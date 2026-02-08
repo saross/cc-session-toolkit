@@ -45,7 +45,7 @@ def extract_session_stats(session_path: Path) -> dict[str, Any]:
         "assistant_messages": 0,
         "thinking_blocks": 0,
         "tool_calls": {"total": 0, "by_type": {}},
-        "tokens": {"input": 0, "output": 0, "cache_read": 0},
+        "tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0},
         "model": None,
         "timestamps": [],
     }
@@ -74,8 +74,17 @@ def extract_session_stats(session_path: Path) -> dict[str, Any]:
             role = message.get("role", entry.get("type", ""))
 
             if role == "user":
-                stats["human_messages"] += 1
-                stats["turns"] += 1
+                # Distinguish real human messages from tool_result messages
+                user_content = message.get("content", "")
+                is_tool_result = False
+                if isinstance(user_content, list):
+                    is_tool_result = any(
+                        isinstance(b, dict) and b.get("type") == "tool_result"
+                        for b in user_content
+                    )
+                if not is_tool_result:
+                    stats["human_messages"] += 1
+                    stats["turns"] += 1
 
             elif role == "assistant":
                 stats["assistant_messages"] += 1
@@ -101,13 +110,20 @@ def extract_session_stats(session_path: Path) -> dict[str, Any]:
                     if model:
                         stats["model"] = model
 
-            # Token usage
-            usage = entry.get("usage", {})
+            # Token usage (lives inside message object in real CC data)
+            usage = (
+                message.get("usage", {})
+                if isinstance(message, dict)
+                else {}
+            )
             if usage:
                 stats["tokens"]["input"] += usage.get("input_tokens", 0)
                 stats["tokens"]["output"] += usage.get("output_tokens", 0)
                 stats["tokens"]["cache_read"] += usage.get(
                     "cache_read_input_tokens", 0
+                )
+                stats["tokens"]["cache_creation"] += usage.get(
+                    "cache_creation_input_tokens", 0
                 )
 
     # Derive timestamps and duration
@@ -151,16 +167,26 @@ def estimate_cost(stats: dict[str, Any]) -> float:
     Returns:
         Estimated cost in USD, rounded to two decimal places.
     """
-    # Approximate pricing per 1M tokens (USD)
-    input_price = 3.0
-    output_price = 15.0
-    cache_price = 0.3
+    # Pricing per 1M tokens (USD) by model family
+    model = stats.get("model") or ""
+    if "opus" in model:
+        input_price = 15.0
+        output_price = 75.0
+        cache_read_price = 1.50
+        cache_creation_price = 18.75  # 1.25x input
+    else:
+        # Sonnet pricing (default)
+        input_price = 3.0
+        output_price = 15.0
+        cache_read_price = 0.30
+        cache_creation_price = 3.75  # 1.25x input
 
     tokens = stats.get("tokens", {})
     cost = (
         (tokens.get("input", 0) / 1_000_000) * input_price
         + (tokens.get("output", 0) / 1_000_000) * output_price
-        + (tokens.get("cache_read", 0) / 1_000_000) * cache_price
+        + (tokens.get("cache_read", 0) / 1_000_000) * cache_read_price
+        + (tokens.get("cache_creation", 0) / 1_000_000) * cache_creation_price
     )
     return round(cost, 2)
 
@@ -369,7 +395,8 @@ def extract_artifacts(
     # Helpers
     def is_in_project(path: str) -> bool:
         try:
-            return str(Path(path).resolve()).startswith(project_dir)
+            resolved = Path(path).resolve()
+            return resolved.is_relative_to(project_root.resolve())
         except (OSError, ValueError):
             return False
 
@@ -490,6 +517,7 @@ def detect_relationship_hints(session_path: Path) -> dict[str, Any]:
             for pattern in continuation_patterns:
                 if re.search(pattern, text, re.IGNORECASE):
                     if not hints["continues_hint"]:
+                        hints["continues_hint"] = "detected"
                         hints["detection_notes"].append(
                             f"Found continuation language: '{pattern}'"
                         )

@@ -5,7 +5,6 @@ Shared test fixtures for cc-session-toolkit.
 from __future__ import annotations
 
 import json
-import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -78,11 +77,12 @@ def sample_session_jsonl(tmp_path: Path) -> Path:
                         "input": {"file_path": "/tmp/test/README.md"},
                     },
                 ],
-            },
-            "usage": {
-                "input_tokens": 500,
-                "output_tokens": 200,
-                "cache_read_input_tokens": 100,
+                "usage": {
+                    "input_tokens": 500,
+                    "output_tokens": 200,
+                    "cache_read_input_tokens": 100,
+                    "cache_creation_input_tokens": 50,
+                },
             },
         },
         # Tool result
@@ -118,11 +118,12 @@ def sample_session_jsonl(tmp_path: Path) -> Path:
                         },
                     },
                 ],
-            },
-            "usage": {
-                "input_tokens": 300,
-                "output_tokens": 100,
-                "cache_read_input_tokens": 50,
+                "usage": {
+                    "input_tokens": 300,
+                    "output_tokens": 100,
+                    "cache_read_input_tokens": 50,
+                    "cache_creation_input_tokens": 0,
+                },
             },
         },
     ]

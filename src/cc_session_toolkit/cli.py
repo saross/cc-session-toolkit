@@ -280,9 +280,17 @@ def cmd_update(args: argparse.Namespace) -> None:
 
     # Read new metadata
     if args.metadata_file:
-        new_meta = json.loads(
-            Path(args.metadata_file).read_text(encoding="utf-8")
-        )
+        meta_input = Path(args.metadata_file)
+        if not meta_input.exists():
+            print(f"File not found: {args.metadata_file}")
+            return
+        try:
+            new_meta = json.loads(
+                meta_input.read_text(encoding="utf-8")
+            )
+        except json.JSONDecodeError as exc:
+            print(f"Invalid JSON in {args.metadata_file}: {exc}")
+            return
     else:
         print("\nEnter metadata JSON (Ctrl+D when done):")
         try:
@@ -292,6 +300,7 @@ def cmd_update(args: argparse.Namespace) -> None:
             return
 
     # Update fields
+    meta.setdefault("auto_generated", {})
     if "title" in new_meta:
         meta["auto_generated"]["title"] = new_meta["title"]
     if "purpose" in new_meta:

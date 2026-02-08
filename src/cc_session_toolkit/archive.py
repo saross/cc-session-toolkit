@@ -446,7 +446,11 @@ def archive_session(
             "uncompressed_bytes": uncompressed_size,
             "compressed_sha256": compressed_hash.hexdigest(),
         }
-        ratio = compression_info["compressed_bytes"] / uncompressed_size
+        ratio = (
+            compression_info["compressed_bytes"] / uncompressed_size
+            if uncompressed_size > 0
+            else 0.0
+        )
         print(
             f"  Compressed to: {dest_jsonl} "
             f"({compression_info['compressed_bytes']:,} bytes, "
@@ -527,8 +531,18 @@ def find_archive_by_id(
     if not project_dir.exists():
         return None
 
-    for candidate in project_dir.iterdir():
-        if candidate.is_dir() and session_id in candidate.name:
-            return candidate
+    matches = sorted(
+        d for d in project_dir.iterdir()
+        if d.is_dir() and session_id in d.name
+    )
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        # Prefer exact match on the session ID portion
+        for m in matches:
+            if session_id == m.name.split("_", 1)[-1]:
+                return m
+        # Fall back to first sorted match
+        return matches[0]
 
     return None

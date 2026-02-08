@@ -15,7 +15,6 @@ from typing import Any
 
 from cc_session_toolkit.config import SCHEMA_VERSION
 from cc_session_toolkit.naming import get_archive_directory
-from cc_session_toolkit.project import get_archive_dir, get_project_name
 
 
 # -------------------------------------------------------------------------
@@ -54,11 +53,15 @@ def update_catalogue(
         if sid in existing_ids:
             continue
 
+        title = session.get("auto_generated", {}).get("title")
+        if title == "Untitled Session":
+            title = None
         directory = get_archive_directory(
             session_id=sid,
             stats={"started_at": session["session"]["started_at"]},
             archive_dir=archive_dir,
             project_name=project_name,
+            title=title,
         )
         try:
             rel_dir = str(directory.relative_to(archive_dir))
@@ -110,7 +113,8 @@ def update_catalogue_entry(
     catalogue = json.loads(catalogue_file.read_text(encoding="utf-8"))
 
     for session in catalogue.get("sessions", []):
-        if session_id in session.get("id", ""):
+        entry_id = session.get("id", "")
+        if entry_id and entry_id == session_id:
             session["title"] = (
                 meta.get("auto_generated", {}).get("title", "Untitled")
             )

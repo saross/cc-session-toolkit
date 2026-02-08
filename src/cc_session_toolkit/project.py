@@ -11,7 +11,6 @@ from __future__ import annotations
 import re
 import subprocess
 from pathlib import Path
-from typing import Any
 
 
 # Markers that indicate a project root directory (checked in order)

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from cc_session_toolkit.naming import get_archive_directory, slugify
 
 
