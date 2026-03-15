@@ -168,7 +168,8 @@ def fetch_untagged_sessions(
             cur.execute(
                 "SELECT id, project, title, started_at, "
                 "       duration_minutes, NULL, capture_type "
-                "FROM untagged_sessions"
+                "FROM untagged_sessions "
+                "ORDER BY started_at DESC"
             )
             rows = cur.fetchall()
         return [SessionRow(*row) for row in rows]
@@ -244,7 +245,10 @@ def format_session_table(
         )
         parts.append(f"{date_str:<{date_w}}")
 
-        dur_str = f"{row.duration_minutes}m" if row.duration_minutes else "N/A"
+        dur_str = (
+            f"{row.duration_minutes}m"
+            if row.duration_minutes is not None else "N/A"
+        )
         parts.append(f"{dur_str:>{dur_w}}")
 
         if show_cost:

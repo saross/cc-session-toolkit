@@ -504,8 +504,17 @@ def cmd_search(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    since = _parse_date(args.since) if args.since else None
-    before = _parse_date(args.before) if args.before else None
+    try:
+        since = _parse_date(args.since) if args.since else None
+        before = _parse_date(args.before) if args.before else None
+    except ValueError as exc:
+        print(f"Error: invalid date format: {exc}")
+        print("Expected YYYY-MM-DD (e.g. 2026-03-15).")
+        sys.exit(1)
+
+    if args.limit < 1:
+        print("Error: --limit must be a positive integer.")
+        sys.exit(1)
 
     try:
         results = search_sessions(
@@ -515,6 +524,12 @@ def cmd_search(args: argparse.Namespace) -> None:
             before=before,
             limit=args.limit,
         )
+    except ImportError:
+        print(
+            "Error: psycopg2 is required for search.\n"
+            "Install with: pip install cc-session-toolkit[db]"
+        )
+        sys.exit(1)
     except Exception as exc:
         print(f"Database error: {exc}")
         print(
@@ -552,6 +567,12 @@ def cmd_untagged(args: argparse.Namespace) -> None:
             return
 
         results = fetch_untagged_sessions()
+    except ImportError:
+        print(
+            "Error: psycopg2 is required for untagged.\n"
+            "Install with: pip install cc-session-toolkit[db]"
+        )
+        sys.exit(1)
     except Exception as exc:
         print(f"Database error: {exc}")
         sys.exit(1)
@@ -567,8 +588,7 @@ def cmd_untagged(args: argparse.Namespace) -> None:
 
 def _parse_date(date_str: str) -> date:
     """Parse a date string in YYYY-MM-DD format."""
-    from datetime import date as date_type
-    return date_type.fromisoformat(date_str)
+    return date.fromisoformat(date_str)
 
 
 # -------------------------------------------------------------------------

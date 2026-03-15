@@ -164,9 +164,8 @@ class TestSearchSessions:
         _, params = mock_db.execute.call_args[0]
         assert params[-1] == 20
 
-    def test_connection_closed_on_success(self, mock_db):
+    def test_connection_closed_on_success(self):
         """Connection is closed after successful query."""
-        mock_db.fetchall.return_value = []
         with patch(
             "cc_session_toolkit.queries.get_connection",
         ) as mock_get:
@@ -274,15 +273,15 @@ class TestFormatSessionTable:
         """Titles exceeding 30 chars are truncated with ellipsis."""
         rows = [_make_row(title="A" * 40)]
         output = format_session_table(rows)
-        assert ".." in output
-        # Full title should not appear
         assert "A" * 40 not in output
+        assert "A" * 28 + ".." in output
 
     def test_truncates_long_project_names(self):
         """Project names exceeding 20 chars are truncated."""
         rows = [_make_row(project="very-long-project-name-here")]
         output = format_session_table(rows)
-        assert "very-long-project-na" not in output or ".." in output
+        assert "very-long-project-name-here" not in output
+        assert ".." in output
 
     def test_handles_none_title(self):
         """None title displays as 'Untitled'."""
@@ -292,10 +291,23 @@ class TestFormatSessionTable:
 
     def test_handles_none_started_at(self):
         """None started_at displays as 'N/A'."""
-        rows = [_make_row(started_at=None)]
-        # Need to explicitly set started_at to None
-        rows[0].started_at = None
+        row = _make_row()
+        row.started_at = None
+        output = format_session_table([row])
+        assert "N/A" in output
+
+    def test_handles_zero_duration(self):
+        """duration_minutes=0 displays as '0m', not 'N/A'."""
+        rows = [_make_row(duration_minutes=0)]
         output = format_session_table(rows)
+        assert "0m" in output
+        assert "N/A" not in output or "N/A" not in output.split("\n")[-1]
+
+    def test_handles_none_duration(self):
+        """None duration displays as 'N/A'."""
+        row = _make_row()
+        row.duration_minutes = None
+        output = format_session_table([row])
         assert "N/A" in output
 
     def test_handles_none_cost(self):
