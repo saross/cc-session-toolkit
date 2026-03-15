@@ -53,29 +53,43 @@ def update_catalogue(
         if sid in existing_ids:
             continue
 
-        title = session.get("auto_generated", {}).get("title")
-        if title == "Untitled Session":
-            title = None
-        directory = get_archive_directory(
-            session_id=sid,
-            stats={"started_at": session["session"]["started_at"]},
-            archive_dir=archive_dir,
-            project_name=project_name,
-            title=title,
-        )
-        try:
-            rel_dir = str(directory.relative_to(archive_dir))
-        except ValueError:
-            rel_dir = str(directory)
+        # Use actual archive directory if recorded by archive_session()
+        # (avoids path reconstruction mismatch).  The transient
+        # ``_archive_directory`` key is consumed here and not persisted.
+        actual_dir = session.pop("_archive_directory", None)
+        if actual_dir:
+            actual_path = Path(actual_dir)
+            try:
+                rel_dir = str(actual_path.relative_to(archive_dir))
+            except ValueError:
+                rel_dir = str(actual_path)
+        else:
+            # Fallback: reconstruct path (legacy callers without the key)
+            title = session.get("auto_generated", {}).get("title")
+            if title == "Untitled Session":
+                title = None
+            directory = get_archive_directory(
+                session_id=sid,
+                stats={"started_at": session["session"]["started_at"]},
+                archive_dir=archive_dir,
+                project_name=project_name,
+                title=title,
+            )
+            try:
+                rel_dir = str(directory.relative_to(archive_dir))
+            except ValueError:
+                rel_dir = str(directory)
 
+        auto = session.get("auto_generated", {})
+        sess = session.get("session", {})
         catalogue["sessions"].append({
             "id": sid,
-            "title": session["auto_generated"]["title"],
+            "title": auto.get("title", "Untitled"),
             "directory": rel_dir,
-            "started_at": session["session"]["started_at"],
-            "duration_minutes": session["session"]["duration_minutes"],
-            "tags": session["auto_generated"]["tags"],
-            "purpose": session["auto_generated"]["purpose"],
+            "started_at": sess.get("started_at"),
+            "duration_minutes": sess.get("duration_minutes", 0),
+            "tags": auto.get("tags", []),
+            "purpose": auto.get("purpose", ""),
         })
 
     catalogue["generated_at"] = datetime.now().isoformat()

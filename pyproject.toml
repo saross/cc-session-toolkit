@@ -31,6 +31,7 @@ classifiers = [
 
 [project.optional-dependencies]
 yaml = ["PyYAML>=6.0"]
+api = ["anthropic>=0.40"]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",

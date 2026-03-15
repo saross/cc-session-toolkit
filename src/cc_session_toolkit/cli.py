@@ -19,6 +19,8 @@ from cc_session_toolkit.archive import (
     get_archived_session_ids,
     get_session_files,
     get_session_id,
+    is_already_archived,
+    is_trivial_session,
 )
 from cc_session_toolkit.catalogue import (
     generate_catalogue_markdown,
@@ -26,11 +28,16 @@ from cc_session_toolkit.catalogue import (
     update_catalogue,
     update_catalogue_entry,
 )
+from cc_session_toolkit.config import DEFAULT_MIN_TURNS
+from cc_session_toolkit.extraction import extract_session_stats
 from cc_session_toolkit.init import initialise_project
 from cc_session_toolkit.project import (
+    detect_project_name_from_cwd,
     find_project_root,
     get_archive_dir,
     get_catalogue_file,
+    get_global_archive_dir,
+    get_global_catalogue_file,
     get_project_name,
 )
 from cc_session_toolkit.summarise import summarise_session
@@ -59,8 +66,113 @@ def cmd_init(args: argparse.Namespace) -> None:
     )
 
 
+def _cmd_archive_from_hook(args: argparse.Namespace) -> None:
+    """
+    Handle ``cc-session archive --from-hook``.
+
+    Reads hook input from stdin (JSON with ``session_id``,
+    ``transcript_path``, ``cwd``), applies trivial-session filtering
+    and deduplication, then archives to the global archive root.
+    """
+    # Read hook input from stdin
+    try:
+        raw_input = sys.stdin.read()
+        if not raw_input.strip():
+            print("Error: no input on stdin (expected hook JSON)")
+            sys.exit(1)
+        hook_input = json.loads(raw_input)
+    except json.JSONDecodeError as exc:
+        print(f"Error: invalid JSON on stdin: {exc}")
+        sys.exit(1)
+
+    session_id = hook_input.get("session_id")
+    transcript_path_str = hook_input.get("transcript_path", "")
+    cwd_str = hook_input.get("cwd", ".")
+
+    if not session_id:
+        print("Error: missing session_id in hook input")
+        sys.exit(1)
+
+    if not transcript_path_str:
+        print("Error: missing transcript_path in hook input")
+        sys.exit(1)
+
+    transcript_path = Path(transcript_path_str)
+    if not transcript_path.is_file():
+        print(f"Error: transcript not found: {transcript_path}")
+        sys.exit(1)
+
+    cwd = Path(cwd_str)
+
+    # Resolve archive root and project name
+    archive_root = (
+        Path(args.archive_root) if args.archive_root
+        else get_global_archive_dir()
+    )
+    project_name = detect_project_name_from_cwd(cwd)
+    catalogue_file = get_global_catalogue_file(archive_root)
+
+    # Extract stats for filtering
+    stats = extract_session_stats(transcript_path)
+
+    # Trivial session filter
+    min_turns = (
+        args.min_turns if args.min_turns is not None
+        else DEFAULT_MIN_TURNS
+    )
+    if is_trivial_session(stats, min_turns=min_turns):
+        print(
+            f"Skipping trivial session {session_id}: "
+            f"{stats['turns']} turns, "
+            f"{stats['duration_minutes']} min"
+        )
+        return
+
+    # Deduplication check
+    if is_already_archived(session_id, catalogue_file):
+        print(f"Skipping already-archived session: {session_id}")
+        return
+
+    # Detect project root for artifact extraction (may not exist)
+    try:
+        project_root = find_project_root(start=cwd)
+    except FileNotFoundError:
+        project_root = None
+
+    # Determine capture type
+    capture_type = (
+        "pre_compact" if args.pre_compact else "session_end"
+    )
+
+    # Archive the session
+    # Always stats_only=True in hook mode — suppress interactive prompt.
+    # The auto_metadata flag handles Haiku independently.
+    result = archive_session(
+        transcript_path,
+        project_root,
+        use_gzip=args.gzip,
+        stats_only=True,
+        archive_root=archive_root,
+        project_name_override=project_name,
+        auto_metadata=args.auto_metadata,
+        capture_type=capture_type,
+        session_id_override=session_id,
+    )
+
+    if result:
+        update_catalogue(
+            [result], catalogue_file, archive_root, project_name
+        )
+        print(f"Archived: {session_id} → {project_name}")
+
+
 def cmd_archive(args: argparse.Namespace) -> None:
     """Handle ``cc-session archive``."""
+    # Branch to hook mode if --from-hook is set
+    if args.from_hook:
+        _cmd_archive_from_hook(args)
+        return
+
     try:
         root = find_project_root()
     except FileNotFoundError:
@@ -447,6 +559,39 @@ def main() -> None:
     p_archive.add_argument(
         "--title", "-t",
         help="Session title for human-readable directory name.",
+    )
+    p_archive.add_argument(
+        "--from-hook",
+        action="store_true",
+        help=(
+            "Hook-compatible mode: read session_id, transcript_path, "
+            "and cwd from stdin JSON instead of discovering sessions."
+        ),
+    )
+    p_archive.add_argument(
+        "--auto-metadata",
+        action="store_true",
+        help="Generate title/purpose/tags via Haiku API (~$0.001/session).",
+    )
+    p_archive.add_argument(
+        "--archive-root",
+        help=(
+            "Global archive root directory "
+            "(default: ~/cc-archives/)."
+        ),
+    )
+    p_archive.add_argument(
+        "--min-turns",
+        type=int,
+        help=(
+            "Minimum turns to archive a session "
+            f"(default: {DEFAULT_MIN_TURNS}; used with --from-hook)."
+        ),
+    )
+    p_archive.add_argument(
+        "--pre-compact",
+        action="store_true",
+        help="Tag as pre-compaction snapshot (used with --from-hook).",
     )
     p_archive.set_defaults(func=cmd_archive)
 

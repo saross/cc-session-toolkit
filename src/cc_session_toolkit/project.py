@@ -163,3 +163,63 @@ def get_catalogue_file(project_root: Path | None = None) -> Path:
         Path to the catalogue file (may not exist).
     """
     return get_archive_dir(project_root) / "CATALOG.json"
+
+
+# -------------------------------------------------------------------------
+# Global archive paths (for hook-based automated archiving)
+# -------------------------------------------------------------------------
+
+def detect_project_name_from_cwd(cwd: Path | None = None) -> str:
+    """
+    Detect project name from a working directory path.
+
+    Searches upward from *cwd* for project root markers.  If found,
+    uses the same cascading priority as :func:`get_project_name`.
+    Falls back to the directory name of *cwd* itself.
+
+    Args:
+        cwd: Working directory path.  Defaults to the current
+            working directory.
+
+    Returns:
+        Project name string.
+    """
+    resolved = (cwd or Path.cwd()).resolve()
+    try:
+        root = find_project_root(start=resolved)
+        return get_project_name(root)
+    except FileNotFoundError:
+        return resolved.name
+
+
+def get_global_archive_dir(archive_root: Path | None = None) -> Path:
+    """
+    Return the global archive root directory.
+
+    Used by hook-based archiving where sessions from all projects are
+    stored centrally rather than per-project.
+
+    Args:
+        archive_root: Explicit archive root.  Defaults to
+            ``~/cc-archives/``.
+
+    Returns:
+        Path to the archive root (may not exist yet).
+    """
+    from cc_session_toolkit.config import DEFAULT_ARCHIVE_ROOT
+
+    return archive_root or DEFAULT_ARCHIVE_ROOT
+
+
+def get_global_catalogue_file(archive_root: Path | None = None) -> Path:
+    """
+    Return the path to the global ``CATALOG.json``.
+
+    Args:
+        archive_root: Explicit archive root.  Defaults to
+            ``~/cc-archives/``.
+
+    Returns:
+        Path to the catalogue file (may not exist).
+    """
+    return get_global_archive_dir(archive_root) / "CATALOG.json"

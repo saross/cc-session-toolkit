@@ -15,6 +15,16 @@ from typing import Any
 SCHEMA_VERSION = "1.1"
 
 # ---------------------------------------------------------------------------
+# Global archive defaults (for hook-based automated archiving)
+# ---------------------------------------------------------------------------
+
+DEFAULT_ARCHIVE_ROOT = Path.home() / "cc-archives"
+
+# Trivial session thresholds — sessions below these limits are skipped
+DEFAULT_MIN_TURNS = 5
+DEFAULT_MIN_DURATION_MINUTES = 1
+
+# ---------------------------------------------------------------------------
 # Default thinking-block ethics preferences
 # ---------------------------------------------------------------------------
 
