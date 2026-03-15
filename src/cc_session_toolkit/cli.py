@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -486,6 +486,92 @@ def cmd_catalogue(args: argparse.Namespace) -> None:
 
 
 # -------------------------------------------------------------------------
+# search / untagged
+# -------------------------------------------------------------------------
+
+
+def cmd_search(args: argparse.Namespace) -> None:
+    """Handle ``cc-session search``."""
+    try:
+        from cc_session_toolkit.queries import (
+            format_session_table,
+            search_sessions,
+        )
+    except ImportError:
+        print(
+            "Error: psycopg2 is required for search.\n"
+            "Install with: pip install cc-session-toolkit[db]"
+        )
+        sys.exit(1)
+
+    since = _parse_date(args.since) if args.since else None
+    before = _parse_date(args.before) if args.before else None
+
+    try:
+        results = search_sessions(
+            args.query,
+            project=args.project,
+            since=since,
+            before=before,
+            limit=args.limit,
+        )
+    except Exception as exc:
+        print(f"Database error: {exc}")
+        print(
+            "PostgreSQL may be unavailable. "
+            "Session archives remain accessible via cc-session list-archives."
+        )
+        sys.exit(1)
+
+    if not results:
+        print("No sessions matched your query.")
+        return
+
+    print(format_session_table(results))
+    print(f"\n{len(results)} session(s) found.")
+
+
+def cmd_untagged(args: argparse.Namespace) -> None:
+    """Handle ``cc-session untagged``."""
+    try:
+        from cc_session_toolkit.queries import (
+            fetch_untagged_sessions,
+            format_session_table,
+        )
+    except ImportError:
+        print(
+            "Error: psycopg2 is required for untagged.\n"
+            "Install with: pip install cc-session-toolkit[db]"
+        )
+        sys.exit(1)
+
+    try:
+        if args.count:
+            count = fetch_untagged_sessions(count_only=True)
+            print(f"{count} session(s) need review.")
+            return
+
+        results = fetch_untagged_sessions()
+    except Exception as exc:
+        print(f"Database error: {exc}")
+        sys.exit(1)
+
+    if not results:
+        print("No sessions need review. All caught up!")
+        return
+
+    print(format_session_table(results, show_cost=False, show_id=True))
+    print(f"\n{len(results)} session(s) need review.")
+    print("Use 'cc-session update <session_id>' to enrich metadata.")
+
+
+def _parse_date(date_str: str) -> date:
+    """Parse a date string in YYYY-MM-DD format."""
+    from datetime import date as date_type
+    return date_type.fromisoformat(date_str)
+
+
+# -------------------------------------------------------------------------
 # Main parser
 # -------------------------------------------------------------------------
 
@@ -656,6 +742,50 @@ def main() -> None:
         help="Also generate CATALOG.md (used with --rebuild).",
     )
     p_catalogue.set_defaults(func=cmd_catalogue)
+
+    # -- search -------------------------------------------------------
+    p_search = subparsers.add_parser(
+        "search",
+        help="Full-text search across archived sessions (requires PostgreSQL).",
+    )
+    p_search.add_argument(
+        "query",
+        help=(
+            "Search terms (matched against title, purpose, "
+            "and prompt summary)."
+        ),
+    )
+    p_search.add_argument(
+        "--project", "-p",
+        help="Filter results to a specific project.",
+    )
+    p_search.add_argument(
+        "--since",
+        help="Only sessions started on or after this date (YYYY-MM-DD).",
+    )
+    p_search.add_argument(
+        "--before",
+        help="Only sessions started before this date (YYYY-MM-DD).",
+    )
+    p_search.add_argument(
+        "--limit", "-l",
+        type=int,
+        default=20,
+        help="Maximum number of results (default: 20).",
+    )
+    p_search.set_defaults(func=cmd_search)
+
+    # -- untagged -----------------------------------------------------
+    p_untagged = subparsers.add_parser(
+        "untagged",
+        help="List sessions needing review (requires PostgreSQL).",
+    )
+    p_untagged.add_argument(
+        "--count", "-c",
+        action="store_true",
+        help="Show count only, not the full list.",
+    )
+    p_untagged.set_defaults(func=cmd_untagged)
 
     # -- dispatch -----------------------------------------------------
     args = parser.parse_args()
