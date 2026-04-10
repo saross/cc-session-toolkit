@@ -214,6 +214,60 @@ def _is_meta_message(text: str) -> bool:
     return any(sub in lower_full for sub in _META_SUBSTRINGS)
 
 
+def _ensure_anthropic_api_key() -> None:
+    """
+    Ensure ``ANTHROPIC_API_KEY`` is available in the environment.
+
+    When called from Claude Code hooks, the environment variable may
+    not survive the shell export chain.  This function provides a
+    fallback: if the key is missing, it reads ``~/personal-assistant/.env``
+    directly and injects the key into ``os.environ``.
+    """
+    import os
+
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return
+
+    env_path = Path.home() / "personal-assistant" / ".env"
+    if not env_path.is_file():
+        return
+
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        key = key.strip()
+        value = value.strip().strip("\"'")
+        if key == "ANTHROPIC_API_KEY" and value:
+            os.environ["ANTHROPIC_API_KEY"] = value
+            return
+
+
+def _log_metadata_event(
+    message: str,
+    *,
+    level: str = "INFO",
+) -> None:
+    """Append a timestamped line to the auto-metadata log."""
+    import os
+
+    log_dir = Path(
+        os.environ.get(
+            "CC_SESSION_LOG_DIR",
+            Path.home() / "personal-assistant" / "data" / "logs",
+        )
+    )
+    log_file = log_dir / "auto-metadata.log"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(log_file, "a", encoding="utf-8") as fh:
+            fh.write(f"{timestamp} [{level}] {message}\n")
+    except OSError:
+        pass  # logging must never break the archive
+
+
 def generate_auto_metadata(
     session_path: Path,
     stats: dict[str, Any],
@@ -240,11 +294,17 @@ def generate_auto_metadata(
     try:
         import anthropic  # noqa: WPS433 — optional dependency
     except ImportError:
+        _log_metadata_event(
+            "anthropic package not installed — skipping",
+            level="WARNING",
+        )
         print(
             "  Warning: anthropic package not installed, "
             "skipping auto-metadata"
         )
         return None
+
+    _ensure_anthropic_api_key()
 
     # Extract representative user messages and file paths from the
     # transcript in a single pass.  Collects:
@@ -367,6 +427,19 @@ def generate_auto_metadata(
 
     try:
         client = anthropic.Anthropic()
+        if not client.api_key:
+            _log_metadata_event(
+                f"No API key available for {session_path.name}",
+                level="ERROR",
+            )
+            print("  Warning: no ANTHROPIC_API_KEY — skipping auto-metadata")
+            return None
+
+        _log_metadata_event(
+            f"Calling Haiku for {session_path.name} "
+            f"({len(sampled)} messages sampled)"
+        )
+
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=256,
@@ -388,12 +461,21 @@ def generate_auto_metadata(
         )
 
         result = json.loads(json_str)
+        title = result.get("title", "Untitled Session")
+        _log_metadata_event(
+            f"Success for {session_path.name}: {title!r}"
+        )
         return {
-            "title": result.get("title", "Untitled Session"),
+            "title": title,
             "purpose": result.get("purpose", ""),
             "tags": result.get("tags", []),
         }
     except Exception as exc:  # noqa: BLE001 — graceful degradation
+        _log_metadata_event(
+            f"Failed for {session_path.name}: "
+            f"{type(exc).__name__}: {exc}",
+            level="ERROR",
+        )
         print(f"  Warning: auto-metadata generation failed: {exc}")
         return None
 

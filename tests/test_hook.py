@@ -6,6 +6,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -298,6 +299,21 @@ class TestAutoMetadataSampling:
         "tool_calls": {"total": 5, "by_type": {"Read": 5}},
     }
 
+    @staticmethod
+    def _mock_haiku_response(title: str = "Test Title") -> Any:
+        """Build a mock Anthropic messages.create response."""
+        from unittest.mock import MagicMock
+
+        response = MagicMock()
+        content_block = MagicMock()
+        content_block.text = json.dumps({
+            "title": title,
+            "purpose": "Test purpose",
+            "tags": ["test"],
+        })
+        response.content = [content_block]
+        return response
+
     def test_filters_slash_commands(self, tmp_path: Path) -> None:
         """Slash commands are excluded from sampled messages."""
         session = _build_session_jsonl(tmp_path, [
@@ -306,13 +322,21 @@ class TestAutoMetadataSampling:
             "/recap",
             "/done",
         ])
-        # Without anthropic, function returns None before reaching
-        # the prompt. We test the filter logic via _is_meta_message
-        # unit tests and the integration tests below.
-        # Here we verify the session parses without error.
-        result = generate_auto_metadata(session, self._STATS)
-        # Returns None because anthropic is not installed in test env
-        assert result is None
+        with patch("anthropic.Anthropic") as MockClient:
+            mock_client = MockClient.return_value
+            mock_client.api_key = "test-key"
+            mock_client.messages.create.return_value = (
+                self._mock_haiku_response("Parser Implementation")
+            )
+            result = generate_auto_metadata(session, self._STATS)
+            assert result is not None
+            assert result["title"] == "Parser Implementation"
+            # Verify the prompt sent to Haiku excludes /recap and /done
+            call_args = mock_client.messages.create.call_args
+            prompt_text = call_args.kwargs["messages"][0]["content"]
+            assert "/recap" not in prompt_text
+            assert "/done" not in prompt_text
+            assert "Implement the parser" in prompt_text
 
     def test_fallback_when_all_meta(self, tmp_path: Path) -> None:
         """All-meta sessions fall back to unfiltered messages."""
@@ -321,10 +345,15 @@ class TestAutoMetadataSampling:
             "yes",
             "ok",
         ])
-        # Should not return None (messages exist, even if all meta)
-        # — returns None only because anthropic is unavailable
-        result = generate_auto_metadata(session, self._STATS)
-        assert result is None  # anthropic unavailable, not "no messages"
+        with patch("anthropic.Anthropic") as MockClient:
+            mock_client = MockClient.return_value
+            mock_client.api_key = "test-key"
+            mock_client.messages.create.return_value = (
+                self._mock_haiku_response("Fallback Session")
+            )
+            result = generate_auto_metadata(session, self._STATS)
+            # Should succeed — messages exist after fallback
+            assert result is not None
 
     def test_collects_write_edit_file_paths(
         self, tmp_path: Path
@@ -336,18 +365,34 @@ class TestAutoMetadataSampling:
             write_files=["/home/user/project/config.py"],
             edit_files=["/home/user/project/cli.py"],
         )
-        # Verify the session parses correctly (actual prompt content
-        # tested via mock in a richer test environment)
-        result = generate_auto_metadata(session, self._STATS)
-        assert result is None  # anthropic unavailable
+        with patch("anthropic.Anthropic") as MockClient:
+            mock_client = MockClient.return_value
+            mock_client.api_key = "test-key"
+            mock_client.messages.create.return_value = (
+                self._mock_haiku_response("Config Refactor")
+            )
+            result = generate_auto_metadata(session, self._STATS)
+            assert result is not None
+            # Verify file paths appear in the prompt
+            call_args = mock_client.messages.create.call_args
+            prompt_text = call_args.kwargs["messages"][0]["content"]
+            assert "config.py" in prompt_text
+            assert "cli.py" in prompt_text
 
     def test_empty_after_filtering(self, tmp_path: Path) -> None:
         """Sessions with only meta messages still parse without error."""
         session = _build_session_jsonl(tmp_path, [
             "yes", "ok", "sure", "/done",
         ])
-        result = generate_auto_metadata(session, self._STATS)
-        assert result is None  # anthropic unavailable, not crash
+        with patch("anthropic.Anthropic") as MockClient:
+            mock_client = MockClient.return_value
+            mock_client.api_key = "test-key"
+            mock_client.messages.create.return_value = (
+                self._mock_haiku_response("Short Session")
+            )
+            result = generate_auto_metadata(session, self._STATS)
+            # All messages are short/meta, but fallback includes them
+            assert result is not None
 
 
 # -------------------------------------------------------------------------
