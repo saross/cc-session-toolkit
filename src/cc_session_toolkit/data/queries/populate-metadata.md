@@ -2,6 +2,18 @@
 
 You are analysing a Claude Code session to populate empty fields in its `session.meta.json` file.
 
+## Core Principle: Capture *Why*, Not Just *What*
+
+Every field you populate should help a reader in 6 months understand **why**
+this session happened and **why** decisions were made — not just *that* they
+happened. Descriptions that record only actions ("implemented batch API")
+decay into noise. Descriptions that encode rationale ("implemented batch API
+because concurrent approach hit rate limits at scale; chose batch over
+streaming because workload is embarrassingly parallel") remain useful.
+
+For each field, ask yourself: **will a reader who has no memory of this session
+understand the reasoning, or only the outcome?**
+
 ## Inputs
 
 You will receive:
@@ -20,28 +32,36 @@ Analyse the session transcript and generate values for any empty or placeholder 
 ```json
 "auto_generated": {
   "title": "Brief descriptive title (3-8 words)",
-  "purpose": "What the user was trying to accomplish (1-2 sentences)",
+  "purpose": "What the user was trying to accomplish and why (1-2 sentences)",
   "tags": ["relevant", "tags", "3-6 items"]
 }
 ```
 
-- **title**: Concise summary of the session's main focus
-- **purpose**: The user's goal, written in past tense
+- **title**: Concise summary of the session's main accomplishment
+- **purpose**: The user's goal *and the motivation behind it*. Not just "refactored
+  auth module" but "refactored auth module because session token storage didn't
+  meet new compliance requirements." If the motivation isn't explicit in the
+  transcript, note what can be inferred.
 - **tags**: Lowercase keywords covering domain, task type, tools used
 
 ### three_ps
 
 ```json
 "three_ps": {
-  "prompt_summary": "What was asked (Prompt)",
-  "process_summary": "How the tool was used (Process)",
-  "provenance_summary": "Role in research workflow (Provenance)"
+  "prompt_summary": "What was asked and why (Prompt)",
+  "process_summary": "How the tool was used and why this approach (Process)",
+  "provenance_summary": "What depends on this session's outcomes (Provenance)"
 }
 ```
 
-- **prompt_summary**: Summarise the user's requests/questions (1-2 sentences)
-- **process_summary**: Describe the workflow and key tools used (1-2 sentences)
-- **provenance_summary**: Context within the broader project (1 sentence)
+- **prompt_summary**: What the user asked *and the underlying need*. Not "asked to
+  fix the batch script" but "asked to fix the batch script because overnight run
+  failed at the 2 GB file size limit, blocking the analysis pipeline." (1-2 sentences)
+- **process_summary**: The workflow followed *and why this approach was chosen over
+  alternatives*. Note decision points, corrections, and pivots. (1-2 sentences)
+- **provenance_summary**: Where this session sits in the broader project — what
+  preceded it, what depends on its outputs, what would break if its results were
+  wrong. (1 sentence)
 
 ### relationships
 
@@ -66,9 +86,13 @@ For each artifact in `created`, `modified`, and `referenced` arrays, populate em
 {
   "path": "scripts/example.py",
   "type": "code",
-  "description": "Brief description of what this file is and why it was used/changed"
+  "description": "Why this file was created/changed, not just what it contains"
 }
 ```
+
+Describe the *reason* the file was touched, not just its contents. "Created to
+replace the serial processing script after discovering the API supports 100
+concurrent jobs" is better than "Batch processing script."
 
 ## Output Format
 
@@ -84,10 +108,13 @@ Return the complete, updated `session.meta.json` as a JSON code block. Preserve 
 ## Guidelines
 
 - Use UK/Australian English spelling
-- Be concise — each description should be one phrase or sentence
+- Encode rationale in every description — *why*, not just *what*
 - Tags should be lowercase, hyphenated for multi-word (e.g., `code-review`)
 - Don't invent information not evidenced in the transcript
-- If a field cannot be determined from the transcript, use a sensible default or note uncertainty
+- If motivation isn't explicit, state what can be inferred: "likely because..."
+  rather than fabricating a reason
+- If a field cannot be determined from the transcript, use a sensible default
+  or note uncertainty
 
 ## Session Data
 

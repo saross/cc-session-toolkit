@@ -414,15 +414,24 @@ def generate_auto_metadata(
         f"generate:\n"
         f"1. A concise title (5-10 words) reflecting the session's "
         f"main accomplishment\n"
-        f"2. A one-sentence purpose statement\n"
-        f"3. 2-5 lowercase hyphenated tags\n\n"
+        f"2. A one-sentence purpose statement that captures *why*, "
+        f"not just *what* (include motivation if evident)\n"
+        f"3. 2-5 lowercase hyphenated tags\n"
+        f"4. Three Ps metadata:\n"
+        f"   - prompt_summary: What was asked and why (1 sentence)\n"
+        f"   - process_summary: How the tool was used and why this "
+        f"approach (1 sentence)\n"
+        f"   - provenance_summary: Where this session fits in the "
+        f"broader project (1 sentence)\n\n"
         f"Session stats: {stats.get('duration_minutes', 0)} min, "
         f"{stats.get('turns', 0)} turns, tools: {tool_summary}\n"
         f"{files_line}\n"
         f"{sample_label}:\n"
         f"{messages_text}\n\n"
         f"Respond with ONLY a JSON object, no markdown:\n"
-        f'{{"title": "...", "purpose": "...", "tags": ["..."]}}'
+        f'{{"title": "...", "purpose": "...", "tags": ["..."], '
+        f'"three_ps": {{"prompt_summary": "...", '
+        f'"process_summary": "...", "provenance_summary": "..."}}}}'
     )
 
     try:
@@ -442,7 +451,7 @@ def generate_auto_metadata(
 
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=256,
+            max_tokens=512,
             messages=[{"role": "user", "content": prompt}],
         )
 
@@ -465,11 +474,26 @@ def generate_auto_metadata(
         _log_metadata_event(
             f"Success for {session_path.name}: {title!r}"
         )
-        return {
+        auto_meta: dict[str, Any] = {
             "title": title,
             "purpose": result.get("purpose", ""),
             "tags": result.get("tags", []),
         }
+        # Include three_ps if Haiku returned them
+        three_ps = result.get("three_ps")
+        if isinstance(three_ps, dict):
+            auto_meta["three_ps"] = {
+                "prompt_summary": three_ps.get(
+                    "prompt_summary", ""
+                ),
+                "process_summary": three_ps.get(
+                    "process_summary", ""
+                ),
+                "provenance_summary": three_ps.get(
+                    "provenance_summary", ""
+                ),
+            }
+        return auto_meta
     except Exception as exc:  # noqa: BLE001 — graceful degradation
         _log_metadata_event(
             f"Failed for {session_path.name}: "
@@ -536,6 +560,56 @@ def generate_metadata_prompt(
         f"```\n\n"
         f"Please respond with ONLY the JSON block, no other text."
     )
+
+
+# -------------------------------------------------------------------------
+# Relationship resolution
+# -------------------------------------------------------------------------
+
+
+def _find_previous_session(
+    archive_base: Path,
+    project_name: str,
+    current_session_id: str,
+) -> str | None:
+    """
+    Find the most recent archived session in the same project.
+
+    Scans the project's archive subdirectory for session directories
+    (sorted lexically by timestamp-prefixed names) and returns the
+    session ID of the most recent one that is not the current session.
+
+    Args:
+        archive_base: Root of the archive tree (e.g. ``~/cc-archives``).
+        project_name: Project subdirectory name.
+        current_session_id: ID of the session being archived (to exclude).
+
+    Returns:
+        Session ID of the previous session, or *None* if none found.
+    """
+    project_dir = archive_base / project_name
+    if not project_dir.is_dir():
+        return None
+
+    # Session directories are timestamp-prefixed, so lexical sort works
+    candidates = sorted(
+        (d for d in project_dir.iterdir() if d.is_dir()),
+        reverse=True,
+    )
+
+    for candidate in candidates:
+        meta_file = candidate / "session.meta.json"
+        if not meta_file.exists():
+            continue
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            prev_id = meta.get("session", {}).get("id", "")
+            if prev_id and prev_id != current_session_id:
+                return prev_id
+        except (json.JSONDecodeError, OSError):
+            continue
+
+    return None
 
 
 # -------------------------------------------------------------------------
@@ -631,8 +705,16 @@ def create_session_metadata(
     default_is_part_of = relationship_defaults.get(
         "default_isPartOf", [project_name]
     )
+    relationship_hints_info = relationship_hints or {}
+
+    # Auto-populate "continues" when continuation was detected and
+    # a previous session ID was resolved.
+    continues_id = relationship_hints_info.get(
+        "continues_session_id"
+    )
+
     relationships = {
-        "continues": None,
+        "continues": continues_id,
         "continuedBy": None,
         "isPartOf": default_is_part_of,
         "isParallelTo": [],
@@ -640,8 +722,6 @@ def create_session_metadata(
         "references": [],
         "branchesFrom": None,
     }
-
-    relationship_hints_info = relationship_hints or {}
 
     # Statistics section
     tool_outputs = tool_output_stats or {
@@ -883,6 +963,20 @@ def archive_session(
     else:
         artifacts = {"created": [], "modified": [], "referenced": []}
     relationship_hints = detect_relationship_hints(session_path)
+
+    # Resolve "continues" relationship: if continuation language was
+    # detected, look up the most recent session in the same project.
+    prev_session_id = _find_previous_session(
+        archive_base, project_name, session_id,
+    )
+    if (
+        relationship_hints.get("continues_hint")
+        and prev_session_id
+    ):
+        relationship_hints["continues_session_id"] = prev_session_id
+        relationship_hints["detection_notes"].append(
+            f"Auto-linked: continues {prev_session_id}"
+        )
 
     print(
         f"    Thinking blocks: {thinking_block_stats['count']} "
