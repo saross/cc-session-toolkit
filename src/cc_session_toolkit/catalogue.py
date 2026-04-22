@@ -82,6 +82,9 @@ def update_catalogue(
 
         auto = session.get("auto_generated", {})
         sess = session.get("session", {})
+        subagents_summary = (
+            session.get("statistics", {}).get("subagents_summary", {}) or {}
+        )
         catalogue["sessions"].append({
             "id": sid,
             "title": auto.get("title", "Untitled"),
@@ -90,6 +93,10 @@ def update_catalogue(
             "duration_minutes": sess.get("duration_minutes", 0),
             "tags": auto.get("tags", []),
             "purpose": auto.get("purpose", ""),
+            "subagent_count": subagents_summary.get("count", 0),
+            "subagent_cost_usd": subagents_summary.get(
+                "estimated_cost_usd", 0.0
+            ),
         })
 
     catalogue["generated_at"] = datetime.now().isoformat()
@@ -248,6 +255,10 @@ def rebuild_catalogue(archive_dir: Path) -> dict[str, Any]:
             "referenced": len(artifacts.get("referenced", [])),
         }
 
+        subagents_summary = (
+            meta.get("statistics", {}).get("subagents_summary", {}) or {}
+        )
+
         session_entry = {
             "id": session_id,
             "project": project,
@@ -278,6 +289,10 @@ def rebuild_catalogue(archive_dir: Path) -> dict[str, Any]:
             "artifact_counts": artifact_counts,
             "thinking_blocks_tokens": thinking_blocks.get(
                 "total_tokens", 0
+            ),
+            "subagent_count": subagents_summary.get("count", 0),
+            "subagent_cost_usd": subagents_summary.get(
+                "estimated_cost_usd", 0.0
             ),
         }
         catalogue["sessions"].append(session_entry)

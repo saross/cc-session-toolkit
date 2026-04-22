@@ -52,7 +52,12 @@ from cc_session_toolkit.project import (
 
 def get_session_files(project_root: Path) -> list[Path]:
     """
-    Find all session JSONL files for a project in ``~/.claude/projects/``.
+    Find all parent session JSONL files for a project in ``~/.claude/projects/``.
+
+    Excludes ``agent-*.jsonl`` files, which are sub-agent transcripts from
+    the pre-2026-01-12 flat layout (current CC places them under
+    ``<session_id>/subagents/``). Sub-agent transcripts are archived
+    alongside their parent, not as top-level sessions.
 
     Args:
         project_root: Project root directory.
@@ -66,7 +71,10 @@ def get_session_files(project_root: Path) -> list[Path]:
     if not project_dir.exists():
         return []
 
-    session_files = list(project_dir.glob("*.jsonl"))
+    session_files = [
+        p for p in project_dir.glob("*.jsonl")
+        if not p.name.startswith("agent-")
+    ]
     return sorted(session_files, key=lambda p: p.stat().st_mtime)
 
 
@@ -631,9 +639,10 @@ def create_session_metadata(
     defaults: dict[str, Any] | None = None,
     project_name_override: str | None = None,
     capture_type: str | None = None,
+    subagents: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
-    Create the complete ``session.meta.json`` structure (v1.1 schema).
+    Create the complete ``session.meta.json`` structure (v1.2 schema).
 
     Args:
         session_id: Session identifier.
@@ -653,6 +662,10 @@ def create_session_metadata(
             auto-detection from *project_root*).
         capture_type: How the session was captured — ``"session_end"``,
             ``"pre_compact"``, or *None* for manual archiving.
+        subagents: Sub-agent info dictionaries from
+            :func:`archive_subagent_transcripts`.  Populates the v1.2
+            ``subagents`` top-level field and the
+            ``statistics.subagents_summary`` rollup.
 
     Returns:
         Complete metadata dictionary.
@@ -729,6 +742,7 @@ def create_session_metadata(
         "by_type": {},
         "largest_single_output_bytes": 0,
     }
+    subagents_list = subagents or []
     statistics = {
         "turns": stats["turns"],
         "human_messages": stats["human_messages"],
@@ -738,6 +752,7 @@ def create_session_metadata(
         "tokens": stats["tokens"],
         "estimated_cost_usd": estimate_cost(stats),
         "tool_outputs": tool_outputs,
+        "subagents_summary": summarise_subagents(subagents_list),
     }
 
     # Archive section
@@ -802,6 +817,7 @@ def create_session_metadata(
             },
         ),
         "archive": archive,
+        "subagents": subagents_list,
     }
 
     if capture_type:
@@ -1036,6 +1052,26 @@ def archive_session(
         shutil.copy2(session_path, dest_jsonl)
         print(f"  Copied to: {dest_jsonl}")
 
+    # Archive any sub-agent transcripts alongside the parent (v1.2).
+    # Keeps parent + sub-agents co-located as one atomic archive unit.
+    try:
+        subagents = archive_subagent_transcripts(
+            session_path=session_path,
+            session_id=session_id,
+            dest_dir=dest_dir,
+            use_gzip=use_gzip,
+            capture_type=capture_type,
+        )
+    except Exception as exc:  # noqa: BLE001 — never fail parent archive
+        print(f"  [warn] Sub-agent archival failed: {exc}")
+        subagents = []
+    if subagents:
+        print(
+            f"  Sub-agents: {len(subagents)} archived "
+            f"({sum(1 for s in subagents if s['agent_kind'] == 'user_invoked')} "
+            f"user-invoked)"
+        )
+
     metadata = create_session_metadata(
         session_id=session_id,
         session_path=session_path,
@@ -1050,6 +1086,7 @@ def archive_session(
         defaults=defaults,
         project_name_override=project_name_override,
         capture_type=capture_type,
+        subagents=subagents,
     )
 
     metadata_path = dest_dir / "session.meta.json"
@@ -1063,6 +1100,547 @@ def archive_session(
     metadata["_archive_directory"] = str(dest_dir)
 
     return metadata
+
+
+# -------------------------------------------------------------------------
+# Sub-agent transcript discovery and archival
+# -------------------------------------------------------------------------
+
+# CC emits internal agents with semantic prefixes (e.g. the session
+# compactor and the prompt-suggestion agent).  Everything else is treated
+# as a user-invoked Agent/Task tool call for linkage purposes.
+_CC_INTERNAL_AGENT_PREFIXES: tuple[str, ...] = (
+    "acompact-",
+    "aprompt_suggestion-",
+)
+
+# Tool names in parent JSONL that spawn sub-agents.  CC currently emits
+# ``Agent``; older traces and some documentation use ``Task``.  Accept both.
+_SUBAGENT_SPAWN_TOOL_NAMES: frozenset[str] = frozenset({"Agent", "Task"})
+
+
+def _classify_agent_kind(agent_id: str) -> str:
+    """
+    Classify a sub-agent by its agent-id prefix.
+
+    Returns one of ``"acompact"``, ``"aprompt_suggestion"``,
+    ``"user_invoked"``, or ``"unknown"`` (empty id).
+    """
+    if not agent_id:
+        return "unknown"
+    for prefix in _CC_INTERNAL_AGENT_PREFIXES:
+        if agent_id.startswith(prefix):
+            return prefix.rstrip("-")
+    return "user_invoked"
+
+
+def _read_first_record(path: Path) -> dict[str, Any] | None:
+    """Read and parse the first non-blank JSON line of a JSONL file."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                try:
+                    return json.loads(line)
+                except json.JSONDecodeError:
+                    return None
+    except OSError:
+        return None
+    return None
+
+
+def _first_user_prompt_preview(path: Path, limit: int = 200) -> str:
+    """Return the first ``limit`` characters of the first user message."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("type") != "user":
+                    continue
+                message = entry.get("message", {})
+                content = message.get("content", "")
+                if isinstance(content, str):
+                    return content[:limit]
+                if isinstance(content, list):
+                    # Prefer the first text block when content is a list
+                    for block in content:
+                        if (
+                            isinstance(block, dict)
+                            and block.get("type") == "text"
+                        ):
+                            return str(block.get("text", ""))[:limit]
+                    return json.dumps(content)[:limit]
+                return ""
+    except OSError:
+        return ""
+    return ""
+
+
+def _file_sha256(path: Path) -> str:
+    """Compute the sha256 of a file as it is on disk (bytes read verbatim)."""
+    sha = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(8192), b""):
+            sha.update(chunk)
+    return sha.hexdigest()
+
+
+def _existing_uncompressed_sha(
+    path: Path,
+    is_gzip: bool,
+) -> str | None:
+    """
+    Compute the sha256 of an archived sub-agent file's *uncompressed*
+    contents, for idempotency comparison against a new source file.
+
+    Returns *None* if the file cannot be read or decompressed.
+    """
+    try:
+        sha = hashlib.sha256()
+        opener = gzip.open if is_gzip else open
+        with opener(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(8192), b""):
+                sha.update(chunk)
+        return sha.hexdigest()
+    except (OSError, gzip.BadGzipFile, EOFError):
+        return None
+
+
+def _duration_seconds(
+    started: str | None,
+    ended: str | None,
+) -> float | None:
+    """Return the seconds between two ISO timestamps, or *None* on failure."""
+    if not started or not ended:
+        return None
+    try:
+        s = datetime.fromisoformat(started.replace("Z", "+00:00"))
+        e = datetime.fromisoformat(ended.replace("Z", "+00:00"))
+        return round((e - s).total_seconds(), 1)
+    except (ValueError, TypeError):
+        return None
+
+
+def _find_subagent_jsonls(
+    session_path: Path,
+    session_id: str,
+) -> list[Path]:
+    """
+    Discover sub-agent JSONL files belonging to a parent session.
+
+    Handles both the current Claude Code layout and the legacy flat
+    layout that was in use before roughly 2026-01-12.
+
+    Current layout
+        ``<session_path.parent>/<session_id>/subagents/agent-<agentId>.jsonl``
+        (walked recursively in case future CC versions nest sub-agents).
+
+    Legacy layout
+        ``<session_path.parent>/agent-<short>.jsonl`` — flat files alongside
+        the parent JSONL.  Filtered by ``sessionId`` in their first
+        record to ensure they belong to this parent.
+
+    Returns paths ordered by the timestamp of each file's first record
+    (so downstream ordinal matching against parent tool-use order is
+    stable).
+    """
+    discovered: list[tuple[str, Path]] = []
+
+    # Current layout — use the parent JSONL's stem as the nesting dir name
+    current_dir = session_path.parent / session_path.stem / "subagents"
+    if current_dir.is_dir():
+        for p in current_dir.rglob("agent-*.jsonl"):
+            first = _read_first_record(p)
+            ts = (first or {}).get("timestamp") or ""
+            discovered.append((ts, p))
+
+    # Legacy layout — flat siblings of the parent JSONL
+    for p in session_path.parent.glob("agent-*.jsonl"):
+        first = _read_first_record(p)
+        if not first:
+            continue
+        if first.get("sessionId") != session_id:
+            continue
+        ts = first.get("timestamp") or ""
+        discovered.append((ts, p))
+
+    # De-duplicate (defensive; paths from the two sources should not collide)
+    seen: set[Path] = set()
+    ordered: list[Path] = []
+    for _, p in sorted(discovered, key=lambda x: x[0]):
+        if p in seen:
+            continue
+        seen.add(p)
+        ordered.append(p)
+    return ordered
+
+
+def _extract_subagent_info(agent_path: Path) -> dict[str, Any] | None:
+    """
+    Build a per-sub-agent info dictionary from its JSONL file.
+
+    Reuses :func:`extract_session_stats` for counts/tokens/tool-calls,
+    augmenting with sub-agent-specific fields (agent-id, parent message
+    uuid, first-prompt preview, content hashes).
+
+    Returns *None* if the file cannot be parsed or lacks an agent id.
+    The transient key ``_internal_path`` is included for downstream
+    helpers and is stripped before persisting.
+    """
+    first = _read_first_record(agent_path)
+    if not first:
+        return None
+    agent_id = str(first.get("agentId") or "")
+    if not agent_id:
+        return None
+
+    stats = extract_session_stats(agent_path)
+
+    # Count records (one pass over the file — cheap for typical sizes)
+    records = 0
+    with open(agent_path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            if line.strip():
+                records += 1
+
+    uncompressed_bytes = agent_path.stat().st_size
+    uncompressed_sha = _file_sha256(agent_path)
+
+    info: dict[str, Any] = {
+        "agent_id": agent_id,
+        "agent_kind": _classify_agent_kind(agent_id),
+        "parent_session_id": first.get("sessionId"),
+        "parent_session_message_uuid": first.get("parentUuid"),
+        "records": records,
+        "user_messages": stats.get("human_messages", 0),
+        "assistant_messages": stats.get("assistant_messages", 0),
+        "tool_calls": stats.get(
+            "tool_calls", {"total": 0, "by_type": {}}
+        ),
+        "tokens": stats.get(
+            "tokens",
+            {
+                "input": 0,
+                "output": 0,
+                "cache_read": 0,
+                "cache_creation": 0,
+            },
+        ),
+        "estimated_cost_usd": estimate_cost(stats),
+        "started_at": stats.get("started_at"),
+        "ended_at": stats.get("ended_at"),
+        "duration_seconds": _duration_seconds(
+            stats.get("started_at"), stats.get("ended_at"),
+        ),
+        "first_prompt_preview": _first_user_prompt_preview(agent_path),
+        "jsonl_sha256_uncompressed": uncompressed_sha,
+        "jsonl_bytes_uncompressed": uncompressed_bytes,
+        "source_path": str(agent_path),
+        "_internal_path": agent_path,
+    }
+    return info
+
+
+def _collect_parent_tool_uses(parent_path: Path) -> list[dict[str, Any]]:
+    """
+    Walk the parent JSONL and return Agent/Task ``tool_use`` blocks in order.
+
+    Each entry carries ``id`` (toolu_…), ``name``, and the input fields
+    we care about for linkage (``subagent_type``, ``description``,
+    ``prompt``).
+    """
+    results: list[dict[str, Any]] = []
+    try:
+        fh = open(parent_path, "r", encoding="utf-8")
+    except OSError:
+        return results
+    with fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            message = entry.get("message", {})
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") != "tool_use":
+                    continue
+                if block.get("name") not in _SUBAGENT_SPAWN_TOOL_NAMES:
+                    continue
+                tool_input = block.get("input") or {}
+                if not isinstance(tool_input, dict):
+                    tool_input = {}
+                results.append({
+                    "id": block.get("id"),
+                    "name": block.get("name"),
+                    "subagent_type": tool_input.get("subagent_type"),
+                    "description": tool_input.get("description"),
+                    "prompt": tool_input.get("prompt", ""),
+                })
+    return results
+
+
+def _match_subagents_to_parent_tool_uses(
+    parent_path: Path,
+    subagents: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Attach parent tool-use linkage to each user-invoked sub-agent.
+
+    Linkage is by ordinal: the k-th Agent/Task ``tool_use`` in the parent
+    JSONL is assumed to correspond to the k-th user-invoked sub-agent
+    sorted by start time.  A first-prompt-prefix match upgrades the
+    linkage from ``"inferred"`` to ``"confirmed"``.
+
+    Sub-agents classified as ``"acompact"`` / ``"aprompt_suggestion"``
+    are CC-internal and receive ``"not_applicable"`` linkage.
+    """
+    parent_calls = _collect_parent_tool_uses(parent_path)
+    user_invoked = [s for s in subagents if s["agent_kind"] == "user_invoked"]
+
+    for idx, sub in enumerate(user_invoked):
+        if idx >= len(parent_calls):
+            sub["parent_tool_use_id"] = None
+            sub["parent_tool_use_index"] = None
+            sub["subagent_type"] = None
+            sub["parent_tool_use_linkage"] = "unknown"
+            continue
+        call = parent_calls[idx]
+        sub["parent_tool_use_id"] = call["id"]
+        sub["parent_tool_use_index"] = idx + 1
+        sub["subagent_type"] = call.get("subagent_type")
+
+        child_prompt = sub.get("first_prompt_preview") or ""
+        parent_prompt_full = call.get("prompt") or ""
+        if (
+            child_prompt
+            and parent_prompt_full
+            and parent_prompt_full.startswith(child_prompt)
+        ):
+            sub["parent_tool_use_linkage"] = "confirmed"
+        else:
+            sub["parent_tool_use_linkage"] = "inferred"
+
+    for sub in subagents:
+        if sub["agent_kind"] != "user_invoked":
+            sub.setdefault("parent_tool_use_id", None)
+            sub.setdefault("parent_tool_use_index", None)
+            sub.setdefault("subagent_type", None)
+            sub.setdefault("parent_tool_use_linkage", "not_applicable")
+
+    return subagents
+
+
+def _resolve_nested_depth(subagents: list[dict[str, Any]]) -> None:
+    """
+    Populate ``depth`` and ``parent_agent_id`` for every sub-agent.
+
+    Looks up each sub-agent's ``parent_session_message_uuid`` against the
+    set of message uuids emitted by any *other* sub-agent.  If a match is
+    found, the sub-agent is nested under another sub-agent; otherwise
+    it is a top-level sub-agent of the parent session (depth 0).
+
+    Current CC (as of 2026-04-23) produces only flat sub-agents, so this
+    function ordinarily assigns ``depth = 0`` to every entry.  It exists
+    for forward-compatibility with future CC versions that may nest.
+    """
+    # Build a message-uuid -> agent-id index across sub-agents
+    agent_uuids: dict[str, str] = {}
+    for sub in subagents:
+        agent_path = sub.get("_internal_path")
+        if not isinstance(agent_path, Path) or not agent_path.is_file():
+            continue
+        with open(agent_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg_uuid = entry.get("uuid")
+                if msg_uuid:
+                    agent_uuids[msg_uuid] = sub["agent_id"]
+
+    for sub in subagents:
+        parent_msg_uuid = sub.get("parent_session_message_uuid")
+        if parent_msg_uuid and parent_msg_uuid in agent_uuids:
+            sub["depth"] = 1
+            sub["parent_agent_id"] = agent_uuids[parent_msg_uuid]
+        else:
+            sub["depth"] = 0
+            sub["parent_agent_id"] = None
+
+
+def archive_subagent_transcripts(
+    session_path: Path,
+    session_id: str,
+    dest_dir: Path,
+    *,
+    use_gzip: bool = True,
+    capture_type: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Discover, archive, and describe all sub-agent transcripts for a session.
+
+    Writes copies into ``dest_dir / "subagents" /`` (creating the
+    directory as needed) and returns a list of per-sub-agent dicts ready
+    for inclusion in ``session.meta.json``.
+
+    Idempotency: if a target file already exists and decompresses to the
+    same uncompressed content as the source, the copy is skipped and an
+    ``"idempotent: target unchanged"`` note is recorded.  If the source
+    has grown (e.g. mid-session ``PreCompact`` snapshot superseded by
+    ``SessionEnd``), the target is overwritten and a note is recorded.
+
+    Args:
+        session_path: Path to the parent session JSONL.
+        session_id: The parent session identifier (used for legacy-layout
+            filtering and directory naming).
+        dest_dir: Archive directory for this session (where
+            ``session.jsonl.gz`` was written).
+        use_gzip: If *True* (default), compress each sub-agent transcript.
+        capture_type: Propagates to each sub-agent's ``capture_type``
+            field (``"session_end"``, ``"pre_compact"``, or *None* for
+            manual/backfill use).
+
+    Returns:
+        List of sub-agent info dictionaries, each shaped for the v1.2
+        ``subagents`` field of ``session.meta.json``.  Empty list when
+        no sub-agents are found.
+    """
+    discovered = _find_subagent_jsonls(session_path, session_id)
+    if not discovered:
+        return []
+
+    subagent_infos: list[dict[str, Any]] = []
+    for p in discovered:
+        try:
+            info = _extract_subagent_info(p)
+        except OSError:
+            continue
+        if info is None:
+            continue
+        subagent_infos.append(info)
+
+    if not subagent_infos:
+        return []
+
+    # In-flight heuristic: at PreCompact, if the last record is within
+    # 60 seconds of "now" the agent may still be writing; mark as
+    # in-flight so a later SessionEnd pass can supersede cleanly.
+    now = datetime.now().astimezone()
+    for sub in subagent_infos:
+        sub["capture_notes"] = []
+        sub["capture_type"] = capture_type or "manual"
+        sub["capture_status"] = "complete"
+        if capture_type == "pre_compact" and sub.get("ended_at"):
+            try:
+                end_dt = datetime.fromisoformat(
+                    sub["ended_at"].replace("Z", "+00:00")
+                )
+                if (now - end_dt).total_seconds() < 60:
+                    sub["capture_status"] = "in_flight"
+            except (ValueError, TypeError):
+                pass
+
+    # Linkage + nesting resolution
+    _match_subagents_to_parent_tool_uses(session_path, subagent_infos)
+    _resolve_nested_depth(subagent_infos)
+
+    # Copy each sub-agent JSONL into the archive's subagents/ subdirectory
+    sub_dir = dest_dir / "subagents"
+    sub_dir.mkdir(parents=True, exist_ok=True)
+
+    for sub in subagent_infos:
+        src_path: Path = sub.pop("_internal_path")
+        agent_id = sub["agent_id"]
+        ext = ".jsonl.gz" if use_gzip else ".jsonl"
+        target = sub_dir / f"agent-{agent_id}{ext}"
+
+        if target.exists():
+            existing_sha = _existing_uncompressed_sha(target, use_gzip)
+            if existing_sha == sub["jsonl_sha256_uncompressed"]:
+                sub["archive_path"] = f"subagents/{target.name}"
+                sub["archive_compression"] = "gzip" if use_gzip else "none"
+                sub["jsonl_bytes_compressed"] = (
+                    target.stat().st_size if use_gzip else None
+                )
+                sub["jsonl_sha256"] = _file_sha256(target)
+                sub["capture_notes"].append("idempotent: target unchanged")
+                continue
+            sub["capture_notes"].append(
+                "superseded prior capture; source sha differed"
+            )
+
+        if use_gzip:
+            with open(src_path, "rb") as f_in, gzip.open(target, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        else:
+            shutil.copy2(src_path, target)
+
+        sub["archive_path"] = f"subagents/{target.name}"
+        sub["archive_compression"] = "gzip" if use_gzip else "none"
+        sub["jsonl_bytes_compressed"] = (
+            target.stat().st_size if use_gzip else None
+        )
+        sub["jsonl_sha256"] = _file_sha256(target)
+
+    return subagent_infos
+
+
+def summarise_subagents(
+    subagents: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Produce a rollup block for ``statistics.subagents_summary``.
+
+    Aggregates per-sub-agent records, tokens, estimated cost, and counts
+    by ``subagent_type`` / ``capture_status`` / ``agent_kind``.  Empty
+    sub-agent lists return a zero-valued rollup so downstream consumers
+    can key off a known shape.
+    """
+    total_input = 0
+    total_output = 0
+    total_cost = 0.0
+    total_records = 0
+    by_type: dict[str, int] = {}
+    by_kind: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    for sub in subagents:
+        tokens = sub.get("tokens") or {}
+        total_input += tokens.get("input", 0) or 0
+        total_output += tokens.get("output", 0) or 0
+        total_cost += float(sub.get("estimated_cost_usd") or 0.0)
+        total_records += sub.get("records", 0) or 0
+        st = sub.get("subagent_type") or "unspecified"
+        by_type[st] = by_type.get(st, 0) + 1
+        kind = sub.get("agent_kind", "unknown")
+        by_kind[kind] = by_kind.get(kind, 0) + 1
+        status = sub.get("capture_status", "complete")
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    return {
+        "count": len(subagents),
+        "total_records": total_records,
+        "total_tokens": {"input": total_input, "output": total_output},
+        "estimated_cost_usd": round(total_cost, 4),
+        "by_type": by_type,
+        "by_kind": by_kind,
+        "capture_status_counts": status_counts,
+    }
 
 
 # -------------------------------------------------------------------------

@@ -12,7 +12,7 @@ from typing import Any
 # Schema
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = "1.1"
+SCHEMA_VERSION = "1.2"
 
 # ---------------------------------------------------------------------------
 # Global archive defaults (for hook-based automated archiving)
