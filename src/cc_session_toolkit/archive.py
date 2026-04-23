@@ -1054,6 +1054,11 @@ def archive_session(
 
     # Archive any sub-agent transcripts alongside the parent (v1.2).
     # Keeps parent + sub-agents co-located as one atomic archive unit.
+    # Exceptions here never propagate — the parent archive is more
+    # valuable than any single sub-agent rescue — but we route the
+    # failure through _log_metadata_event so it lands in
+    # auto-metadata.log with enough context to diagnose, rather than
+    # vanishing into hook stdout.
     try:
         subagents = archive_subagent_transcripts(
             session_path=session_path,
@@ -1064,6 +1069,14 @@ def archive_session(
         )
     except Exception as exc:  # noqa: BLE001 — never fail parent archive
         print(f"  [warn] Sub-agent archival failed: {exc}")
+        _log_metadata_event(
+            (
+                f"Sub-agent archival failed for session_id={session_id} "
+                f"source={session_path} dest={dest_dir}: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            level="WARNING",
+        )
         subagents = []
     if subagents:
         print(
@@ -1150,6 +1163,34 @@ def _read_first_record(path: Path) -> dict[str, Any] | None:
     return None
 
 
+def _extract_user_prompt_from_entry(
+    entry: dict[str, Any],
+    limit: int = 200,
+) -> str | None:
+    """
+    Return the first ``limit`` characters of a user message's content,
+    or *None* if the entry is not a user message with recognisable content.
+
+    Kept separate from :func:`_first_user_prompt_preview` so a single-pass
+    walker can reuse the extraction logic without re-opening the file.
+    """
+    if entry.get("type") != "user":
+        return None
+    message = entry.get("message", {})
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content[:limit]
+    if isinstance(content, list):
+        # Prefer the first text block when content is a list
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                return str(block.get("text", ""))[:limit]
+        return json.dumps(content)[:limit]
+    return ""
+
+
 def _first_user_prompt_preview(path: Path, limit: int = 200) -> str:
     """Return the first ``limit`` characters of the first user message."""
     try:
@@ -1161,22 +1202,9 @@ def _first_user_prompt_preview(path: Path, limit: int = 200) -> str:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if entry.get("type") != "user":
-                    continue
-                message = entry.get("message", {})
-                content = message.get("content", "")
-                if isinstance(content, str):
-                    return content[:limit]
-                if isinstance(content, list):
-                    # Prefer the first text block when content is a list
-                    for block in content:
-                        if (
-                            isinstance(block, dict)
-                            and block.get("type") == "text"
-                        ):
-                            return str(block.get("text", ""))[:limit]
-                    return json.dumps(content)[:limit]
-                return ""
+                preview = _extract_user_prompt_from_entry(entry, limit)
+                if preview is not None:
+                    return preview
     except OSError:
         return ""
     return ""
@@ -1285,15 +1313,47 @@ def _extract_subagent_info(agent_path: Path) -> dict[str, Any] | None:
     """
     Build a per-sub-agent info dictionary from its JSONL file.
 
-    Reuses :func:`extract_session_stats` for counts/tokens/tool-calls,
-    augmenting with sub-agent-specific fields (agent-id, parent message
-    uuid, first-prompt preview, content hashes).
+    Single JSON-parsing pass captures first record, line count, and the
+    first user-message preview.  A second pass through
+    :func:`extract_session_stats` (shared with the parent-session code
+    path — not duplicated here) extracts counts, tokens, and tool-call
+    breakdowns.  A third binary pass computes the uncompressed sha256.
+    Three passes rather than five; the remaining two are either shared
+    code or necessarily separate (binary vs text).
+
+    ``duration_seconds`` here is deliberately seconds, not minutes:
+    sub-agent runs are commonly under 60 s and minute-resolution would
+    round most to zero.  Parent-session metadata uses
+    ``duration_minutes`` because sessions span hours.  Readers
+    interpreting both at once should key off the unit in the field name.
 
     Returns *None* if the file cannot be parsed or lacks an agent id.
     The transient key ``_internal_path`` is included for downstream
     helpers and is stripped before persisting.
     """
-    first = _read_first_record(agent_path)
+    first: dict[str, Any] | None = None
+    records = 0
+    first_prompt_preview = ""
+    try:
+        fh = open(agent_path, "r", encoding="utf-8")
+    except OSError:
+        return None
+    with fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            records += 1
+            if first is None:
+                first = entry
+            if not first_prompt_preview:
+                preview = _extract_user_prompt_from_entry(entry)
+                if preview is not None:
+                    first_prompt_preview = preview
+
     if not first:
         return None
     agent_id = str(first.get("agentId") or "")
@@ -1301,18 +1361,10 @@ def _extract_subagent_info(agent_path: Path) -> dict[str, Any] | None:
         return None
 
     stats = extract_session_stats(agent_path)
-
-    # Count records (one pass over the file — cheap for typical sizes)
-    records = 0
-    with open(agent_path, "r", encoding="utf-8") as fh:
-        for line in fh:
-            if line.strip():
-                records += 1
-
     uncompressed_bytes = agent_path.stat().st_size
     uncompressed_sha = _file_sha256(agent_path)
 
-    info: dict[str, Any] = {
+    return {
         "agent_id": agent_id,
         "agent_kind": _classify_agent_kind(agent_id),
         "parent_session_id": first.get("sessionId"),
@@ -1338,13 +1390,12 @@ def _extract_subagent_info(agent_path: Path) -> dict[str, Any] | None:
         "duration_seconds": _duration_seconds(
             stats.get("started_at"), stats.get("ended_at"),
         ),
-        "first_prompt_preview": _first_user_prompt_preview(agent_path),
+        "first_prompt_preview": first_prompt_preview,
         "jsonl_sha256_uncompressed": uncompressed_sha,
         "jsonl_bytes_uncompressed": uncompressed_bytes,
         "source_path": str(agent_path),
         "_internal_path": agent_path,
     }
-    return info
 
 
 def _collect_parent_tool_uses(parent_path: Path) -> list[dict[str, Any]]:
@@ -1445,12 +1496,33 @@ def _match_subagents_to_parent_tool_uses(
 
 def _resolve_nested_depth(subagents: list[dict[str, Any]]) -> None:
     """
-    Populate ``depth`` and ``parent_agent_id`` for every sub-agent.
+    Populate ``depth``, ``depth_is_exact``, and ``parent_agent_id`` for
+    every sub-agent.
 
     Looks up each sub-agent's ``parent_session_message_uuid`` against the
     set of message uuids emitted by any *other* sub-agent.  If a match is
     found, the sub-agent is nested under another sub-agent; otherwise
     it is a top-level sub-agent of the parent session (depth 0).
+
+    Depth semantics:
+
+    - ``depth = 0`` means top-level (parent message uuid belongs to the
+      parent session's main JSONL).  ``depth_is_exact = True`` — we are
+      certain.
+    - ``depth = 1`` when a parent-agent match is found.  This is a
+      *minimum bound*, not an exact depth — a true depth-2 agent (A
+      spawns B spawns C) would still report ``depth = 1`` because the
+      single-hop lookup cannot distinguish.  ``depth_is_exact = False``
+      flags this.  A future CC version that exposes filesystem-nested
+      sub-agents (``subagents/.../subagents/...``) would let us compute
+      exact depth via directory structure; until then the min-bound is
+      honest.
+
+    Readers should use ``depth == 0`` as "definitely top-level" and
+    ``depth >= 1 and not depth_is_exact`` as "nested, true depth unknown".
+    Absence of ``depth_is_exact`` in pre-2026-04-23 backfilled archives
+    should be treated as True — all such entries had ``depth = 0`` and
+    depth 0 is always exact.
 
     Current CC (as of 2026-04-23) produces only flat sub-agents, so this
     function ordinarily assigns ``depth = 0`` to every entry.  It exists
@@ -1478,9 +1550,11 @@ def _resolve_nested_depth(subagents: list[dict[str, Any]]) -> None:
         parent_msg_uuid = sub.get("parent_session_message_uuid")
         if parent_msg_uuid and parent_msg_uuid in agent_uuids:
             sub["depth"] = 1
+            sub["depth_is_exact"] = False
             sub["parent_agent_id"] = agent_uuids[parent_msg_uuid]
         else:
             sub["depth"] = 0
+            sub["depth_is_exact"] = True
             sub["parent_agent_id"] = None
 
 
@@ -1636,7 +1710,7 @@ def summarise_subagents(
         "count": len(subagents),
         "total_records": total_records,
         "total_tokens": {"input": total_input, "output": total_output},
-        "estimated_cost_usd": round(total_cost, 4),
+        "estimated_cost_usd": round(total_cost, 2),
         "by_type": by_type,
         "by_kind": by_kind,
         "capture_status_counts": status_counts,
