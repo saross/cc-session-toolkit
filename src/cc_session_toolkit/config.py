@@ -15,6 +15,34 @@ from typing import Any
 SCHEMA_VERSION = "1.2"
 
 # ---------------------------------------------------------------------------
+# Extractor model
+# ---------------------------------------------------------------------------
+# The Anthropic model used for automatic metadata generation
+# (title / purpose / tags / Three Ps summaries). Surfaced in
+# ``session.meta.json`` under ``provenance.extractor_model_id`` so that
+# downstream RO-Crate / FAIR consumers can attribute the generated
+# fields to a specific model version — provenance audit Gap 3, 2026-05-17.
+#
+# Bumping this constant: change in lockstep with any other Haiku
+# references in the toolkit and flag in the changelog. PA's
+# ``hooks/extraction-hook.py`` carries an independent ``HAIKU_MODEL``
+# constant for memory extraction; the two are deliberately
+# loose-coupled because they may move on different cadences.
+EXTRACTOR_MODEL_ID = "claude-haiku-4-5-20251001"
+
+# ---------------------------------------------------------------------------
+# Sharing licence default
+# ---------------------------------------------------------------------------
+# Default ``licence`` field for ``session.meta.json`` records (provenance
+# audit Gap 3, 2026-05-17). Left as ``None`` so the user explicitly opts
+# in to a licence string at the moment a session record becomes
+# shareable. RO-Crate spec requires a licence URI on shared records;
+# emitting one by default would either (a) lie about a non-existent
+# project-wide policy or (b) silently commit Shawn to a default he never
+# chose. Both worse than ``None``.
+DEFAULT_LICENCE: str | None = None
+
+# ---------------------------------------------------------------------------
 # Global archive defaults (for hook-based automated archiving)
 # ---------------------------------------------------------------------------
 

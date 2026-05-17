@@ -14,17 +14,20 @@ import hashlib
 import json
 import re
 import shutil
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from cc_session_toolkit.config import (
+    DEFAULT_LICENCE,
     DEFAULT_MIN_DURATION_MINUTES,
     DEFAULT_MIN_TURNS,
     DEFAULT_THINKING_EXCLUDED_USES,
     DEFAULT_THINKING_NATURE_NOTE,
     DEFAULT_THINKING_SHARING,
     DEFAULT_THINKING_USE_CONSTRAINTS,
+    EXTRACTOR_MODEL_ID,
     SCHEMA_VERSION,
     load_defaults,
 )
@@ -458,7 +461,7 @@ def generate_auto_metadata(
         )
 
         response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=EXTRACTOR_MODEL_ID,
             max_tokens=512,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -621,6 +624,92 @@ def _find_previous_session(
 
 
 # -------------------------------------------------------------------------
+# Code-state capture (provenance audit Gap 2)
+# -------------------------------------------------------------------------
+
+def _run_git(args: list[str], cwd: Path) -> tuple[bool, str]:
+    """
+    Run a git command in ``cwd`` and return ``(ok, stdout)``.
+
+    ``ok`` is *True* only when the binary executed and exited with code
+    0. ``stdout`` is the (possibly empty) stripped stdout. The two-tuple
+    shape lets callers disambiguate "command succeeded with empty
+    output" (e.g. ``git status --porcelain`` on a clean tree) from
+    "command failed" — both produce empty strings under a single-return
+    contract.
+
+    Provenance capture is best-effort: any failure mode (missing git
+    binary, not a git repo, timeout, non-zero exit) yields
+    ``(False, "")`` and is never surfaced as an exception. Archiving
+    must not break when git is unavailable.
+    """
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False, ""
+    if result.returncode != 0:
+        return False, ""
+    return True, result.stdout.strip()
+
+
+def capture_code_state(project_root: Path | None) -> dict[str, Any]:
+    """
+    Capture the working tree's git state at archive time.
+
+    Returns a dict with three keys (provenance audit Gap 2, 2026-05-17):
+
+    - ``commit_at_start``: HEAD at session start. Always *None* from
+      this function — capture at session start requires a side-channel
+      (e.g. a SessionStart hook writing a sidecar keyed by session id)
+      that does not yet exist. Kept in the schema so a later SessionStart
+      hook can fill it without a further schema bump.
+    - ``commit_at_end``: HEAD at the moment of archive (i.e. now).
+      Resolved via ``git rev-parse HEAD`` in *project_root*. *None* if
+      *project_root* is missing, not a git repo, or the command fails.
+    - ``dirty_at_end``: *True* when ``git status --porcelain`` returns
+      non-empty output (i.e. there are uncommitted changes, including
+      untracked files, in the working tree). *None* when the dirty
+      check could not be run.
+
+    Best-effort: any git failure produces *None* for the affected
+    field rather than raising. Provenance capture must never break
+    archiving.
+    """
+    state: dict[str, Any] = {
+        "commit_at_start": None,
+        "commit_at_end": None,
+        "dirty_at_end": None,
+    }
+    if project_root is None or not project_root.is_dir():
+        return state
+
+    ok, commit = _run_git(["rev-parse", "HEAD"], project_root)
+    if not ok or not commit:
+        # Not a git repo (or git unavailable) — leave all fields None.
+        # The dirty check is meaningless without a repo to dirty.
+        return state
+    state["commit_at_end"] = commit
+
+    ok, porcelain = _run_git(["status", "--porcelain"], project_root)
+    if ok:
+        # Empty porcelain output means a clean tree; any output at all
+        # means uncommitted changes (including untracked files).
+        state["dirty_at_end"] = bool(porcelain)
+    # else: dirty_at_end stays None — we recorded the commit hash but
+    # couldn't ascertain dirtiness; better to surface uncertainty than
+    # to assume one way.
+
+    return state
+
+
+# -------------------------------------------------------------------------
 # Metadata creation
 # -------------------------------------------------------------------------
 
@@ -640,6 +729,9 @@ def create_session_metadata(
     project_name_override: str | None = None,
     capture_type: str | None = None,
     subagents: list[dict[str, Any]] | None = None,
+    licence: str | None = None,
+    extractor_model_id: str | None = None,
+    code_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Create the complete ``session.meta.json`` structure (v1.2 schema).
@@ -666,6 +758,22 @@ def create_session_metadata(
             :func:`archive_subagent_transcripts`.  Populates the v1.2
             ``subagents`` top-level field and the
             ``statistics.subagents_summary`` rollup.
+        licence: Optional licence string for sharing the record (RO-Crate
+            field, provenance audit Gap 3).  Defaults to
+            :data:`cc_session_toolkit.config.DEFAULT_LICENCE` (``None``)
+            so the user explicitly opts in to a licence at the moment
+            the record becomes shareable.
+        extractor_model_id: Model identifier responsible for any
+            auto-generated metadata in this record (Three Ps summaries,
+            title, purpose, tags).  Defaults to
+            :data:`cc_session_toolkit.config.EXTRACTOR_MODEL_ID`.
+            Surfaced for RO-Crate attribution (provenance audit Gap 3).
+        code_state: Pre-computed code-state dict
+            ``{commit_at_start, commit_at_end, dirty_at_end}``.  When
+            *None*, :func:`capture_code_state` is invoked against
+            *project_root* to populate it.  Pass an explicit dict to
+            override capture (e.g. when restoring from a sidecar with
+            ``commit_at_start`` already known).  Provenance audit Gap 2.
 
     Returns:
         Complete metadata dictionary.
@@ -780,6 +888,21 @@ def create_session_metadata(
         if "compressed_sha256" in compression_info:
             archive["jsonl_sha256"] = compression_info["compressed_sha256"]
 
+    # Provenance audit Gap 2 (2026-05-17): capture working-tree git
+    # state at archive time. Best-effort; missing/unreachable git
+    # collapses to None values rather than aborting.
+    if code_state is None:
+        code_state = capture_code_state(project_root)
+
+    # Provenance audit Gap 3 (2026-05-17): resolve sharing licence and
+    # the model that produced auto-generated metadata. Defaults live in
+    # ``cc_session_toolkit.config`` so they can be swept in lockstep.
+    resolved_licence = licence if licence is not None else DEFAULT_LICENCE
+    resolved_extractor = (
+        extractor_model_id if extractor_model_id is not None
+        else EXTRACTOR_MODEL_ID
+    )
+
     metadata = {
         "schema_version": SCHEMA_VERSION,
         "session": {
@@ -816,6 +939,15 @@ def create_session_metadata(
                 "provenance_summary": "",
             },
         ),
+        # Provenance audit Gaps 2 + 3 (2026-05-17). ``code_state``
+        # anchors the record to the working tree's git HEAD at archive
+        # time; ``licence`` is RO-Crate's sharing field (populated by
+        # the user when records become shareable); ``extractor_model_id``
+        # attributes the Three Ps / auto_generated fields to a specific
+        # model version.
+        "code_state": code_state,
+        "licence": resolved_licence,
+        "extractor_model_id": resolved_extractor,
         "archive": archive,
         "subagents": subagents_list,
     }

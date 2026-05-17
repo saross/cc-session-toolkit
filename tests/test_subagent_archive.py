@@ -21,11 +21,16 @@ from cc_session_toolkit.archive import (
     _match_subagents_to_parent_tool_uses,
     _resolve_nested_depth,
     archive_subagent_transcripts,
+    capture_code_state,
     create_session_metadata,
     get_session_files,
     summarise_subagents,
 )
-from cc_session_toolkit.config import SCHEMA_VERSION
+from cc_session_toolkit.config import (
+    DEFAULT_LICENCE,
+    EXTRACTOR_MODEL_ID,
+    SCHEMA_VERSION,
+)
 from cc_session_toolkit.extraction import extract_session_stats
 
 
@@ -785,3 +790,205 @@ class TestGetSessionFilesFiltering:
         assert "abc-main.jsonl" in names
         assert "xyz-main.jsonl" in names
         assert "agent-subagent01.jsonl" not in names
+
+
+# -------------------------------------------------------------------------
+# Provenance audit Gap 2 — code_state capture
+# -------------------------------------------------------------------------
+
+
+def _init_git_repo(path: Path) -> str:
+    """
+    Initialise a minimal git repo at ``path`` and return the HEAD sha.
+
+    Helper for code_state tests. Uses ``git init -q`` + a single empty
+    commit so we have a deterministic HEAD to assert against. Each
+    test runs in an isolated tmp_path so there is no cross-contamination.
+    """
+    import subprocess as sp
+    env = {
+        "GIT_AUTHOR_NAME": "test",
+        "GIT_AUTHOR_EMAIL": "test@example.invalid",
+        "GIT_COMMITTER_NAME": "test",
+        "GIT_COMMITTER_EMAIL": "test@example.invalid",
+        # Suppress global gitconfig interference (e.g. signing keys)
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "HOME": str(path),
+    }
+    sp.run(["git", "init", "-q"], cwd=path, check=True, env=env)
+    sp.run(
+        ["git", "commit", "--allow-empty", "-q", "-m", "init"],
+        cwd=path, check=True, env=env,
+    )
+    return sp.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=path, check=True, capture_output=True, text=True, env=env,
+    ).stdout.strip()
+
+
+class TestCaptureCodeState:
+    """Tests for :func:`capture_code_state` (provenance audit Gap 2)."""
+
+    def test_returns_none_for_missing_project_root(self) -> None:
+        """A *None* project root yields all-None fields."""
+        state = capture_code_state(None)
+        assert state == {
+            "commit_at_start": None,
+            "commit_at_end": None,
+            "dirty_at_end": None,
+        }
+
+    def test_returns_none_for_nonexistent_path(
+        self, tmp_path: Path,
+    ) -> None:
+        """Non-existent project root path yields all-None fields."""
+        state = capture_code_state(tmp_path / "does-not-exist")
+        assert state["commit_at_end"] is None
+        assert state["dirty_at_end"] is None
+
+    def test_returns_none_for_non_git_directory(
+        self, tmp_path: Path,
+    ) -> None:
+        """A real directory that is not a git repo yields all-None."""
+        bare = tmp_path / "bare-dir"
+        bare.mkdir()
+        state = capture_code_state(bare)
+        assert state["commit_at_end"] is None
+        assert state["dirty_at_end"] is None
+
+    def test_captures_commit_on_clean_tree(
+        self, tmp_path: Path,
+    ) -> None:
+        """A clean git repo yields ``commit_at_end`` and ``dirty_at_end=False``."""
+        repo = tmp_path / "clean-repo"
+        repo.mkdir()
+        head = _init_git_repo(repo)
+        state = capture_code_state(repo)
+        assert state["commit_at_end"] == head
+        assert state["dirty_at_end"] is False
+        # commit_at_start is always None from this function — that
+        # capture would need a SessionStart-hook side-channel.
+        assert state["commit_at_start"] is None
+
+    def test_detects_dirty_tree_via_untracked(
+        self, tmp_path: Path,
+    ) -> None:
+        """An untracked file counts as dirty per ``git status --porcelain``."""
+        repo = tmp_path / "dirty-repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+        (repo / "scratch.txt").write_text("untracked content\n")
+        state = capture_code_state(repo)
+        assert state["commit_at_end"] is not None
+        assert state["dirty_at_end"] is True
+
+
+# -------------------------------------------------------------------------
+# Provenance audit Gaps 2 + 3 — session.meta.json provenance fields
+# -------------------------------------------------------------------------
+
+
+class TestSessionMetaProvenance:
+    """Provenance fields landed on ``session.meta.json`` (Gaps 2 + 3)."""
+
+    def test_code_state_present_with_default_capture(
+        self, sample_session_jsonl: Path,
+    ) -> None:
+        """``code_state`` is present and has the three expected keys."""
+        stats = extract_session_stats(sample_session_jsonl)
+        meta = create_session_metadata(
+            session_id="abc12345",
+            session_path=sample_session_jsonl,
+            stats=stats,
+        )
+        assert "code_state" in meta
+        assert set(meta["code_state"].keys()) == {
+            "commit_at_start", "commit_at_end", "dirty_at_end",
+        }
+
+    def test_code_state_populated_when_project_root_is_git_repo(
+        self, sample_session_jsonl: Path, tmp_path: Path,
+    ) -> None:
+        """When *project_root* is a git repo, code_state captures HEAD."""
+        repo = tmp_path / "session-repo"
+        repo.mkdir()
+        head = _init_git_repo(repo)
+        stats = extract_session_stats(sample_session_jsonl)
+        meta = create_session_metadata(
+            session_id="abc12345",
+            session_path=sample_session_jsonl,
+            stats=stats,
+            project_root=repo,
+        )
+        assert meta["code_state"]["commit_at_end"] == head
+        assert meta["code_state"]["dirty_at_end"] is False
+
+    def test_code_state_override(
+        self, sample_session_jsonl: Path,
+    ) -> None:
+        """An explicit ``code_state`` dict overrides capture."""
+        stats = extract_session_stats(sample_session_jsonl)
+        explicit = {
+            "commit_at_start": "deadbeef" * 5,
+            "commit_at_end": "feedface" * 5,
+            "dirty_at_end": True,
+        }
+        meta = create_session_metadata(
+            session_id="abc12345",
+            session_path=sample_session_jsonl,
+            stats=stats,
+            code_state=explicit,
+        )
+        assert meta["code_state"] == explicit
+
+    def test_licence_defaults_to_none(
+        self, sample_session_jsonl: Path,
+    ) -> None:
+        """RO-Crate ``licence`` defaults to ``None`` (user opts in later)."""
+        stats = extract_session_stats(sample_session_jsonl)
+        meta = create_session_metadata(
+            session_id="abc12345",
+            session_path=sample_session_jsonl,
+            stats=stats,
+        )
+        assert meta["licence"] is DEFAULT_LICENCE
+        assert meta["licence"] is None
+
+    def test_licence_explicit_override(
+        self, sample_session_jsonl: Path,
+    ) -> None:
+        """An explicit ``licence`` string lands on the record."""
+        stats = extract_session_stats(sample_session_jsonl)
+        meta = create_session_metadata(
+            session_id="abc12345",
+            session_path=sample_session_jsonl,
+            stats=stats,
+            licence="CC-BY-4.0",
+        )
+        assert meta["licence"] == "CC-BY-4.0"
+
+    def test_extractor_model_id_defaults_to_config_constant(
+        self, sample_session_jsonl: Path,
+    ) -> None:
+        """``extractor_model_id`` defaults to the toolkit-wide constant."""
+        stats = extract_session_stats(sample_session_jsonl)
+        meta = create_session_metadata(
+            session_id="abc12345",
+            session_path=sample_session_jsonl,
+            stats=stats,
+        )
+        assert meta["extractor_model_id"] == EXTRACTOR_MODEL_ID
+
+    def test_extractor_model_id_explicit_override(
+        self, sample_session_jsonl: Path,
+    ) -> None:
+        """An explicit ``extractor_model_id`` overrides the default."""
+        stats = extract_session_stats(sample_session_jsonl)
+        meta = create_session_metadata(
+            session_id="abc12345",
+            session_path=sample_session_jsonl,
+            stats=stats,
+            extractor_model_id="claude-opus-4-7",
+        )
+        assert meta["extractor_model_id"] == "claude-opus-4-7"
