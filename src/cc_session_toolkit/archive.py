@@ -12,7 +12,6 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
-import re
 import shutil
 import subprocess
 from datetime import datetime
@@ -20,6 +19,9 @@ from pathlib import Path
 from typing import Any
 
 from cc_session_toolkit.config import (
+    AUTO_METADATA_FLEX_RETRY_WAITS_SECONDS,
+    AUTO_METADATA_MAX_OUTPUT_TOKENS,
+    CODE_STATE_SIDECAR_DIR,
     DEFAULT_LICENCE,
     DEFAULT_MIN_DURATION_MINUTES,
     DEFAULT_MIN_TURNS,
@@ -168,80 +170,33 @@ def is_already_archived(
     return session_id in get_archived_session_ids(catalogue_file)
 
 
-# Short confirmations and housekeeping phrases (case-insensitive).
-# Only checked when the message is under 40 characters.
-_META_SHORT_PATTERNS: frozenset[str] = frozenset({
-    "yes", "no", "ok", "okay", "sure", "nope",
-    "go ahead", "looks good", "lgtm",
-    "thanks", "thank you", "perfect", "great", "nice",
-    "do it", "commit", "push", "done",
-    "agreed", "exactly", "correct", "right", "good",
-    "yep", "yeah", "please", "proceed", "continue", "approved",
-})
-
-# Substrings that mark a message as meta regardless of length.
-_META_SUBSTRINGS: tuple[str, ...] = (
-    "commit and push",
-    "commit this",
-    "push this",
-    "session summary",
-    "please commit",
-    "go ahead and commit",
-)
-
-
-def _is_meta_message(text: str) -> bool:
+def _ensure_gemini_api_key() -> str | None:
     """
-    Check whether a user message is meta/housekeeping rather than
-    substantive work direction.
+    Resolve the Gemini API key from the environment, with a PA
+    ``.env`` fallback.
 
-    Meta messages include slash commands, short confirmations, and
-    commit/push instructions.  These are filtered before sampling
-    to ensure the "last N" messages reflect actual work, not session
-    wrap-up.
+    When called from Claude Code hooks, environment variables exported
+    via the launcher may not survive the shell chain. This helper
+    mirrors the old ``_ensure_anthropic_api_key`` semantics for the
+    Gemini case: check ``GEMINI_API_KEY`` first, then ``GOOGLE_API_KEY``
+    (both are accepted by ``google.genai.Client()``), then sniff the
+    personal-assistant ``.env`` file for the same names.
 
-    Args:
-        text: The user message text.
-
-    Returns:
-        *True* if the message should be excluded from sampling.
-    """
-    stripped = text.strip()
-    if not stripped:
-        return True
-
-    # Slash commands (/recap, /done, /reflect, etc.)
-    if stripped.startswith("/"):
-        return True
-
-    lower = stripped.lower().rstrip(".!?,")
-
-    # Short confirmations / housekeeping
-    if len(stripped) < 40 and lower in _META_SHORT_PATTERNS:
-        return True
-
-    # Substring matches (any length)
-    lower_full = stripped.lower()
-    return any(sub in lower_full for sub in _META_SUBSTRINGS)
-
-
-def _ensure_anthropic_api_key() -> None:
-    """
-    Ensure ``ANTHROPIC_API_KEY`` is available in the environment.
-
-    When called from Claude Code hooks, the environment variable may
-    not survive the shell export chain.  This function provides a
-    fallback: if the key is missing, it reads ``~/personal-assistant/.env``
-    directly and injects the key into ``os.environ``.
+    Returns the resolved key (after setting it into ``os.environ`` if it
+    came from the .env file), or *None* when no key is available. The
+    caller is expected to refuse to make the API call when *None* is
+    returned.
     """
     import os
 
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        value = os.environ.get(name)
+        if value:
+            return value
 
     env_path = Path.home() / "personal-assistant" / ".env"
     if not env_path.is_file():
-        return
+        return None
 
     for line in env_path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
@@ -250,9 +205,10 @@ def _ensure_anthropic_api_key() -> None:
         key, _, value = stripped.partition("=")
         key = key.strip()
         value = value.strip().strip("\"'")
-        if key == "ANTHROPIC_API_KEY" and value:
-            os.environ["ANTHROPIC_API_KEY"] = value
-            return
+        if key in ("GEMINI_API_KEY", "GOOGLE_API_KEY") and value:
+            os.environ[key] = value
+            return value
+    return None
 
 
 def _log_metadata_event(
@@ -279,240 +235,326 @@ def _log_metadata_event(
         pass  # logging must never break the archive
 
 
+def _load_auto_metadata_prompt() -> str:
+    """
+    Load the production auto-metadata system prompt.
+
+    The prompt is shipped as package data at
+    ``src/cc_session_toolkit/prompts/auto_metadata.md`` (see
+    ``pyproject.toml`` ``[tool.setuptools.package-data]``). It is the
+    production-candidate ``prompt-gemini-v2.md`` from the 2026-05-18
+    bake-off; see continuity log workstream F.
+
+    Environment variable ``CC_AUTO_METADATA_PROMPT_PATH`` overrides the
+    bundled prompt with an arbitrary filesystem path — useful for
+    iterating on the prompt without re-installing the package.
+    """
+    import os
+
+    override = os.environ.get("CC_AUTO_METADATA_PROMPT_PATH")
+    if override:
+        return Path(override).read_text(encoding="utf-8")
+
+    # importlib.resources is the canonical way to read package data
+    # under modern Python. The ``files`` API arrived in 3.9 and is
+    # what setuptools' package_data ships with.
+    from importlib.resources import files
+
+    return (
+        files("cc_session_toolkit.prompts")
+        .joinpath("auto_metadata.md")
+        .read_text(encoding="utf-8")
+    )
+
+
+def _build_auto_metadata_user_message(
+    *,
+    session_id: str,
+    project: str,
+    started_at: str,
+    content_tokens: int,
+    transcript_text: str,
+) -> str:
+    """
+    Build the user-message payload for the Gemini auto-metadata call.
+
+    Structural contract (architectural decision 2026-05-18):
+    - System instruction carries the role + contracts + JSON output
+      spec; this user message carries the *input* (header + transcript)
+      plus a post-transcript output reminder.
+    - Transcript is wrapped in ``<transcript>`` tags with neutral
+      ``--- Role ---`` dividers (not square-bracket chat markers).
+      This combination defeats the failure mode where Haiku and Gemini
+      would *continue* the conversation instead of summarising it.
+    - Output reminder lives *after* the closing ``</transcript>`` tag
+      so recency favours the contract rather than the transcript tail.
+    """
+    header = (
+        "## Session metadata header (not authoritative — transcript wins)\n"
+        f"- Session ID: {session_id}\n"
+        f"- Project: {project}\n"
+        f"- Started at: {started_at}\n"
+        f"- Distilled content tokens (chars/4): {content_tokens:,}\n"
+    )
+    postamble = (
+        "## Output reminder\n\n"
+        "You have now read the complete transcript. Return a single JSON "
+        "object with keys ``title``, ``purpose``, ``tags``, and "
+        "``three_ps`` (an object with ``prompt_summary``, "
+        "``process_summary``, ``provenance_summary``). Field contracts "
+        "and anti-satisficing rules are in the system prompt; apply them.\n\n"
+        "You are an outside observer summarising the transcript. You are "
+        "not a participant. Do not continue the conversation.\n\n"
+        "Begin output with ``{`` on the very next character. End with "
+        "``}``. No markdown code fence. Nothing before, nothing after."
+    )
+    return (
+        f"{header}\n"
+        f"<transcript>\n"
+        f"{transcript_text}\n"
+        f"</transcript>\n\n"
+        f"{postamble}"
+    )
+
+
+def _parse_metadata_response_json(raw_text: str) -> dict[str, Any]:
+    """
+    Parse a JSON object out of a model response.
+
+    The prompt instructs the model to emit bare JSON (no fences), but
+    real-world models intermittently wrap output in ``` json blocks.
+    This strips any single leading/trailing fence and then tries
+    ``json.loads``. On any failure, raises ``ValueError`` so callers
+    can record the raw text for diagnosis.
+    """
+    text = raw_text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines and lines[-1].startswith("```"):
+            text = "\n".join(lines[1:-1])
+        else:
+            text = "\n".join(lines[1:])
+        text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"JSON parse failed: {exc}") from exc
+
+
+def _call_gemini_once(
+    client: Any,
+    user_message: str,
+    system_prompt: str,
+) -> str:
+    """
+    Single Flex-tier Gemini call. Raises on any error; returns raw text.
+
+    ``thinking_budget=0`` is mandatory (architectural decision
+    2026-05-18): Gemini 3 Flash Preview is a reasoning model and without
+    this flag thinking tokens consume the output budget before any JSON
+    is emitted. ``service_tier="flex"`` selects the discounted tier;
+    list price ~½ Haiku Batch.
+    """
+    response = client.models.generate_content(
+        model=EXTRACTOR_MODEL_ID,
+        contents=user_message,
+        config={
+            "service_tier": "flex",
+            "max_output_tokens": AUTO_METADATA_MAX_OUTPUT_TOKENS,
+            "system_instruction": system_prompt,
+            "thinking_config": {"thinking_budget": 0},
+        },
+    )
+    return response.text
+
+
+def _call_gemini_with_retry(
+    client: Any,
+    user_message: str,
+    system_prompt: str,
+) -> str:
+    """
+    Call Gemini Flex with exponential-backoff retries on HTTP 503.
+
+    Flex preemption surfaces as HTTP 503 "Service Unavailable" (see
+    Google's Flex documentation). We retry on 503 specifically; other
+    errors propagate. The schedule is configurable via
+    ``AUTO_METADATA_FLEX_RETRY_WAITS_SECONDS``.
+    """
+    import time
+
+    last_exc: Exception | None = None
+    waits: tuple[int, ...] = (0,) + tuple(
+        AUTO_METADATA_FLEX_RETRY_WAITS_SECONDS
+    )
+    for attempt, wait_seconds in enumerate(waits):
+        if wait_seconds:
+            _log_metadata_event(
+                f"Gemini Flex preempted; waiting {wait_seconds}s before "
+                f"retry (attempt {attempt + 1}/{len(waits)})",
+                level="WARNING",
+            )
+            time.sleep(wait_seconds)
+        try:
+            return _call_gemini_once(client, user_message, system_prompt)
+        except Exception as exc:  # noqa: BLE001 — narrow below
+            last_exc = exc
+            # Detect 503 from the exception text rather than importing
+            # the specific error class — the SDK may not be available
+            # at module-load time on every machine.
+            text = str(exc).lower()
+            is_503 = (
+                "503" in text
+                or "service unavailable" in text
+                or "preempt" in text
+            )
+            if not is_503:
+                raise
+            # Else: retry on next loop iteration.
+    raise RuntimeError(
+        f"Gemini Flex preempted {len(waits)} times; last error: {last_exc}"
+    )
+
+
 def generate_auto_metadata(
     session_path: Path,
     stats: dict[str, Any],
 ) -> dict[str, Any] | None:
     """
-    Generate title, purpose, and tags via Haiku Application Programming
-    Interface (API) call.
+    Generate title / purpose / tags / Three Ps via Gemini Flex.
 
-    Extracts the first few user messages from the session transcript
-    and sends them (with session statistics) to Haiku for automatic
-    metadata generation.  Falls back to *None* if the ``anthropic``
-    package is not installed or the API call fails.
+    Architecture (2026-05-18 bake-off winner):
+    - Full distilled transcript via :func:`transcript_text.extract_transcript_text`
+      (not first-and-last sampled messages).
+    - Production prompt loaded from package data at
+      ``cc_session_toolkit/prompts/auto_metadata.md`` (override via
+      ``CC_AUTO_METADATA_PROMPT_PATH`` env var).
+    - Gemini 3 Flash Preview (Flex tier) via ``google.genai`` with
+      ``thinking_budget=0`` and 503-retry backoff.
 
-    Budget: ~$0.001 per session (Haiku pricing).
+    Budget: ~$0.027 per session (~½ Haiku Batch list price).
+
+    Falls back to *None* on any of: ``google-genai`` not installed, no
+    API key available, transcript extraction failure, persistent 503,
+    or response not parseable as JSON. The archive remains usable
+    without auto-metadata; the field collapses to the schema-level
+    "Untitled Session" default.
 
     Args:
-        session_path: Path to the session JSONL file.
+        session_path: Path to the session JSONL (or JSONL.gz) file.
         stats: Session statistics from :func:`extract_session_stats`.
+            Used only for the input-header summary; the model grounds
+            every claim in the transcript text.
 
     Returns:
-        Dictionary with ``title``, ``purpose``, and ``tags`` keys,
-        or *None* on failure.
+        Dictionary with ``title``, ``purpose``, ``tags``, and
+        ``three_ps`` keys, or *None* on failure.
     """
     try:
-        import anthropic  # noqa: WPS433 — optional dependency
+        from google import genai  # noqa: WPS433 — optional dependency
     except ImportError:
         _log_metadata_event(
-            "anthropic package not installed — skipping",
+            "google-genai package not installed — skipping auto-metadata",
             level="WARNING",
         )
         print(
-            "  Warning: anthropic package not installed, "
+            "  Warning: google-genai package not installed, "
             "skipping auto-metadata"
         )
         return None
 
-    _ensure_anthropic_api_key()
-
-    # Extract representative user messages and file paths from the
-    # transcript in a single pass.  Collects:
-    # - All user messages (for sampling)
-    # - File paths from Write/Edit tool calls (for artefact context)
-    all_user_messages: list[str] = []
-    files_modified: set[str] = set()
-
-    with open(session_path, "r", encoding="utf-8") as fh:
-        for line in fh:
-            if not line.strip():
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            message = entry.get("message", {})
-            role = message.get("role")
-
-            # Collect file paths from Write/Edit tool calls
-            if role == "assistant":
-                a_content = message.get("content", [])
-                if isinstance(a_content, list):
-                    for block in a_content:
-                        if (
-                            isinstance(block, dict)
-                            and block.get("type") == "tool_use"
-                            and block.get("name") in {"Write", "Edit"}
-                        ):
-                            fp = block.get("input", {}).get("file_path")
-                            if fp:
-                                files_modified.add(fp)
-                continue
-
-            if role != "user":
-                continue
-
-            content = message.get("content", "")
-            if isinstance(content, list):
-                # Skip tool results
-                if any(
-                    isinstance(b, dict) and b.get("type") == "tool_result"
-                    for b in content
-                ):
-                    continue
-                content = " ".join(
-                    b.get("text", "")
-                    for b in content
-                    if isinstance(b, dict) and b.get("type") == "text"
-                )
-
-            if content:
-                all_user_messages.append(content[:500])
-
-    if not all_user_messages:
+    api_key = _ensure_gemini_api_key()
+    if not api_key:
+        _log_metadata_event(
+            f"No GEMINI_API_KEY / GOOGLE_API_KEY for {session_path.name}",
+            level="ERROR",
+        )
+        print(
+            "  Warning: no GEMINI_API_KEY / GOOGLE_API_KEY — "
+            "skipping auto-metadata"
+        )
         return None
 
-    # Filter out meta/housekeeping messages (slash commands, short
-    # confirmations, commit instructions) so the "last 2" reflect
-    # substantive work rather than session wrap-up.
-    substantive = [
-        msg for msg in all_user_messages
-        if not _is_meta_message(msg)
-    ]
-    # Fall back to unfiltered if filtering removed everything
-    sample_source = substantive or all_user_messages
-
-    # Sample: first 2 (intent) + last 2 (outcome), deduplicated
-    # for short sessions where they overlap
-    first = sample_source[:2]
-    last = sample_source[-2:]
-    seen: set[str] = set()
-    sampled: list[str] = []
-    for msg in first + last:
-        if msg not in seen:
-            seen.add(msg)
-            sampled.append(msg)
-
-    messages_text = "\n---\n".join(sampled)
-    tool_summary = ", ".join(
-        f"{k}: {v}"
-        for k, v in stats.get("tool_calls", {}).get("by_type", {}).items()
-    )
-
-    # Build artefact context from collected file paths
-    artefact_basenames = sorted(
-        {Path(fp).name for fp in files_modified}
-    )
-    files_line = (
-        f"Files modified: {', '.join(artefact_basenames)}\n"
-        if artefact_basenames else ""
-    )
-
-    # Label the sample so Haiku understands the temporal spread
-    n_total = len(sample_source)
-    if len(sampled) == n_total:
-        sample_label = f"All {n_total} user messages"
-    else:
-        sample_label = (
-            f"First and last substantive user messages "
-            f"(from {n_total} total, meta-messages filtered)"
+    # Distil the full transcript. The extractor strips framing,
+    # preserves tool calls + results, and is gzip-aware.
+    try:
+        from cc_session_toolkit.transcript_text import (
+            estimate_tokens,
+            extract_transcript_text,
         )
+        transcript_text = extract_transcript_text(session_path)
+    except (FileNotFoundError, OSError) as exc:
+        _log_metadata_event(
+            f"Transcript extraction failed for {session_path.name}: "
+            f"{type(exc).__name__}: {exc}",
+            level="ERROR",
+        )
+        return None
 
-    prompt = (
-        f"Based on the following Claude Code session information, "
-        f"generate:\n"
-        f"1. A concise title (5-10 words) reflecting the session's "
-        f"main accomplishment\n"
-        f"2. A one-sentence purpose statement that captures *why*, "
-        f"not just *what* (include motivation if evident)\n"
-        f"3. 2-5 lowercase hyphenated tags\n"
-        f"4. Three Ps metadata:\n"
-        f"   - prompt_summary: What was asked and why (1 sentence)\n"
-        f"   - process_summary: How the tool was used and why this "
-        f"approach (1 sentence)\n"
-        f"   - provenance_summary: Where this session fits in the "
-        f"broader project (1 sentence)\n\n"
-        f"Session stats: {stats.get('duration_minutes', 0)} min, "
-        f"{stats.get('turns', 0)} turns, tools: {tool_summary}\n"
-        f"{files_line}\n"
-        f"{sample_label}:\n"
-        f"{messages_text}\n\n"
-        f"Respond with ONLY a JSON object, no markdown:\n"
-        f'{{"title": "...", "purpose": "...", "tags": ["..."], '
-        f'"three_ps": {{"prompt_summary": "...", '
-        f'"process_summary": "...", "provenance_summary": "..."}}}}'
+    if not transcript_text:
+        _log_metadata_event(
+            f"Empty distilled transcript for {session_path.name}; "
+            "skipping auto-metadata",
+            level="WARNING",
+        )
+        return None
+
+    content_tokens = estimate_tokens(transcript_text)
+    system_prompt = _load_auto_metadata_prompt()
+    user_message = _build_auto_metadata_user_message(
+        session_id=stats.get("session_id") or session_path.stem,
+        project=stats.get("project_name") or "",
+        started_at=stats.get("started_at") or "",
+        content_tokens=content_tokens,
+        transcript_text=transcript_text,
     )
 
     try:
-        client = anthropic.Anthropic()
-        if not client.api_key:
-            _log_metadata_event(
-                f"No API key available for {session_path.name}",
-                level="ERROR",
-            )
-            print("  Warning: no ANTHROPIC_API_KEY — skipping auto-metadata")
-            return None
-
+        client = genai.Client()
         _log_metadata_event(
-            f"Calling Haiku for {session_path.name} "
-            f"({len(sampled)} messages sampled)"
+            f"Calling Gemini Flex for {session_path.name} "
+            f"({content_tokens:,} content tokens)"
         )
-
-        response = client.messages.create(
-            model=EXTRACTOR_MODEL_ID,
-            max_tokens=512,
-            messages=[{"role": "user", "content": prompt}],
+        raw_text = _call_gemini_with_retry(
+            client, user_message, system_prompt
         )
-
-        response_text = response.content[0].text.strip()
-
-        # Extract JSON from potential markdown code blocks.
-        # Use regex to handle varied fencing (```json, ```, etc.)
-        code_block = re.search(
-            r"```(?:json)?\s*\n?(.*?)\n?\s*```",
-            response_text,
-            re.DOTALL,
-        )
-        json_str = (
-            code_block.group(1).strip() if code_block
-            else response_text
-        )
-
-        result = json.loads(json_str)
-        title = result.get("title", "Untitled Session")
-        _log_metadata_event(
-            f"Success for {session_path.name}: {title!r}"
-        )
-        auto_meta: dict[str, Any] = {
-            "title": title,
-            "purpose": result.get("purpose", ""),
-            "tags": result.get("tags", []),
-        }
-        # Include three_ps if Haiku returned them
-        three_ps = result.get("three_ps")
-        if isinstance(three_ps, dict):
-            auto_meta["three_ps"] = {
-                "prompt_summary": three_ps.get(
-                    "prompt_summary", ""
-                ),
-                "process_summary": three_ps.get(
-                    "process_summary", ""
-                ),
-                "provenance_summary": three_ps.get(
-                    "provenance_summary", ""
-                ),
-            }
-        return auto_meta
     except Exception as exc:  # noqa: BLE001 — graceful degradation
         _log_metadata_event(
-            f"Failed for {session_path.name}: "
+            f"Gemini call failed for {session_path.name}: "
             f"{type(exc).__name__}: {exc}",
             level="ERROR",
         )
         print(f"  Warning: auto-metadata generation failed: {exc}")
         return None
+
+    try:
+        result = _parse_metadata_response_json(raw_text)
+    except ValueError as exc:
+        _log_metadata_event(
+            f"Gemini response not parseable as JSON for "
+            f"{session_path.name}: {exc}; raw[:300]={raw_text[:300]!r}",
+            level="ERROR",
+        )
+        print(f"  Warning: auto-metadata JSON parse failed: {exc}")
+        return None
+
+    title = result.get("title", "Untitled Session")
+    _log_metadata_event(
+        f"Success for {session_path.name}: {title!r}"
+    )
+    auto_meta: dict[str, Any] = {
+        "title": title,
+        "purpose": result.get("purpose", ""),
+        "tags": result.get("tags", []),
+    }
+    three_ps = result.get("three_ps")
+    if isinstance(three_ps, dict):
+        auto_meta["three_ps"] = {
+            "prompt_summary": three_ps.get("prompt_summary", ""),
+            "process_summary": three_ps.get("process_summary", ""),
+            "provenance_summary": three_ps.get("provenance_summary", ""),
+        }
+    return auto_meta
 
 
 # -------------------------------------------------------------------------
@@ -659,17 +701,53 @@ def _run_git(args: list[str], cwd: Path) -> tuple[bool, str]:
     return True, result.stdout.strip()
 
 
-def capture_code_state(project_root: Path | None) -> dict[str, Any]:
+def _load_code_state_sidecar(
+    session_id: str | None,
+    sidecar_dir: Path | None = None,
+) -> str | None:
+    """
+    Look up the SessionStart ``commit_at_start`` sidecar.
+
+    The PA hook ``hooks/session-start-code-state.py`` writes a JSON
+    sidecar at ``<sidecar_dir>/<session_id>.json`` when each session
+    begins.  This helper reads it and returns the captured commit hash,
+    or *None* if the sidecar is missing, unreadable, or malformed.
+
+    Returns *None* when *session_id* is falsy or no sidecar exists.
+    Never raises — sidecar lookup is best-effort, mirroring the
+    semantics of :func:`capture_code_state` itself.
+    """
+    if not session_id:
+        return None
+    base = sidecar_dir if sidecar_dir is not None else CODE_STATE_SIDECAR_DIR
+    sidecar_path = base / f"{session_id}.json"
+    if not sidecar_path.is_file():
+        return None
+    try:
+        data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    commit = data.get("commit_at_start")
+    if isinstance(commit, str) and commit:
+        return commit
+    return None
+
+
+def capture_code_state(
+    project_root: Path | None,
+    session_id: str | None = None,
+    *,
+    sidecar_dir: Path | None = None,
+) -> dict[str, Any]:
     """
     Capture the working tree's git state at archive time.
 
     Returns a dict with three keys (provenance audit Gap 2, 2026-05-17):
 
-    - ``commit_at_start``: HEAD at session start. Always *None* from
-      this function — capture at session start requires a side-channel
-      (e.g. a SessionStart hook writing a sidecar keyed by session id)
-      that does not yet exist. Kept in the schema so a later SessionStart
-      hook can fill it without a further schema bump.
+    - ``commit_at_start``: HEAD at session start. Populated from the
+      sidecar at ``<sidecar_dir>/<session_id>.json`` if both
+      *session_id* is given and the SessionStart hook has written one.
+      *None* when no sidecar exists.
     - ``commit_at_end``: HEAD at the moment of archive (i.e. now).
       Resolved via ``git rev-parse HEAD`` in *project_root*. *None* if
       *project_root* is missing, not a git repo, or the command fails.
@@ -681,9 +759,20 @@ def capture_code_state(project_root: Path | None) -> dict[str, Any]:
     Best-effort: any git failure produces *None* for the affected
     field rather than raising. Provenance capture must never break
     archiving.
+
+    Args:
+        project_root: Project root directory; used for the ``end``
+            captures. May be *None*.
+        session_id: Session identifier; used to look up the sidecar
+            for ``commit_at_start``. May be *None*; in that case
+            ``commit_at_start`` is always *None*.
+        sidecar_dir: Override for the sidecar directory. Defaults to
+            :data:`cc_session_toolkit.config.CODE_STATE_SIDECAR_DIR`.
     """
     state: dict[str, Any] = {
-        "commit_at_start": None,
+        "commit_at_start": _load_code_state_sidecar(
+            session_id, sidecar_dir=sidecar_dir
+        ),
         "commit_at_end": None,
         "dirty_at_end": None,
     }
@@ -692,8 +781,12 @@ def capture_code_state(project_root: Path | None) -> dict[str, Any]:
 
     ok, commit = _run_git(["rev-parse", "HEAD"], project_root)
     if not ok or not commit:
-        # Not a git repo (or git unavailable) — leave all fields None.
+        # Not a git repo (or git unavailable) — leave end fields None.
         # The dirty check is meaningless without a repo to dirty.
+        # ``commit_at_start`` may still be populated from the sidecar,
+        # since that capture happens against the cwd at session start
+        # and is independent of whether the project root is a git repo
+        # at archive time.
         return state
     state["commit_at_end"] = commit
 
@@ -890,9 +983,11 @@ def create_session_metadata(
 
     # Provenance audit Gap 2 (2026-05-17): capture working-tree git
     # state at archive time. Best-effort; missing/unreachable git
-    # collapses to None values rather than aborting.
+    # collapses to None values rather than aborting. ``session_id``
+    # is passed so ``capture_code_state`` can look up the SessionStart
+    # sidecar for ``commit_at_start``.
     if code_state is None:
-        code_state = capture_code_state(project_root)
+        code_state = capture_code_state(project_root, session_id=session_id)
 
     # Provenance audit Gap 3 (2026-05-17): resolve sharing licence and
     # the model that produced auto-generated metadata. Defaults live in

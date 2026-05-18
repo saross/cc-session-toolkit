@@ -867,8 +867,8 @@ class TestCaptureCodeState:
         state = capture_code_state(repo)
         assert state["commit_at_end"] == head
         assert state["dirty_at_end"] is False
-        # commit_at_start is always None from this function — that
-        # capture would need a SessionStart-hook side-channel.
+        # commit_at_start stays None without a sidecar lookup — the
+        # SessionStart hook writes the sidecar; absence is normal here.
         assert state["commit_at_start"] is None
 
     def test_detects_dirty_tree_via_untracked(
@@ -882,6 +882,109 @@ class TestCaptureCodeState:
         state = capture_code_state(repo)
         assert state["commit_at_end"] is not None
         assert state["dirty_at_end"] is True
+
+    # -- SessionStart-sidecar lookup for ``commit_at_start`` ---------
+
+    def test_commit_at_start_from_sidecar(
+        self, tmp_path: Path,
+    ) -> None:
+        """A sidecar at ``<dir>/<session_id>.json`` populates commit_at_start."""
+        sidecar_dir = tmp_path / "code-state"
+        sidecar_dir.mkdir()
+        session_id = "session-abc-001"
+        commit = "a" * 40
+        (sidecar_dir / f"{session_id}.json").write_text(
+            json.dumps({
+                "session_id": session_id,
+                "commit_at_start": commit,
+                "project_root": str(tmp_path),
+                "captured_at": "2026-05-17T12:00:00Z",
+            })
+        )
+        state = capture_code_state(
+            None, session_id=session_id, sidecar_dir=sidecar_dir,
+        )
+        assert state["commit_at_start"] == commit
+        # commit_at_end remains None (project_root was None).
+        assert state["commit_at_end"] is None
+
+    def test_commit_at_start_sidecar_with_clean_repo(
+        self, tmp_path: Path,
+    ) -> None:
+        """Both ends populate when sidecar + clean repo are present."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        head = _init_git_repo(repo)
+        sidecar_dir = tmp_path / "code-state"
+        sidecar_dir.mkdir()
+        session_id = "session-xyz-002"
+        start_commit = "b" * 40
+        (sidecar_dir / f"{session_id}.json").write_text(
+            json.dumps({
+                "session_id": session_id, "commit_at_start": start_commit,
+            })
+        )
+        state = capture_code_state(
+            repo, session_id=session_id, sidecar_dir=sidecar_dir,
+        )
+        assert state["commit_at_start"] == start_commit
+        assert state["commit_at_end"] == head
+        assert state["dirty_at_end"] is False
+
+    def test_no_sidecar_leaves_commit_at_start_none(
+        self, tmp_path: Path,
+    ) -> None:
+        """A session_id with no matching sidecar yields None gracefully."""
+        sidecar_dir = tmp_path / "code-state"
+        sidecar_dir.mkdir()  # empty
+        state = capture_code_state(
+            None, session_id="never-written", sidecar_dir=sidecar_dir,
+        )
+        assert state["commit_at_start"] is None
+
+    def test_session_id_none_skips_sidecar_lookup(
+        self, tmp_path: Path,
+    ) -> None:
+        """*None* session_id means no sidecar consulted; no error."""
+        sidecar_dir = tmp_path / "code-state"
+        sidecar_dir.mkdir()
+        (sidecar_dir / "phantom.json").write_text(
+            json.dumps({"commit_at_start": "c" * 40})
+        )
+        state = capture_code_state(
+            None, session_id=None, sidecar_dir=sidecar_dir,
+        )
+        assert state["commit_at_start"] is None
+
+    def test_malformed_sidecar_collapses_to_none(
+        self, tmp_path: Path,
+    ) -> None:
+        """A non-JSON sidecar yields None rather than raising."""
+        sidecar_dir = tmp_path / "code-state"
+        sidecar_dir.mkdir()
+        session_id = "session-malformed"
+        (sidecar_dir / f"{session_id}.json").write_text(
+            "{not json at all"
+        )
+        state = capture_code_state(
+            None, session_id=session_id, sidecar_dir=sidecar_dir,
+        )
+        assert state["commit_at_start"] is None
+
+    def test_sidecar_with_missing_commit_field(
+        self, tmp_path: Path,
+    ) -> None:
+        """A sidecar without ``commit_at_start`` yields None gracefully."""
+        sidecar_dir = tmp_path / "code-state"
+        sidecar_dir.mkdir()
+        session_id = "session-no-commit"
+        (sidecar_dir / f"{session_id}.json").write_text(
+            json.dumps({"session_id": session_id, "other_field": "x"})
+        )
+        state = capture_code_state(
+            None, session_id=session_id, sidecar_dir=sidecar_dir,
+        )
+        assert state["commit_at_start"] is None
 
 
 # -------------------------------------------------------------------------

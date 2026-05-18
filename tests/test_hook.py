@@ -11,15 +11,22 @@ from unittest.mock import patch
 import pytest
 
 from cc_session_toolkit.archive import (
-    _is_meta_message,
+    _build_auto_metadata_user_message,
+    _call_gemini_once,
+    _call_gemini_with_retry,
+    _ensure_gemini_api_key,
+    _load_auto_metadata_prompt,
+    _parse_metadata_response_json,
     generate_auto_metadata,
     is_already_archived,
     is_trivial_session,
 )
 from cc_session_toolkit.config import (
+    AUTO_METADATA_MAX_OUTPUT_TOKENS,
     DEFAULT_ARCHIVE_ROOT,
     DEFAULT_MIN_DURATION_MINUTES,
     DEFAULT_MIN_TURNS,
+    EXTRACTOR_MODEL_ID,
 )
 from cc_session_toolkit.project import (
     detect_project_name_from_cwd,
@@ -124,152 +131,183 @@ class TestIsAlreadyArchived:
 # -------------------------------------------------------------------------
 
 class TestGenerateAutoMetadata:
-    """Tests for :func:`generate_auto_metadata`."""
+    """Tests for :func:`generate_auto_metadata` (Gemini Flex path)."""
 
-    def test_returns_none_without_anthropic(
+    _STATS: dict[str, Any] = {
+        "turns": 10, "duration_minutes": 30,
+        "tool_calls": {"total": 5, "by_type": {"Read": 5}},
+        "session_id": "test-session-abc",
+        "project_name": "test-project",
+        "started_at": "2026-05-18T10:00:00+00:00",
+    }
+
+    def test_returns_none_without_google_genai(
         self, sample_session_jsonl: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Falls back gracefully when anthropic is not installed."""
-        # Simulate ImportError for anthropic
+        """Falls back gracefully when google-genai is not installed."""
         import builtins
         real_import = builtins.__import__
 
         def mock_import(name: str, *args: Any, **kwargs: Any) -> Any:
-            if name == "anthropic":
+            if name == "google" or name.startswith("google."):
                 raise ImportError("mocked")
             return real_import(name, *args, **kwargs)
 
         monkeypatch.setattr(builtins, "__import__", mock_import)
+        result = generate_auto_metadata(sample_session_jsonl, self._STATS)
+        assert result is None
 
-        stats = {"turns": 10, "duration_minutes": 30, "tool_calls": {
-            "total": 5, "by_type": {"Read": 3, "Write": 2},
-        }}
-        result = generate_auto_metadata(sample_session_jsonl, stats)
+    def test_returns_none_without_api_key(
+        self,
+        sample_session_jsonl: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Returns None when no GEMINI_API_KEY / GOOGLE_API_KEY is available."""
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        # Point the .env-sniffing fallback at an empty file so it
+        # doesn't accidentally pick up the real PA .env.
+        empty_home = tmp_path / "fake-home"
+        (empty_home / "personal-assistant").mkdir(parents=True)
+        (empty_home / "personal-assistant" / ".env").write_text("")
+        monkeypatch.setattr(Path, "home", lambda: empty_home)
+        result = generate_auto_metadata(sample_session_jsonl, self._STATS)
         assert result is None
 
     def test_returns_none_for_empty_session(
-        self, tmp_path: Path
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Returns None when the session has no user messages."""
+        """Returns None when the distilled transcript is empty."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
         empty_session = tmp_path / "empty.jsonl"
         empty_session.write_text("")
-        stats = {"turns": 0, "duration_minutes": 0, "tool_calls": {
-            "total": 0, "by_type": {},
-        }}
-        result = generate_auto_metadata(empty_session, stats)
+        result = generate_auto_metadata(empty_session, self._STATS)
         assert result is None
 
 
 # -------------------------------------------------------------------------
-# Meta-message filter
+# Helper-level unit tests for the Gemini path
 # -------------------------------------------------------------------------
 
-class TestIsMetaMessage:
-    """Unit tests for :func:`_is_meta_message`."""
+class TestAutoMetadataHelpers:
+    """Tests for the Gemini-path helper functions."""
 
-    @pytest.mark.parametrize("text", [
-        "/recap",
-        "/done task-123",
-        "/review",
-        "/standup",
-        "yes",
-        "ok",
-        "looks good",
-        "lgtm",
-        "commit",
-        "push",
-        "done",
-        "please",
-        "sure!",
-        "go ahead.",
-        "commit and push this please",
-        "please commit this",
-        "Could you push this to main",
-        "  /reflect  ",
-        "",
-        "   ",
-    ])
-    def test_meta_messages_detected(self, text: str) -> None:
-        assert _is_meta_message(text) is True
+    def test_load_prompt_from_package_data(self) -> None:
+        """The bundled prompt loads via importlib.resources."""
+        prompt = _load_auto_metadata_prompt()
+        assert "Session Metadata Extraction Prompt" in prompt
+        # Spot-check known sections from prompt-gemini-v2.md.
+        assert "Specifics requirement" in prompt
+        assert "three_ps" in prompt or "three Ps" in prompt.lower()
 
-    @pytest.mark.parametrize("text", [
-        "Implement the parser for CSV files",
-        "Add error handling to the validation module",
-        "yes, but also add the validation logic for edge cases",
-        "The config loader needs to handle missing keys gracefully",
-        "Update the README with installation instructions",
-        "Fix the bug where timestamps are off by one hour",
-        "Can you commit the archive module changes separately",
-    ])
-    def test_substantive_messages_not_filtered(self, text: str) -> None:
-        assert _is_meta_message(text) is False
+    def test_load_prompt_override_via_env(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``CC_AUTO_METADATA_PROMPT_PATH`` overrides the bundled prompt."""
+        custom = tmp_path / "custom-prompt.md"
+        custom.write_text("# custom-prompt-sentinel\nbody\n")
+        monkeypatch.setenv("CC_AUTO_METADATA_PROMPT_PATH", str(custom))
+        prompt = _load_auto_metadata_prompt()
+        assert "custom-prompt-sentinel" in prompt
+
+    def test_build_user_message_wraps_transcript_in_tags(self) -> None:
+        """The user message wraps the transcript in ``<transcript>`` tags."""
+        msg = _build_auto_metadata_user_message(
+            session_id="sid",
+            project="proj",
+            started_at="2026-05-18T10:00:00",
+            content_tokens=1234,
+            transcript_text="--- User ---\nHello",
+        )
+        assert "<transcript>" in msg
+        assert "</transcript>" in msg
+        # Output reminder lives AFTER the closing tag so recency
+        # favours the contract.
+        assert msg.index("</transcript>") < msg.index("Output reminder")
+        # Square-bracket chat markers must NOT appear — they confuse the
+        # extractor into continuing the conversation.
+        assert "[user]" not in msg.lower()
+        assert "[assistant]" not in msg.lower()
+
+    def test_build_user_message_includes_header_fields(self) -> None:
+        """Session header carries the identifying fields."""
+        msg = _build_auto_metadata_user_message(
+            session_id="abc-123",
+            project="my-proj",
+            started_at="2026-05-18T10:00:00",
+            content_tokens=42,
+            transcript_text="--- User ---\nx",
+        )
+        assert "abc-123" in msg
+        assert "my-proj" in msg
+        assert "2026-05-18" in msg
+        assert "42" in msg
+
+    def test_parse_response_handles_bare_json(self) -> None:
+        """Bare JSON parses cleanly."""
+        result = _parse_metadata_response_json('{"title": "t", "tags": []}')
+        assert result == {"title": "t", "tags": []}
+
+    def test_parse_response_strips_code_fences(self) -> None:
+        """A fenced ```json block is stripped and parsed."""
+        raw = '```json\n{"title": "fenced"}\n```'
+        result = _parse_metadata_response_json(raw)
+        assert result == {"title": "fenced"}
+
+    def test_parse_response_raises_on_malformed(self) -> None:
+        """Malformed JSON raises ValueError so callers can record raw text."""
+        with pytest.raises(ValueError):
+            _parse_metadata_response_json("not json at all")
+
+    def test_ensure_gemini_api_key_prefers_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Existing ``GEMINI_API_KEY`` takes precedence over the .env file."""
+        monkeypatch.setenv("GEMINI_API_KEY", "env-value")
+        assert _ensure_gemini_api_key() == "env-value"
+
+    def test_ensure_gemini_api_key_falls_back_to_google(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``GOOGLE_API_KEY`` is accepted when GEMINI_API_KEY is unset."""
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.setenv("GOOGLE_API_KEY", "google-value")
+        assert _ensure_gemini_api_key() == "google-value"
 
 
 # -------------------------------------------------------------------------
-# Session JSONL builder (for meta-filter and artefact tests)
+# Session-JSONL builder + Gemini integration tests
 # -------------------------------------------------------------------------
 
 def _build_session_jsonl(
     tmp_path: Path,
     user_messages: list[str],
-    *,
-    write_files: list[str] | None = None,
-    edit_files: list[str] | None = None,
 ) -> Path:
-    """
-    Build a session JSONL file with controlled user messages and
-    optional Write/Edit tool_use blocks in assistant messages.
+    """Build a minimal session JSONL fixture with the given user messages.
 
-    Args:
-        tmp_path: pytest tmp_path for file creation.
-        user_messages: List of user message strings.
-        write_files: File paths for Write tool_use blocks.
-        edit_files: File paths for Edit tool_use blocks.
-
-    Returns:
-        Path to the created JSONL file.
+    The Gemini path reads the full distilled transcript, so we no longer
+    need elaborate Write/Edit tool_use scaffolding here — tests just need
+    enough user-role text to produce a non-empty distillation.
     """
+    from datetime import timedelta
+
     now = datetime(2026, 3, 15, 10, 0, 0, tzinfo=timezone.utc)
     entries: list[dict[str, Any]] = []
-
-    # Add Write/Edit tool calls as early assistant messages
-    tool_uses: list[dict[str, Any]] = []
-    for fp in (write_files or []):
-        tool_uses.append({
-            "type": "tool_use",
-            "id": f"tool_{len(tool_uses)}",
-            "name": "Write",
-            "input": {"file_path": fp, "content": "..."},
-        })
-    for fp in (edit_files or []):
-        tool_uses.append({
-            "type": "tool_use",
-            "id": f"tool_{len(tool_uses)}",
-            "name": "Edit",
-            "input": {"file_path": fp, "old_string": "a", "new_string": "b"},
-        })
-
-    if tool_uses:
-        entries.append({
-            "timestamp": now.isoformat(),
-            "message": {
-                "role": "assistant",
-                "model": "claude-sonnet-4-5-20250929",
-                "content": tool_uses,
-                "usage": {"input_tokens": 100, "output_tokens": 50},
-            },
-        })
-
-    # Add user messages with interleaved assistant replies
-    from datetime import timedelta
     for i, msg in enumerate(user_messages):
-        ts = (now + timedelta(minutes=i * 2 + 1)).isoformat()
+        ts_user = (now + timedelta(minutes=i * 2)).isoformat()
         entries.append({
-            "timestamp": ts,
+            "type": "user",
+            "timestamp": ts_user,
             "message": {"role": "user", "content": msg},
         })
-        ts_reply = (now + timedelta(minutes=i * 2 + 2)).isoformat()
+        ts_reply = (now + timedelta(minutes=i * 2 + 1)).isoformat()
         entries.append({
+            "type": "assistant",
             "timestamp": ts_reply,
             "message": {
                 "role": "assistant",
@@ -280,119 +318,178 @@ def _build_session_jsonl(
         })
 
     session = tmp_path / "test-session.jsonl"
-    session.write_text(
-        "\n".join(json.dumps(e) for e in entries) + "\n"
-    )
+    session.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
     return session
 
 
-# -------------------------------------------------------------------------
-# Auto-metadata sampling integration tests
-# -------------------------------------------------------------------------
-
-class TestAutoMetadataSampling:
-    """Tests for meta-message filtering and artefact collection in
-    :func:`generate_auto_metadata`."""
+class TestAutoMetadataGeminiIntegration:
+    """Integration tests for :func:`generate_auto_metadata` with a mocked Gemini client."""
 
     _STATS: dict[str, Any] = {
-        "turns": 10, "duration_minutes": 30,
+        "turns": 10,
+        "duration_minutes": 30,
         "tool_calls": {"total": 5, "by_type": {"Read": 5}},
+        "session_id": "integration-test-001",
+        "project_name": "test-project",
+        "started_at": "2026-05-18T10:00:00+00:00",
     }
 
     @staticmethod
-    def _mock_haiku_response(title: str = "Test Title") -> Any:
-        """Build a mock Anthropic messages.create response."""
+    def _mock_gemini_response(payload: dict[str, Any]) -> Any:
+        """Build a minimal mock of ``client.models.generate_content``'s return."""
         from unittest.mock import MagicMock
 
         response = MagicMock()
-        content_block = MagicMock()
-        content_block.text = json.dumps({
-            "title": title,
-            "purpose": "Test purpose",
-            "tags": ["test"],
-        })
-        response.content = [content_block]
+        response.text = json.dumps(payload)
         return response
 
-    def test_filters_slash_commands(self, tmp_path: Path) -> None:
-        """Slash commands are excluded from sampled messages."""
-        session = _build_session_jsonl(tmp_path, [
-            "Implement the parser",
-            "Add error handling",
-            "/recap",
-            "/done",
-        ])
-        with patch("anthropic.Anthropic") as MockClient:
-            mock_client = MockClient.return_value
-            mock_client.api_key = "test-key"
-            mock_client.messages.create.return_value = (
-                self._mock_haiku_response("Parser Implementation")
-            )
-            result = generate_auto_metadata(session, self._STATS)
-            assert result is not None
-            assert result["title"] == "Parser Implementation"
-            # Verify the prompt sent to Haiku excludes /recap and /done
-            call_args = mock_client.messages.create.call_args
-            prompt_text = call_args.kwargs["messages"][0]["content"]
-            assert "/recap" not in prompt_text
-            assert "/done" not in prompt_text
-            assert "Implement the parser" in prompt_text
-
-    def test_fallback_when_all_meta(self, tmp_path: Path) -> None:
-        """All-meta sessions fall back to unfiltered messages."""
-        session = _build_session_jsonl(tmp_path, [
-            "/recap",
-            "yes",
-            "ok",
-        ])
-        with patch("anthropic.Anthropic") as MockClient:
-            mock_client = MockClient.return_value
-            mock_client.api_key = "test-key"
-            mock_client.messages.create.return_value = (
-                self._mock_haiku_response("Fallback Session")
-            )
-            result = generate_auto_metadata(session, self._STATS)
-            # Should succeed — messages exist after fallback
-            assert result is not None
-
-    def test_collects_write_edit_file_paths(
-        self, tmp_path: Path
+    def test_happy_path_returns_parsed_metadata(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Write/Edit file paths are collected during JSONL parsing."""
+        """A clean response yields a populated auto_meta dict."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
         session = _build_session_jsonl(
             tmp_path,
-            ["Refactor the config module"],
-            write_files=["/home/user/project/config.py"],
-            edit_files=["/home/user/project/cli.py"],
+            [
+                "Implement the parser for CSV files",
+                "Add error handling to the validation module",
+            ],
         )
-        with patch("anthropic.Anthropic") as MockClient:
+        mock_payload = {
+            "title": "CSV Parser Implementation",
+            "purpose": "Build a robust CSV parsing layer",
+            "tags": ["csv", "parser", "implementation"],
+            "three_ps": {
+                "prompt_summary": "User asked for a CSV parser",
+                "process_summary": "Iterative implementation with tests",
+                "provenance_summary": "Part of the data-pipeline rewrite",
+            },
+        }
+        with patch("google.genai.Client") as MockClient:
             mock_client = MockClient.return_value
-            mock_client.api_key = "test-key"
-            mock_client.messages.create.return_value = (
-                self._mock_haiku_response("Config Refactor")
+            mock_client.models.generate_content.return_value = (
+                self._mock_gemini_response(mock_payload)
             )
             result = generate_auto_metadata(session, self._STATS)
-            assert result is not None
-            # Verify file paths appear in the prompt
-            call_args = mock_client.messages.create.call_args
-            prompt_text = call_args.kwargs["messages"][0]["content"]
-            assert "config.py" in prompt_text
-            assert "cli.py" in prompt_text
 
-    def test_empty_after_filtering(self, tmp_path: Path) -> None:
-        """Sessions with only meta messages still parse without error."""
-        session = _build_session_jsonl(tmp_path, [
-            "yes", "ok", "sure", "/done",
-        ])
-        with patch("anthropic.Anthropic") as MockClient:
+        assert result is not None
+        assert result["title"] == "CSV Parser Implementation"
+        assert result["purpose"] == "Build a robust CSV parsing layer"
+        assert result["tags"] == ["csv", "parser", "implementation"]
+        assert result["three_ps"]["prompt_summary"] == (
+            "User asked for a CSV parser"
+        )
+
+    def test_call_shape_passes_required_config(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Verify the Gemini call uses thinking_budget=0, Flex tier, and the production model."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        session = _build_session_jsonl(tmp_path, ["A substantive message"])
+        with patch("google.genai.Client") as MockClient:
             mock_client = MockClient.return_value
-            mock_client.api_key = "test-key"
-            mock_client.messages.create.return_value = (
-                self._mock_haiku_response("Short Session")
+            mock_client.models.generate_content.return_value = (
+                self._mock_gemini_response({"title": "x", "tags": []})
+            )
+            generate_auto_metadata(session, self._STATS)
+            call_args = mock_client.models.generate_content.call_args
+
+        assert call_args.kwargs["model"] == EXTRACTOR_MODEL_ID
+        cfg = call_args.kwargs["config"]
+        assert cfg["service_tier"] == "flex"
+        assert cfg["thinking_config"] == {"thinking_budget": 0}
+        assert cfg["max_output_tokens"] == AUTO_METADATA_MAX_OUTPUT_TOKENS
+        # System prompt carries the role + contracts; user message carries
+        # the delimited transcript.
+        assert "Session Metadata Extraction" in cfg["system_instruction"]
+        user_content = call_args.kwargs["contents"]
+        assert "<transcript>" in user_content
+        assert "</transcript>" in user_content
+
+    def test_returns_none_on_persistent_503(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Exhausted 503 retries collapse to None gracefully."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        # Don't actually sleep during retries.
+        monkeypatch.setattr(
+            "cc_session_toolkit.archive.AUTO_METADATA_FLEX_RETRY_WAITS_SECONDS",
+            (0, 0, 0),
+        )
+        session = _build_session_jsonl(tmp_path, ["Substantive message"])
+
+        with patch("google.genai.Client") as MockClient:
+            mock_client = MockClient.return_value
+            mock_client.models.generate_content.side_effect = RuntimeError(
+                "503 Service Unavailable: preempted"
             )
             result = generate_auto_metadata(session, self._STATS)
-            # All messages are short/meta, but fallback includes them
-            assert result is not None
+        assert result is None
+
+    def test_503_retry_recovers(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A 503 followed by success returns the parsed metadata."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        monkeypatch.setattr(
+            "cc_session_toolkit.archive.AUTO_METADATA_FLEX_RETRY_WAITS_SECONDS",
+            (0, 0, 0),
+        )
+        session = _build_session_jsonl(tmp_path, ["Substantive message"])
+
+        success_response = self._mock_gemini_response(
+            {"title": "Recovered", "tags": []}
+        )
+        with patch("google.genai.Client") as MockClient:
+            mock_client = MockClient.return_value
+            mock_client.models.generate_content.side_effect = [
+                RuntimeError("503 Service Unavailable"),
+                success_response,
+            ]
+            result = generate_auto_metadata(session, self._STATS)
+        assert result is not None
+        assert result["title"] == "Recovered"
+
+    def test_non_503_error_propagates_to_none(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Non-503 errors don't retry; auto-metadata gives up cleanly."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        session = _build_session_jsonl(tmp_path, ["Substantive message"])
+
+        with patch("google.genai.Client") as MockClient:
+            mock_client = MockClient.return_value
+            mock_client.models.generate_content.side_effect = RuntimeError(
+                "400 invalid argument"
+            )
+            result = generate_auto_metadata(session, self._STATS)
+        assert result is None
+
+    def test_unparseable_json_collapses_to_none(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Response that doesn't parse as JSON yields None, not an exception."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        session = _build_session_jsonl(tmp_path, ["Substantive message"])
+
+        bad_response = type("MockResp", (), {"text": "definitely not json"})()
+        with patch("google.genai.Client") as MockClient:
+            mock_client = MockClient.return_value
+            mock_client.models.generate_content.return_value = bad_response
+            result = generate_auto_metadata(session, self._STATS)
+        assert result is None
 
 
 # -------------------------------------------------------------------------

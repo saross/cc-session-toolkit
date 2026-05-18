@@ -31,7 +31,11 @@ classifiers = [
 
 [project.optional-dependencies]
 yaml = ["PyYAML>=6.0"]
-api = ["anthropic>=0.40"]
+# ``api`` shipped with anthropic when auto-metadata used Haiku. As of
+# 2026-05-18 the production extractor is Gemini 3 Flash Preview (Flex
+# tier) via google-genai; the constant ``EXTRACTOR_MODEL_ID`` and the
+# call shape in ``archive.generate_auto_metadata`` reflect this.
+api = ["google-genai>=2.3"]
 db = ["psycopg2-binary>=2.9"]
 dev = [
     "pytest>=7.0",
@@ -54,6 +58,7 @@ where = ["src"]
 cc_session_toolkit = [
     "data/**/*.md",
     "data/**/*.yaml",
+    "prompts/*.md",
 ]
 
 [tool.pytest.ini_options]
