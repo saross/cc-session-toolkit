@@ -146,7 +146,7 @@ def _cmd_archive_from_hook(args: argparse.Namespace) -> None:
 
     # Archive the session
     # Always stats_only=True in hook mode — suppress interactive prompt.
-    # The auto_metadata flag handles Haiku independently.
+    # The auto_metadata flag handles Gemini Flex independently.
     result = archive_session(
         transcript_path,
         project_root,
@@ -677,7 +677,10 @@ def main() -> None:
     p_archive.add_argument(
         "--auto-metadata",
         action="store_true",
-        help="Generate title/purpose/tags via Haiku API (~$0.001/session).",
+        help=(
+            "Generate title/purpose/tags/three_ps via Gemini Flex "
+            "(~$0.027/session, ~½ Haiku Batch list price)."
+        ),
     )
     p_archive.add_argument(
         "--archive-root",

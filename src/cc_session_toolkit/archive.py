@@ -354,6 +354,16 @@ def _call_gemini_once(
     this flag thinking tokens consume the output budget before any JSON
     is emitted. ``service_tier="flex"`` selects the discounted tier;
     list price ~½ Haiku Batch.
+
+    ``response.text`` can be ``None`` when the model is blocked by a
+    safety filter, when ``finish_reason`` is ``MAX_TOKENS`` with no
+    parts emitted, or when no candidates were generated. We raise a
+    ``RuntimeError`` in that case so the caller's exception handler
+    (which already collapses errors to ``None`` and falls through to
+    graceful degradation) catches it — rather than letting a ``None``
+    propagate to ``_parse_metadata_response_json``, where ``.strip()``
+    would raise an uncaught ``AttributeError`` and crash the entire
+    archive.
     """
     response = client.models.generate_content(
         model=EXTRACTOR_MODEL_ID,
@@ -365,7 +375,20 @@ def _call_gemini_once(
             "thinking_config": {"thinking_budget": 0},
         },
     )
-    return response.text
+    raw = response.text
+    if raw is None:
+        # Try to surface the finish_reason in the error for diagnostics.
+        finish_reason = None
+        try:
+            finish_reason = response.candidates[0].finish_reason
+        except (AttributeError, IndexError, TypeError):
+            pass
+        raise RuntimeError(
+            f"Gemini returned response.text=None "
+            f"(finish_reason={finish_reason!r}); likely safety-filtered, "
+            f"MAX_TOKENS with no parts, or no candidates."
+        )
+    return raw
 
 
 def _call_gemini_with_retry(
@@ -538,21 +561,26 @@ def generate_auto_metadata(
         print(f"  Warning: auto-metadata JSON parse failed: {exc}")
         return None
 
-    title = result.get("title", "Untitled Session")
+    # ``result.get(key, default)`` returns the default only when the key
+    # is *absent* — if Gemini emits ``"tags": null`` (which it occasionally
+    # does on low-confidence sessions), the default does not apply and
+    # ``None`` lands in session.meta.json, breaking downstream consumers
+    # that iterate ``tags``. ``.get(key) or default`` covers both cases.
+    title = result.get("title") or "Untitled Session"
     _log_metadata_event(
         f"Success for {session_path.name}: {title!r}"
     )
     auto_meta: dict[str, Any] = {
         "title": title,
-        "purpose": result.get("purpose", ""),
-        "tags": result.get("tags", []),
+        "purpose": result.get("purpose") or "",
+        "tags": result.get("tags") or [],
     }
     three_ps = result.get("three_ps")
     if isinstance(three_ps, dict):
         auto_meta["three_ps"] = {
-            "prompt_summary": three_ps.get("prompt_summary", ""),
-            "process_summary": three_ps.get("process_summary", ""),
-            "provenance_summary": three_ps.get("provenance_summary", ""),
+            "prompt_summary": three_ps.get("prompt_summary") or "",
+            "process_summary": three_ps.get("process_summary") or "",
+            "provenance_summary": three_ps.get("provenance_summary") or "",
         }
     return auto_meta
 
@@ -1097,7 +1125,9 @@ def archive_session(
             archive directory).
         project_name_override: Explicit project name (overrides
             auto-detection from *project_root*).
-        auto_metadata: Call Haiku API for automatic title/purpose/tags.
+        auto_metadata: Call Gemini Flex (Flex tier) for automatic
+            title/purpose/tags/three_ps. See
+            :func:`generate_auto_metadata` for the model + cost details.
         capture_type: How the session was captured — ``"session_end"``,
             ``"pre_compact"``, or *None* for manual archiving.
         session_id_override: Explicit session ID (overrides
@@ -1132,20 +1162,21 @@ def archive_session(
     else:
         defaults = {}
 
-    # Generate auto-metadata early so Haiku title can inform the
-    # directory name (human-readable slug instead of short session ID).
+    # Generate auto-metadata early so the model-generated title can
+    # inform the directory name (human-readable slug instead of short
+    # session ID).
     auto_generated = None
     effective_title = title
 
     if auto_metadata:
-        print("  Generating auto-metadata via Haiku...")
+        print(f"  Generating auto-metadata via {EXTRACTOR_MODEL_ID}...")
         auto_generated = generate_auto_metadata(session_path, stats)
         if auto_generated:
             if title:
-                # Explicit title overrides Haiku title
+                # Explicit title overrides the auto-generated title.
                 auto_generated["title"] = title
             elif auto_generated.get("title"):
-                # Use Haiku title for directory naming
+                # Use the auto-generated title for directory naming.
                 effective_title = auto_generated["title"]
 
     if not auto_generated and not stats_only:

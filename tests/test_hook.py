@@ -764,7 +764,7 @@ class TestArchiveSessionGlobalRoot:
         self, tmp_path: Path, capsys: pytest.CaptureFixture
     ) -> None:
         """Bug #1: stats_only=True suppresses interactive prompt even
-        when auto_metadata=True and Haiku is unavailable."""
+        when auto_metadata=True and the metadata extractor is unavailable."""
         from cc_session_toolkit.archive import archive_session
 
         session = self._make_session_with_turns(tmp_path)
@@ -775,7 +775,7 @@ class TestArchiveSessionGlobalRoot:
             archive_root=archive_root,
             project_name_override="test-project",
             stats_only=True,
-            auto_metadata=True,  # will fail (no anthropic in test)
+            auto_metadata=True,  # will fail (no google-genai key in test)
         )
 
         assert result is not None
