@@ -506,7 +506,9 @@ def generate_auto_metadata(
             extract_transcript_text,
         )
         transcript_text = extract_transcript_text(session_path)
-    except (FileNotFoundError, OSError) as exc:
+    except (
+        FileNotFoundError, OSError, EOFError, UnicodeDecodeError,
+    ) as exc:
         _log_metadata_event(
             f"Transcript extraction failed for {session_path.name}: "
             f"{type(exc).__name__}: {exc}",
@@ -754,6 +756,11 @@ def _load_code_state_sidecar(
     try:
         data = json.loads(sidecar_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        return None
+    # A malformed sidecar containing a JSON list/scalar (rather than the
+    # expected object) would crash on ``data.get(...)``. Guarding here
+    # preserves the "never raises" contract documented above.
+    if not isinstance(data, dict):
         return None
     commit = data.get("commit_at_start")
     if isinstance(commit, str) and commit:
