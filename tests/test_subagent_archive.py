@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import gzip
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -389,15 +388,24 @@ class TestExtractSubagentInfo:
         )
 
     def test_sha_matches_file_bytes(
-        self, current_layout_session: dict[str, Path]
+        self, tmp_path: Path
     ) -> None:
-        info = _extract_subagent_info(current_layout_session["agent_a"])
-        assert (
-            info["jsonl_sha256_uncompressed"]
-            == _file_sha256(current_layout_session["agent_a"])
+        # Use a fixture with a known a-priori SHA-256 rather than
+        # comparing ``_file_sha256(...)`` to itself (which would be
+        # tautological — same helper both sides, so a buggy helper
+        # would still match). The payload bytes and their SHA-256 hex
+        # are pinned literals here; if either drifts the test fails.
+        payload = b'{"a":1}\n'
+        # SHA-256 of the eight-byte payload above, computed via
+        # ``hashlib.sha256(payload).hexdigest()`` and pinned as a literal.
+        expected_sha = (
+            "e346432021b04179518d9614f3560ccd71354a4ee101ddcb893d6959a9d6301c"
         )
+        bytes_path = tmp_path / "known-bytes.jsonl"
+        bytes_path.write_bytes(payload)
+        assert _file_sha256(bytes_path) == expected_sha
 
-    def test_returns_none_on_unreadable_first_line(
+    def test_returns_none_on_unparseable_first_line(
         self, tmp_path: Path
     ) -> None:
         bad = tmp_path / "agent-bad.jsonl"

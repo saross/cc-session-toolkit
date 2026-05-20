@@ -12,8 +12,6 @@ import pytest
 
 from cc_session_toolkit.archive import (
     _build_auto_metadata_user_message,
-    _call_gemini_once,
-    _call_gemini_with_retry,
     _ensure_gemini_api_key,
     _load_auto_metadata_prompt,
     _parse_metadata_response_json,
@@ -180,7 +178,15 @@ class TestGenerateAutoMetadata:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Returns None when the distilled transcript is empty."""
+        """Returns None when the distilled transcript is empty.
+
+        Skip when ``google-genai`` is not installed: without the import
+        the function would early-return ``None`` from the ImportError
+        branch and the test would pass for the wrong reason — never
+        reaching the empty-transcript code path this test is meant to
+        exercise.
+        """
+        pytest.importorskip("google.genai")
         monkeypatch.setenv("GEMINI_API_KEY", "test-key")
         empty_session = tmp_path / "empty.jsonl"
         empty_session.write_text("")
@@ -430,6 +436,12 @@ class TestAutoMetadataGeminiIntegration:
                 "503 Service Unavailable: preempted"
             )
             result = generate_auto_metadata(session, self._STATS)
+            # Initial attempt plus three retries (one per wait in the
+            # patched ``(0, 0, 0)`` tuple) — total 4 calls before
+            # collapsing to None. Without this assertion a bug that
+            # broke out of the retry loop after a single attempt would
+            # still produce a None result and the test would still pass.
+            assert mock_client.models.generate_content.call_count == 4
         assert result is None
 
     def test_503_retry_recovers(
@@ -455,6 +467,11 @@ class TestAutoMetadataGeminiIntegration:
                 success_response,
             ]
             result = generate_auto_metadata(session, self._STATS)
+            # First attempt raises 503, second attempt succeeds — so
+            # exactly two calls. Without this assertion a bug that
+            # short-circuited the retry loop would produce a misleading
+            # green result.
+            assert mock_client.models.generate_content.call_count == 2
         assert result is not None
         assert result["title"] == "Recovered"
 
@@ -854,8 +871,11 @@ class TestCliFromHook:
         capsys: pytest.CaptureFixture,
     ) -> None:
         """Sessions with too few turns are skipped."""
-        # Create a trivial session (1 turn only)
-        now = datetime.now(tz=timezone.utc)
+        # Create a trivial session (1 turn only). Use the fixed
+        # timestamp convention shared by sibling tests in this file
+        # (``datetime(2026, 3, 15, ...)``) rather than ``datetime.now``
+        # so the fixture is deterministic across runs.
+        now = datetime(2026, 3, 15, 10, 0, 0, tzinfo=timezone.utc)
         entries = [
             {
                 "timestamp": now.isoformat(),
