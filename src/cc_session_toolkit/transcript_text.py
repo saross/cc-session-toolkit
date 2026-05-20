@@ -15,9 +15,9 @@ What is kept
 - User text (string content or ``text``-typed content blocks).
 - Assistant text blocks (``type == "text"``).
 - ``tool_use`` blocks — tool name plus a compact JSON serialisation of the
-  inputs (truncated per block).
+  full inputs. No per-block truncation.
 - ``tool_result`` text content — the actual results the assistant saw,
-  truncated per block to bound runaway log/grep output.
+  in full. No per-block truncation.
 
 What is stripped
 ----------------
@@ -25,11 +25,29 @@ What is stripped
   ``# claudeMd`` / ``# userEmail`` / ``# currentDate`` injected context, and
   PreToolUse / PostToolUse / Stop hook output wrappers that appear in user
   turns.
-- ``thinking`` content blocks (private reasoning — not sent to providers).
+- ``thinking`` content blocks (Claude Code persists only the cryptographic
+  ``signature`` field; the ``thinking`` text is empty as of CC v2.1.72 by
+  design — see ``docs/open-science/cot-capture-claude-code-investigation-
+  2026-05-19.md`` in the personal-assistant repo).
 - Record types that are pure plumbing:
   ``file-history-snapshot``, ``queue-operation``, ``system``,
   ``custom-title``, ``agent-name``, ``last-prompt``.
 - Empty / whitespace-only blocks.
+
+Session-level emergency cap
+---------------------------
+A safety bound — ``SESSION_TOKEN_BUDGET = 850_000`` tokens — exists to
+ensure the assembled transcript stays comfortably within Gemini 3 Flash
+Preview's 1,000,000-token input context. The cap rarely fires (1 in 242
+historical sessions on the analysis corpus, 2026-05-19), and when it does
+the distillation is **middle-truncated**: the head and tail of the session
+are preserved verbatim (the framing and the resolution / handoff), and an
+explanatory marker takes the place of the dropped middle fragments. This
+exploits the structure of long agentic sessions, which typically have a
+repetitive middle (paper-after-paper extractions, file-after-file
+refactors) and unique start/end content. See
+``data/experiments/transcript-cap-analysis-2026-05-19/findings.md`` in
+the personal-assistant repo for the evidence behind this choice.
 
 Token counting
 --------------
@@ -70,11 +88,63 @@ SKIP_RECORD_TYPES = {
     "last-prompt",
 }
 
-# Per-block truncation. Tool results and tool-use inputs can blow up
-# enormously (gigabyte log dumps, full file reads). We cap them so a single
-# pathological block cannot dominate a session's token budget.
-TOOL_RESULT_MAX_CHARS = 4000
-TOOL_USE_INPUT_MAX_CHARS = 1500
+# Per-block truncation is OFF: tool_use inputs and tool_result content
+# are passed through in full so downstream summarisers can ground their
+# claims in the actual diff / file content / command output. The
+# pathological-block worry that motivated per-block caps in the original
+# design is handled instead by ``SESSION_TOKEN_BUDGET`` below — an
+# absolute session-total ceiling that triggers middle-truncation only on
+# rare long-tail outliers. See module docstring for rationale and
+# ``data/experiments/transcript-cap-analysis-2026-05-19/findings.md``
+# in the personal-assistant repo for the empirical basis.
+#
+# These sentinels are kept as named constants (rather than removed
+# outright) so that callers and tests can still introspect the
+# distillation policy and so a future revert to per-block caps is a
+# single-line change.
+TOOL_RESULT_MAX_CHARS: int | None = None
+TOOL_USE_INPUT_MAX_CHARS: int | None = None
+
+# Session-level emergency cap. Triggers middle-truncation when the
+# full distilled transcript would exceed this many tokens. Set to 85%
+# of Gemini 3 Flash Preview's 1,000,000-token input context to leave
+# room for the system prompt (~6,400 tokens) plus framing overhead
+# (~1,000 tokens) and a healthy safety margin.
+SESSION_TOKEN_BUDGET: int = 850_000
+SESSION_CHAR_BUDGET: int = SESSION_TOKEN_BUDGET * 4  # chars-per-token heuristic
+
+# Text inserted in place of dropped fragments when the session-level
+# cap fires. The wording is deliberately explicit so a downstream LLM
+# treats it as ground-truth metadata about the missing region rather
+# than guessing.
+MIDDLE_TRUNCATION_MARKER_TEMPLATE = (
+    "\n\n--- [SESSION-LEVEL EMERGENCY CAP REACHED] ---\n"
+    "{dropped_fragments:,} fragments / ~{dropped_chars:,} chars "
+    "(~{dropped_tokens:,} tokens) omitted from the middle of the session "
+    "to fit within the {budget_tokens:,}-token transcript budget. The "
+    "head and tail of the session are preserved verbatim above and "
+    "below this marker.\n"
+    "--- [END MARKER] ---\n\n"
+)
+
+# Used in the pathological case where natural middle-truncation cannot
+# preserve a head/tail structure — typically when a single fragment is
+# larger than half the budget (e.g., one ~3.4M-char tool_result), or
+# when the largest few fragments force head and tail to overlap. We
+# fall back to a hard char-truncation of the leading content with a
+# marker spelling out exactly what was lost. Tail content is sacrificed
+# rather than the head because the head usually contains the user's
+# initial framing (which Gemini needs to summarise the session faithfully).
+TAIL_TRUNCATION_MARKER_TEMPLATE = (
+    "\n\n--- [SESSION-LEVEL EMERGENCY CAP REACHED — PATHOLOGICAL] ---\n"
+    "Could not preserve session head + tail at the {budget_tokens:,}-token "
+    "transcript budget (session structure too imbalanced — e.g., one "
+    "tool block exceeds half the budget). Output above is the leading "
+    "{kept_chars:,} chars (~{kept_tokens:,} tokens) of the session; "
+    "~{dropped_chars:,} chars (~{dropped_tokens:,} tokens) follow in the "
+    "original transcript but were omitted.\n"
+    "--- [END MARKER] ---\n\n"
+)
 
 # Patterns identifying framing material that should be stripped from any
 # user-role text block before it is emitted.
@@ -145,15 +215,19 @@ def _strip_framing(text: str) -> str:
     return text.strip()
 
 
-def _truncate(text: str, limit: int) -> str:
-    """Truncate ``text`` to ``limit`` characters with a trailing marker."""
-    if len(text) <= limit:
+def _truncate(text: str, limit: int | None) -> str:
+    """Truncate ``text`` to ``limit`` characters with a trailing marker.
+
+    When ``limit`` is ``None``, returns the text untouched. This is the
+    default for tool_use / tool_result blocks (see module docstring).
+    """
+    if limit is None or len(text) <= limit:
         return text
     return text[:limit] + f" …[truncated; total {len(text):,} chars]"
 
 
-def _compact_json(value: Any, limit: int) -> str:
-    """Serialise a tool-use input dict to compact JSON, truncated to limit."""
+def _compact_json(value: Any, limit: int | None) -> str:
+    """Serialise a tool-use input dict to compact JSON, optionally truncated."""
     try:
         s = json.dumps(value, ensure_ascii=False, sort_keys=True)
     except (TypeError, ValueError):
@@ -235,7 +309,8 @@ def _stringify_tool_result(content: Any) -> str:
 def extract_transcript_text(path: str | Path) -> str:
     """Return a single distilled-text representation of the transcript.
 
-    See module docstring for the inclusion / exclusion contract.
+    See module docstring for the inclusion / exclusion contract and the
+    session-level emergency-cap policy.
     """
     p = Path(path)
     if not p.exists():
@@ -269,7 +344,135 @@ def extract_transcript_text(path: str | Path) -> str:
 
         # Anything else (None, dict, etc.) is dropped.
 
-    return "\n\n".join(fragments).strip()
+    return _apply_session_budget(fragments)
+
+
+def _apply_session_budget(fragments: list[str]) -> str:
+    """
+    Join ``fragments`` into the final distilled string, applying the
+    session-level emergency cap by middle-truncation if necessary.
+
+    The join contract — ``"\\n\\n".join(...)`` — is mirrored here so the
+    accumulated char count corresponds exactly to the final output. We
+    walk forwards to find the largest prefix that fits in the head
+    budget, walk backwards to find the largest suffix that fits in the
+    tail budget, and replace the middle fragments with a single marker
+    fragment describing the elision. When no truncation is needed the
+    function reduces to a single ``"\\n\\n".join(...)`` and ``.strip()``.
+
+    A two-fragment session that already exceeds the budget will not be
+    middle-truncated (there is no middle to drop); it is returned in
+    full and Gemini's input size becomes the caller's problem. This
+    edge case does not occur in practice — a single fragment fitting
+    in 425K tokens would already be a pathological session.
+    """
+    if not fragments:
+        return ""
+
+    separator = "\n\n"
+    sep_len = len(separator)
+
+    sizes = [len(f) for f in fragments]
+    # Total chars if joined verbatim.
+    total = sum(sizes) + sep_len * (len(fragments) - 1)
+    if total <= SESSION_CHAR_BUDGET:
+        return separator.join(fragments).strip()
+
+    # Need to middle-truncate. Reserve room for the marker.
+    marker_overhead = len(MIDDLE_TRUNCATION_MARKER_TEMPLATE.format(
+        dropped_fragments=999_999,
+        dropped_chars=999_999_999,
+        dropped_tokens=999_999_999,
+        budget_tokens=SESSION_TOKEN_BUDGET,
+    ))
+    effective_budget = SESSION_CHAR_BUDGET - marker_overhead
+    half_budget = effective_budget // 2
+
+    # Walk forwards: largest prefix [0..head_end) fitting in half_budget.
+    running = 0
+    head_end = 0
+    for i, sz in enumerate(sizes):
+        # Cost of adding this fragment: its size plus the separator to
+        # the previous one (or to the marker, conservatively).
+        added = sz + sep_len
+        if running + added > half_budget:
+            break
+        running += added
+        head_end = i + 1
+
+    # Walk backwards: largest suffix [tail_start..end) fitting in half_budget.
+    running = 0
+    tail_start = len(fragments)
+    for i in range(len(fragments) - 1, head_end - 1, -1):
+        sz = sizes[i]
+        added = sz + sep_len
+        if running + added > half_budget:
+            break
+        running += added
+        tail_start = i
+
+    # Pathological cases where natural middle-truncation cannot preserve
+    # head + tail structure:
+    #   (a) head_end == 0: the very first fragment is itself larger than
+    #       half-budget, so no head can fit.
+    #   (b) tail_start == len(fragments): the very last fragment is larger
+    #       than half-budget, so no tail can fit.
+    #   (c) tail_start <= head_end: head and tail walks collided — the
+    #       fragments between them are smaller than the slack but the
+    #       largest fragments at the ends each consume too much half-budget.
+    # In all three, fall back to a hard char-truncation: keep the leading
+    # ``effective_budget`` characters of the joined transcript and append
+    # the TAIL_TRUNCATION_MARKER_TEMPLATE so Gemini knows it saw a
+    # truncated view. Sacrifices the tail (rather than the head) because
+    # the user's initial framing is the most important context for an
+    # outside-observer summariser.
+    if (
+        head_end == 0
+        or tail_start == len(fragments)
+        or tail_start <= head_end
+    ):
+        # Account for the marker overhead. Use generous placeholder
+        # values in the overhead estimate so the actual marker (which
+        # carries smaller real numbers) is guaranteed to fit.
+        pathological_overhead = len(TAIL_TRUNCATION_MARKER_TEMPLATE.format(
+            budget_tokens=SESSION_TOKEN_BUDGET,
+            kept_chars=999_999_999,
+            kept_tokens=999_999_999,
+            dropped_chars=999_999_999,
+            dropped_tokens=999_999_999,
+        ))
+        # Clamp to non-negative — in tests with very small budgets the
+        # marker text alone can exceed the budget; we still emit the
+        # marker (truthful provenance is more important than fitting),
+        # but we keep zero content rather than slicing with a negative
+        # index (which would silently return content from the tail).
+        pathological_keep = max(0, SESSION_CHAR_BUDGET - pathological_overhead)
+        full_text = separator.join(fragments)
+        kept = full_text[:pathological_keep]
+        dropped_chars = len(full_text) - len(kept)
+        marker = TAIL_TRUNCATION_MARKER_TEMPLATE.format(
+            budget_tokens=SESSION_TOKEN_BUDGET,
+            kept_chars=len(kept),
+            kept_tokens=len(kept) // 4,
+            dropped_chars=dropped_chars,
+            dropped_tokens=dropped_chars // 4,
+        )
+        return (kept + marker).strip()
+
+    dropped = fragments[head_end:tail_start]
+    dropped_chars = sum(len(f) for f in dropped) + sep_len * max(
+        0, len(dropped) - 1
+    )
+    marker = MIDDLE_TRUNCATION_MARKER_TEMPLATE.format(
+        dropped_fragments=len(dropped),
+        dropped_chars=dropped_chars,
+        dropped_tokens=dropped_chars // 4,
+        budget_tokens=SESSION_TOKEN_BUDGET,
+    )
+
+    return separator.join(
+        list(fragments[:head_end]) + [marker.strip()] + list(fragments[tail_start:])
+    ).strip()
 
 
 def estimate_tokens(text: str) -> int:
