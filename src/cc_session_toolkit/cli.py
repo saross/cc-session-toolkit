@@ -270,7 +270,17 @@ def _cmd_archive_global(args: argparse.Namespace) -> None:
                 if get_session_id(p) not in archived_ids
             ]
     else:
-        targets = [all_sessions[-1]]
+        # Global mode without --all or --session-id is almost certainly
+        # a user mistake — "archive the lexicographically-last session
+        # across every project" is rarely what anyone means. Per-project
+        # mode keeps its "last session" default (less surprising when
+        # scoped to one project), but global mode requires an explicit
+        # selector.
+        print(
+            "Error: global mode (--archive-root) requires --all or "
+            "--session-id to specify what to archive."
+        )
+        sys.exit(2)
 
     if not targets:
         print("No sessions to archive (all already archived).")
@@ -631,6 +641,15 @@ def cmd_catalogue(args: argparse.Namespace) -> None:
     # global-mode dispatch.
     if args.archive_root:
         archive_root = Path(args.archive_root).expanduser()
+        if not archive_root.is_dir():
+            # Refuse to "rebuild" against a non-existent directory.
+            # Without this check we'd silently write an empty
+            # CATALOG.json, masking a typo'd path.
+            print(
+                f"Error: archive root not found or not a directory: "
+                f"{archive_root}"
+            )
+            sys.exit(2)
         archive_dir = archive_root
         catalogue_file = get_global_catalogue_file(archive_root)
     else:

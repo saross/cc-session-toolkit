@@ -1099,9 +1099,11 @@ class TestCliArchiveGlobal:
         """Global mode discovers sessions across multiple project dirs."""
         monkeypatch.setenv("HOME", str(tmp_path))
 
-        # Two projects, two sessions each. Use distinct UUID-like ids
-        # whose first 8 chars differ — the archive uses the prefix as
-        # part of the dir name, so collisions there would mask a real bug.
+        # Two projects, two sessions each. Test ids deliberately have
+        # distinct 8-char prefixes — the archive uses the prefix as
+        # part of the session-dir name, so collisions there would mask
+        # a real multi-project bug. (Not real UUIDs; just non-colliding
+        # filenames for `get_session_id` via `Path.stem`.)
         for proj_dir, cwd_str, sid in [
             ("-home-shawn-foo", str(tmp_path / "foo"),
              "aaaaaaaa-foo1-0000-0000-000000000001"),
@@ -1294,6 +1296,216 @@ class TestCliArchiveGlobal:
         archived = list(foo_dir.iterdir())
         assert len(archived) == 1
 
+    def test_global_mode_requires_all_or_session_id(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """
+        Global mode without --all or --session-id is almost always a
+        user mistake (the previous "lexicographically-last globally"
+        default was surprising). The CLI should error rather than
+        silently archive one session.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        live_dir = tmp_path / ".claude" / "projects" / "-home-shawn-foo"
+        self._make_session(
+            live_dir,
+            "aaaaaaaa-foo1-0000-0000-000000000001",
+            str(tmp_path / "foo"),
+        )
+
+        archive_root = tmp_path / "cc-archives"
+        code = self._run_cli_no_stdin(
+            ["archive", "--gzip", "--archive-root", str(archive_root)],
+            monkeypatch,
+        )
+        assert code == 2
+        err = capsys.readouterr().out
+        assert "requires --all or --session-id" in err
+
+    def test_global_mode_force_rearchives_existing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """
+        With ``--force`` set, already-archived sessions are
+        re-processed instead of skipped. Important for the
+        re-run-after-prompt-iteration workflow.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        live_dir = tmp_path / ".claude" / "projects" / "-home-shawn-foo"
+        sid_known = "aaaaaaaa-known-0000-0000-000000000001"
+        self._make_session(live_dir, sid_known, str(tmp_path / "foo"))
+
+        archive_root = tmp_path / "cc-archives"
+        archive_root.mkdir()
+        # Pre-populate catalogue so the session is "already archived"
+        (archive_root / "CATALOG.json").write_text(json.dumps({
+            "schema_version": "1.1",
+            "sessions": [{"id": sid_known}],
+        }))
+
+        # Without --force: skipped
+        code = self._run_cli_no_stdin(
+            ["archive", "--all", "--gzip",
+             "--archive-root", str(archive_root)],
+            monkeypatch,
+        )
+        assert code == 0
+        out_no_force = capsys.readouterr().out
+        assert "No sessions to archive" in out_no_force
+
+        # With --force: archived
+        code = self._run_cli_no_stdin(
+            ["archive", "--all", "--force", "--gzip",
+             "--archive-root", str(archive_root)],
+            monkeypatch,
+        )
+        assert code == 0
+        out_force = capsys.readouterr().out
+        assert "Archiving 1 session(s)" in out_force
+
+    def test_global_mode_session_id_targets_one_session(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """
+        ``--session-id X`` in global mode targets a single session by
+        its UUID, regardless of which project_dir it lives under.
+        Tests both the match and the not-found error path.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        live_dir_foo = (
+            tmp_path / ".claude" / "projects" / "-home-shawn-foo"
+        )
+        live_dir_bar = (
+            tmp_path / ".claude" / "projects" / "-home-shawn-bar"
+        )
+        target_sid = "aaaaaaaa-target-0000-0000-000000000001"
+        other_sid = "bbbbbbbb-other-0000-0000-000000000002"
+        self._make_session(live_dir_foo, target_sid, str(tmp_path / "foo"))
+        self._make_session(live_dir_bar, other_sid, str(tmp_path / "bar"))
+
+        archive_root = tmp_path / "cc-archives"
+
+        # Match: only the target session is archived
+        code = self._run_cli_no_stdin(
+            ["archive", "--session-id", target_sid, "--gzip",
+             "--archive-root", str(archive_root)],
+            monkeypatch,
+        )
+        assert code == 0
+        out_match = capsys.readouterr().out
+        assert "Archiving 1 session(s)" in out_match
+        assert (archive_root / "foo").is_dir()
+        assert not (archive_root / "bar").exists()
+
+        # Not found: error returned
+        code = self._run_cli_no_stdin(
+            ["archive", "--session-id", "no-such-sid", "--gzip",
+             "--archive-root", str(archive_root)],
+            monkeypatch,
+        )
+        assert code == 0
+        out_miss = capsys.readouterr().out
+        assert "Session not found: no-such-sid" in out_miss
+
+    def test_global_mode_update_catalogue_called_once_per_project(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        Regression: ``update_catalogue`` takes a single ``project_name``
+        argument, so global mode groups results by project and calls
+        it once per project. Verify the call count matches the number
+        of distinct projects, not the total session count.
+
+        A bug that called it once per session would n²-bloat writes on
+        large sweeps. A bug that called it once total would silently
+        overwrite all but the last project's catalogue contribution.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        # 4 sessions across 2 projects
+        for proj_dir, cwd_str, sid in [
+            ("-home-shawn-foo", str(tmp_path / "foo"),
+             "aaaaaaaa-foo1-0000-0000-000000000001"),
+            ("-home-shawn-foo", str(tmp_path / "foo"),
+             "bbbbbbbb-foo2-0000-0000-000000000002"),
+            ("-home-shawn-bar", str(tmp_path / "bar"),
+             "cccccccc-bar1-0000-0000-000000000003"),
+            ("-home-shawn-bar", str(tmp_path / "bar"),
+             "dddddddd-bar2-0000-0000-000000000004"),
+        ]:
+            live_dir = tmp_path / ".claude" / "projects" / proj_dir
+            self._make_session(live_dir, sid, cwd_str)
+
+        update_calls: list[tuple[str, int]] = []
+
+        def fake_update(
+            results: list[Any],
+            _cat: Any,
+            _root: Any,
+            project_name: str,
+        ) -> None:
+            update_calls.append((project_name, len(results)))
+
+        monkeypatch.setattr(
+            "cc_session_toolkit.cli.update_catalogue", fake_update
+        )
+
+        archive_root = tmp_path / "cc-archives"
+        code = self._run_cli_no_stdin(
+            ["archive", "--all", "--gzip",
+             "--archive-root", str(archive_root)],
+            monkeypatch,
+        )
+        assert code == 0
+        # 2 distinct projects → exactly 2 catalogue calls
+        assert len(update_calls) == 2
+        project_names = sorted(name for name, _ in update_calls)
+        assert project_names == ["bar", "foo"]
+        # Each call should batch both sessions for that project
+        counts = {name: n for name, n in update_calls}
+        assert counts == {"foo": 2, "bar": 2}
+
+    def test_global_mode_archive_root_with_tilde_is_expanded(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        ``--archive-root ~/cc-archives`` must be tilde-expanded before
+        use. ``Path("~/cc-archives")`` doesn't expand `~` on its own.
+        """
+        # Use HOME=tmp_path so ~ expands predictably under test
+        monkeypatch.setenv("HOME", str(tmp_path))
+        live_dir = tmp_path / ".claude" / "projects" / "-home-shawn-foo"
+        self._make_session(
+            live_dir,
+            "aaaaaaaa-foo1-0000-0000-000000000001",
+            str(tmp_path / "foo"),
+        )
+
+        # Pass a tilde-prefixed path; expansion should resolve it
+        # to tmp_path/cc-archives
+        code = self._run_cli_no_stdin(
+            ["archive", "--all", "--gzip",
+             "--archive-root", "~/cc-archives"],
+            monkeypatch,
+        )
+        assert code == 0
+        # The archive should land under HOME-expanded path, not a
+        # literal "~" directory
+        assert (tmp_path / "cc-archives").is_dir()
+        assert not (Path.cwd() / "~").exists()  # no literal-~ dir
+
     def test_global_mode_excludes_flat_agent_jsonls(
         self,
         tmp_path: Path,
@@ -1398,6 +1610,7 @@ class TestCliCatalogueGlobal:
         args: list[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> int:
+        """Run the CLI with monkeypatched argv (no stdin needed)."""
         from cc_session_toolkit.cli import main
 
         monkeypatch.setattr("sys.argv", ["cc-session"] + args)
@@ -1463,6 +1676,31 @@ class TestCliCatalogueGlobal:
         # The session we placed should now appear in the catalogue
         session_ids = {s.get("id") for s in data.get("sessions", [])}
         assert "aaaaaaaa-1234-0000-0000-000000000001" in session_ids
+
+    def test_catalogue_errors_on_missing_archive_root(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """
+        Typo'd ``--archive-root`` should error explicitly rather than
+        silently writing an empty CATALOG.json to a path that didn't
+        exist. (Pre-fix behaviour was the silent-empty-catalogue
+        misfire flagged by the audit.)
+        """
+        monkeypatch.chdir(tmp_path)
+        bogus = tmp_path / "no-such-archive-root"
+
+        code = self._run_cli(
+            ["catalogue", "--rebuild", "--archive-root", str(bogus)],
+            monkeypatch,
+        )
+        assert code == 2
+        err = capsys.readouterr().out
+        assert "not found or not a directory" in err
+        # And the catalogue file must NOT have been created
+        assert not (bogus / "CATALOG.json").exists()
 
 
 class TestExtractCwdFromJsonl:
