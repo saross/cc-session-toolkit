@@ -1169,6 +1169,169 @@ class TestCliArchiveGlobal:
         assert captured_kwargs.get("auto_metadata") is True
         assert captured_kwargs.get("archive_root") == archive_root
 
+    def test_global_mode_applies_trivial_session_filter(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """
+        Regression: trivial sessions (< min-turns) must be filtered in
+        global mode, mirroring ``_cmd_archive_from_hook``. Without
+        this, ``--all --auto-metadata`` fires a Gemini Flex call on
+        every empty session in the live store.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        live_dir = tmp_path / ".claude" / "projects" / "-home-shawn-foo"
+
+        # One trivial session (2 turns) + one non-trivial (6 turns)
+        self._make_session(
+            live_dir,
+            "aaaaaaaa-trivial-0000-0000-000000000001",
+            str(tmp_path / "foo"),
+            turns=2,
+        )
+        self._make_session(
+            live_dir,
+            "bbbbbbbb-real-0000-0000-000000000002",
+            str(tmp_path / "foo"),
+            turns=6,
+        )
+
+        archive_root = tmp_path / "cc-archives"
+        code = self._run_cli_no_stdin(
+            ["archive", "--all", "--gzip",
+             "--archive-root", str(archive_root)],
+            monkeypatch,
+        )
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "Skipping trivial" in out
+        assert "Archiving 1 session(s)" in out
+        # Only the non-trivial session should land in the archive
+        foo_dir = archive_root / "foo"
+        assert foo_dir.is_dir()
+        archived_dirs = list(foo_dir.iterdir())
+        assert len(archived_dirs) == 1
+
+    def test_global_mode_dry_run_does_not_update_catalogue(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        Regression: ``--dry-run`` must NOT call ``update_catalogue``.
+        A dry-run that mutates the catalogue would defeat the purpose
+        of dry-running (state pollution from a "preview" command).
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        live_dir = tmp_path / ".claude" / "projects" / "-home-shawn-foo"
+        self._make_session(
+            live_dir,
+            "aaaaaaaa-foo1-0000-0000-000000000001",
+            str(tmp_path / "foo"),
+        )
+
+        update_calls: list[Any] = []
+
+        def fake_update(*args: Any, **kwargs: Any) -> None:
+            update_calls.append((args, kwargs))
+
+        monkeypatch.setattr(
+            "cc_session_toolkit.cli.update_catalogue", fake_update
+        )
+
+        archive_root = tmp_path / "cc-archives"
+        code = self._run_cli_no_stdin(
+            ["archive", "--all", "--gzip", "--dry-run",
+             "--archive-root", str(archive_root)],
+            monkeypatch,
+        )
+        assert code == 0
+        assert len(update_calls) == 0, (
+            f"update_catalogue called {len(update_calls)} times "
+            "during --dry-run; expected 0"
+        )
+
+    def test_global_mode_dedup_skips_already_archived(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """
+        Sessions whose id is in the global catalogue should be skipped
+        unless ``--force`` is set. Critical for safe re-runs of a
+        production sweep — a second invocation must not double-archive
+        and double-spend on Gemini Flex.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        live_dir = tmp_path / ".claude" / "projects" / "-home-shawn-foo"
+        sid_known = "aaaaaaaa-known-0000-0000-000000000001"
+        sid_new = "bbbbbbbb-newxx-0000-0000-000000000002"
+        self._make_session(live_dir, sid_known, str(tmp_path / "foo"))
+        self._make_session(live_dir, sid_new, str(tmp_path / "foo"))
+
+        # Pre-populate the catalogue so the known id is already there
+        archive_root = tmp_path / "cc-archives"
+        archive_root.mkdir()
+        (archive_root / "CATALOG.json").write_text(json.dumps({
+            "schema_version": "1.1",
+            "sessions": [{"id": sid_known}],
+        }))
+
+        code = self._run_cli_no_stdin(
+            ["archive", "--all", "--gzip",
+             "--archive-root", str(archive_root)],
+            monkeypatch,
+        )
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "Archiving 1 session(s)" in out
+        foo_dir = archive_root / "foo"
+        assert foo_dir.is_dir()
+        # Only the new (not pre-archived) session should land
+        archived = list(foo_dir.iterdir())
+        assert len(archived) == 1
+
+    def test_global_mode_excludes_flat_agent_jsonls(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """
+        ``agent-*.jsonl`` files at the top of a project dir are
+        subagent transcripts; they are archived under their parent
+        session's ``subagents/`` subdir during the main archive pass.
+        Global mode must exclude them from discovery to avoid
+        misrouting and double-counting. Matches the exclusion in
+        ``archive.get_session_files``.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        live_dir = tmp_path / ".claude" / "projects" / "-home-shawn-foo"
+        # One regular session
+        self._make_session(
+            live_dir,
+            "aaaaaaaa-main-0000-0000-000000000001",
+            str(tmp_path / "foo"),
+        )
+        # One agent-*.jsonl that should be ignored
+        self._make_session(live_dir, "agent-deadbeef", str(tmp_path / "foo"))
+
+        archive_root = tmp_path / "cc-archives"
+        code = self._run_cli_no_stdin(
+            ["archive", "--all", "--gzip",
+             "--archive-root", str(archive_root)],
+            monkeypatch,
+        )
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "Archiving 1 session(s)" in out
+        foo_dir = archive_root / "foo"
+        assert foo_dir.is_dir()
+        assert len(list(foo_dir.iterdir())) == 1
+
     def test_per_project_mode_passes_auto_metadata_to_archive_session(
         self,
         tmp_path: Path,
@@ -1340,3 +1503,110 @@ class TestExtractCwdFromJsonl:
         assert _extract_cwd_from_jsonl(
             tmp_path / "no-such-file.jsonl"
         ) == Path.home()
+
+    def test_scans_past_summary_record_to_find_cwd(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        Regression: real CC live JSONLs commonly open with a
+        ``type: summary`` or ``type: permission-mode`` record that
+        lacks a ``cwd`` field; the actual session record with ``cwd``
+        appears later. Empirically ~90% of live JSONLs have ``cwd`` on
+        line 2 or later. The helper must scan past leading metadata
+        records, not stop at line 1.
+        """
+        from cc_session_toolkit.cli import _extract_cwd_from_jsonl
+
+        jsonl = tmp_path / "s.jsonl"
+        jsonl.write_text(
+            json.dumps(
+                {"leafUuid": "abc", "summary": "x", "type": "summary"}
+            ) + "\n"
+            + json.dumps(
+                {"permissionMode": "default",
+                 "sessionId": "s1", "type": "permission-mode"}
+            ) + "\n"
+            + json.dumps(
+                {"type": "user",
+                 "cwd": "/home/shawn/personal-assistant",
+                 "isSidechain": False, "sessionId": "s1"}
+            ) + "\n"
+        )
+        assert _extract_cwd_from_jsonl(jsonl) == Path(
+            "/home/shawn/personal-assistant"
+        )
+
+    def test_scans_past_multiple_metadata_records(
+        self, tmp_path: Path
+    ) -> None:
+        """The scan should look at up to 20 records before giving up."""
+        from cc_session_toolkit.cli import _extract_cwd_from_jsonl
+
+        jsonl = tmp_path / "s.jsonl"
+        lines = []
+        # 15 metadata records without cwd, then the real one
+        for _ in range(15):
+            lines.append(json.dumps({"type": "progress"}))
+        lines.append(json.dumps({"type": "user", "cwd": "/somewhere"}))
+        jsonl.write_text("\n".join(lines) + "\n")
+
+        assert _extract_cwd_from_jsonl(jsonl) == Path("/somewhere")
+
+    def test_treats_non_string_cwd_as_missing(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        Regression: a malformed record with a non-string ``cwd``
+        (None / int / list / dict) must not raise TypeError and abort
+        the batch. The helper treats such values as if the field were
+        absent, so the scan continues to subsequent lines.
+        """
+        from cc_session_toolkit.cli import _extract_cwd_from_jsonl
+
+        # cwd=None then a valid record
+        jsonl1 = tmp_path / "s1.jsonl"
+        jsonl1.write_text(
+            json.dumps({"cwd": None, "type": "x"}) + "\n"
+            + json.dumps({"cwd": "/real/path", "type": "y"}) + "\n"
+        )
+        assert _extract_cwd_from_jsonl(jsonl1) == Path("/real/path")
+
+        # cwd=int — also a valid record after it
+        jsonl2 = tmp_path / "s2.jsonl"
+        jsonl2.write_text(
+            json.dumps({"cwd": 42, "type": "x"}) + "\n"
+            + json.dumps({"cwd": "/real/path-2", "type": "y"}) + "\n"
+        )
+        assert _extract_cwd_from_jsonl(jsonl2) == Path("/real/path-2")
+
+        # cwd=list — falls back when no valid record follows
+        jsonl3 = tmp_path / "s3.jsonl"
+        jsonl3.write_text(
+            json.dumps({"cwd": ["a", "b"], "type": "x"}) + "\n"
+        )
+        assert _extract_cwd_from_jsonl(jsonl3) == Path.home()
+
+        # cwd="" (empty string) — also treated as missing
+        jsonl4 = tmp_path / "s4.jsonl"
+        jsonl4.write_text(
+            json.dumps({"cwd": "", "type": "x"}) + "\n"
+            + json.dumps({"cwd": "/real/path-4", "type": "y"}) + "\n"
+        )
+        assert _extract_cwd_from_jsonl(jsonl4) == Path("/real/path-4")
+
+    def test_skips_unparseable_lines_then_finds_cwd(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A bad line in the middle should not abort the scan — keep
+        going to find the next parseable record with a valid cwd.
+        """
+        from cc_session_toolkit.cli import _extract_cwd_from_jsonl
+
+        jsonl = tmp_path / "s.jsonl"
+        jsonl.write_text(
+            json.dumps({"type": "summary"}) + "\n"
+            + "this is not json at all\n"
+            + json.dumps({"cwd": "/found"}) + "\n"
+        )
+        assert _extract_cwd_from_jsonl(jsonl) == Path("/found")

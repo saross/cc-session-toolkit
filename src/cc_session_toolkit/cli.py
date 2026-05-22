@@ -166,9 +166,12 @@ def _cmd_archive_from_hook(args: argparse.Namespace) -> None:
         print(f"Archived: {session_id} → {project_name}")
 
 
+_CWD_SCAN_MAX_LINES = 20
+
+
 def _extract_cwd_from_jsonl(jsonl_path: Path) -> Path:
     """
-    Extract the ``cwd`` field from the first line of a CC live JSONL.
+    Extract the ``cwd`` field from a CC live JSONL.
 
     Used by ``_cmd_archive_global`` to derive each session's project
     name from its actual working directory rather than the encoded
@@ -176,16 +179,38 @@ def _extract_cwd_from_jsonl(jsonl_path: Path) -> Path:
     slashes become hyphens, so ``~/Code/foo-bar`` and ``~/Code-foo/bar``
     encode identically).
 
-    Returns the user's home directory as a safe fallback if the field
-    is missing or the file is unparseable.
+    Claude Code's live JSONLs typically open with one or more metadata
+    records (``type: summary``, ``type: permission-mode``,
+    ``type: progress``, etc.) that lack a ``cwd`` field, followed by
+    the actual session content where ``cwd`` first appears. Empirically
+    only ~10% of live JSONLs carry ``cwd`` on line 1; the rest carry it
+    on lines 2–10. This helper scans up to ``_CWD_SCAN_MAX_LINES``
+    records to find the first one with a valid string ``cwd``.
+
+    Returns the user's home directory as a safe fallback when no valid
+    ``cwd`` is found within the scan window, the file is unparseable,
+    or the file is missing. Non-string ``cwd`` values (None, ints,
+    lists) are treated as missing rather than allowed to raise
+    ``TypeError`` from ``Path(...)`` — a single malformed record must
+    not abort an entire batch sweep.
     """
     try:
-        with open(jsonl_path) as f:
-            first = json.loads(f.readline())
-            cwd_str = first.get("cwd", str(Path.home()))
-            return Path(cwd_str)
-    except (json.JSONDecodeError, OSError):
-        return Path.home()
+        with open(jsonl_path, encoding="utf-8") as f:
+            for line_num, line in enumerate(f, 1):
+                if line_num > _CWD_SCAN_MAX_LINES:
+                    break
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                cwd_value = record.get("cwd")
+                if isinstance(cwd_value, str) and cwd_value:
+                    return Path(cwd_value)
+    except OSError:
+        pass
+    return Path.home()
 
 
 def _cmd_archive_global(args: argparse.Namespace) -> None:
@@ -205,7 +230,7 @@ def _cmd_archive_global(args: argparse.Namespace) -> None:
     cannot deliver because it is scoped to ``find_project_root()`` on
     the caller's cwd.
     """
-    archive_root = Path(args.archive_root)
+    archive_root = Path(args.archive_root).expanduser()
     catalogue_file = get_global_catalogue_file(archive_root)
     archived_ids = get_archived_session_ids(catalogue_file)
 
@@ -214,7 +239,16 @@ def _cmd_archive_global(args: argparse.Namespace) -> None:
         print(f"Error: {cc_projects_dir} not found")
         sys.exit(1)
 
-    all_sessions = sorted(cc_projects_dir.glob("*/*.jsonl"))
+    # Exclude flat ``agent-*.jsonl`` files (subagent transcripts that
+    # CC sometimes drops alongside main-thread JSONLs). The toolkit
+    # archives subagents under their parent session's ``subagents/``
+    # subdir during the main archive pass; treating them as standalone
+    # would mis-route and double-count them. Matches the same exclusion
+    # in ``archive.get_session_files``.
+    all_sessions = sorted(
+        p for p in cc_projects_dir.glob("*/*.jsonl")
+        if not p.name.startswith("agent-")
+    )
     if not all_sessions:
         print("No live sessions found.")
         return
@@ -243,13 +277,42 @@ def _cmd_archive_global(args: argparse.Namespace) -> None:
         print("Use --force to re-archive existing sessions.")
         return
 
-    print(f"Archiving {len(targets)} session(s) to {archive_root}...")
+    # Apply trivial-session filter (mirrors ``_cmd_archive_from_hook``).
+    # Without this, ``--all --auto-metadata`` would fire a Gemini Flex
+    # call on every empty / aborted / few-turn session in the live
+    # store — material cost on a multi-hundred-session sweep. The
+    # ``--min-turns`` flag (previously documented as hook-only) is
+    # honoured here too.
+    min_turns = (
+        args.min_turns if args.min_turns is not None
+        else DEFAULT_MIN_TURNS
+    )
+    non_trivial_targets: list[Path] = []
+    for session_path in targets:
+        stats = extract_session_stats(session_path)
+        if is_trivial_session(stats, min_turns=min_turns):
+            print(
+                f"Skipping trivial session {get_session_id(session_path)}: "
+                f"{stats.get('turns', 0)} turns, "
+                f"{stats.get('duration_minutes', 0)} min"
+            )
+            continue
+        non_trivial_targets.append(session_path)
+
+    if not non_trivial_targets:
+        print("No non-trivial sessions to archive.")
+        return
+
+    print(
+        f"Archiving {len(non_trivial_targets)} session(s) to "
+        f"{archive_root}..."
+    )
 
     # Group results by project_name so update_catalogue is called once
     # per project (it takes a single project_name argument).
     new_sessions_by_project: dict[str, list[dict[str, Any]]] = {}
 
-    for session_path in targets:
+    for session_path in non_trivial_targets:
         cwd = _extract_cwd_from_jsonl(session_path)
         project_name = detect_project_name_from_cwd(cwd)
         try:
@@ -257,7 +320,7 @@ def _cmd_archive_global(args: argparse.Namespace) -> None:
         except FileNotFoundError:
             project_root = None
 
-        title = args.title if len(targets) == 1 else None
+        title = args.title if len(non_trivial_targets) == 1 else None
         result = archive_session(
             session_path,
             project_root,
@@ -567,7 +630,7 @@ def cmd_catalogue(args: argparse.Namespace) -> None:
     # directly, no project root required. Symmetric with cmd_archive's
     # global-mode dispatch.
     if args.archive_root:
-        archive_root = Path(args.archive_root)
+        archive_root = Path(args.archive_root).expanduser()
         archive_dir = archive_root
         catalogue_file = get_global_catalogue_file(archive_root)
     else:
@@ -827,7 +890,8 @@ def main() -> None:
         type=int,
         help=(
             "Minimum turns to archive a session "
-            f"(default: {DEFAULT_MIN_TURNS}; used with --from-hook)."
+            f"(default: {DEFAULT_MIN_TURNS}; used with --from-hook "
+            "and global mode via --archive-root)."
         ),
     )
     p_archive.add_argument(
