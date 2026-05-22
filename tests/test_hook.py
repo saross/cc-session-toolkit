@@ -981,3 +981,362 @@ class TestCliFromHook:
         assert code == 0
         captured = capsys.readouterr()
         assert "already-archived" in captured.out
+
+
+class TestCliArchiveGlobal:
+    """
+    Tests for ``cc-session archive --archive-root ...`` (global mode).
+
+    Global mode is the cross-project bulk-backfill counterpart to
+    ``--from-hook``: it scans every ``~/.claude/projects/<project>/``
+    for live JSONLs and writes archives to the supplied ``archive_root``
+    with the project name derived per-session from each transcript's
+    ``cwd`` field.
+    """
+
+    def _run_cli_no_stdin(
+        self,
+        args: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> int:
+        """Run the CLI with monkeypatched argv (no stdin needed)."""
+        from cc_session_toolkit.cli import main
+
+        monkeypatch.setattr("sys.argv", ["cc-session"] + args)
+        try:
+            main()
+            return 0
+        except SystemExit as exc:
+            return exc.code if exc.code else 0
+
+    def _make_session(
+        self,
+        live_dir: Path,
+        sid: str,
+        cwd: str,
+        turns: int = 6,
+    ) -> Path:
+        """
+        Create a fake live JSONL with *turns* user/assistant pairs.
+
+        The first entry carries the ``cwd`` field that
+        ``_extract_cwd_from_jsonl`` reads. Each pair adds 1 min between
+        entries so the session passes the trivial-session filter.
+        """
+        from datetime import timedelta
+
+        live_dir.mkdir(parents=True, exist_ok=True)
+        start = datetime(2026, 3, 15, 10, 0, 0, tzinfo=timezone.utc)
+        entries: list[dict[str, Any]] = []
+        for i in range(turns):
+            ts_user = (start + timedelta(minutes=i * 2)).isoformat()
+            entries.append({
+                "timestamp": ts_user,
+                "cwd": cwd,
+                "message": {
+                    "role": "user",
+                    "content": f"User msg {i + 1}",
+                },
+            })
+            ts_asst = (start + timedelta(minutes=i * 2 + 1)).isoformat()
+            entries.append({
+                "timestamp": ts_asst,
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-5-20250929",
+                    "content": [
+                        {"type": "text", "text": f"Reply {i + 1}"},
+                    ],
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                    },
+                },
+            })
+        jsonl = live_dir / f"{sid}.jsonl"
+        jsonl.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        return jsonl
+
+    def test_archive_root_dispatches_to_global_mode(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        ``--archive-root`` routes to ``_cmd_archive_global``, not the
+        per-project path. Verified by spying on the dispatcher.
+        """
+        # Set HOME so Path.home() under test points at tmp_path
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        # Create a single session under the mock CC live store
+        live_dir = tmp_path / ".claude" / "projects" / "-home-shawn-foo"
+        self._make_session(live_dir, "sid-001", str(tmp_path / "foo"))
+
+        called = {"count": 0}
+
+        def fake_global(_args: Any) -> None:
+            called["count"] += 1
+
+        monkeypatch.setattr(
+            "cc_session_toolkit.cli._cmd_archive_global", fake_global
+        )
+
+        archive_root = tmp_path / "cc-archives"
+        code = self._run_cli_no_stdin(
+            ["archive", "--all", "--archive-root", str(archive_root)],
+            monkeypatch,
+        )
+        assert code == 0
+        assert called["count"] == 1
+
+    def test_global_mode_scans_all_projects(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Global mode discovers sessions across multiple project dirs."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        # Two projects, two sessions each. Use distinct UUID-like ids
+        # whose first 8 chars differ — the archive uses the prefix as
+        # part of the dir name, so collisions there would mask a real bug.
+        for proj_dir, cwd_str, sid in [
+            ("-home-shawn-foo", str(tmp_path / "foo"),
+             "aaaaaaaa-foo1-0000-0000-000000000001"),
+            ("-home-shawn-foo", str(tmp_path / "foo"),
+             "bbbbbbbb-foo2-0000-0000-000000000002"),
+            ("-home-shawn-bar", str(tmp_path / "bar"),
+             "cccccccc-bar1-0000-0000-000000000003"),
+            ("-home-shawn-bar", str(tmp_path / "bar"),
+             "dddddddd-bar2-0000-0000-000000000004"),
+        ]:
+            live_dir = tmp_path / ".claude" / "projects" / proj_dir
+            self._make_session(live_dir, sid, cwd_str)
+
+        archive_root = tmp_path / "cc-archives"
+
+        code = self._run_cli_no_stdin(
+            ["archive", "--all", "--gzip",
+             "--archive-root", str(archive_root)],
+            monkeypatch,
+        )
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "Archiving 4 session(s)" in out
+        # Each session should land under archive_root/<project_name>/
+        # detect_project_name_from_cwd falls back to the cwd's
+        # directory basename when no project markers are present, so
+        # we expect "foo" and "bar" subtrees.
+        assert (archive_root / "foo").is_dir()
+        assert (archive_root / "bar").is_dir()
+        # Two session-dirs per project
+        assert len(list((archive_root / "foo").iterdir())) == 2
+        assert len(list((archive_root / "bar").iterdir())) == 2
+
+    def test_global_mode_passes_auto_metadata_to_archive_session(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        Regression: ``--auto-metadata`` must flow through to
+        ``archive_session`` in global mode (it was silently dropped
+        before the 2026-05-22 cli.py patch).
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        live_dir = tmp_path / ".claude" / "projects" / "-home-shawn-foo"
+        self._make_session(live_dir, "sid-001", str(tmp_path / "foo"))
+
+        captured_kwargs: dict[str, Any] = {}
+
+        def fake_archive_session(*_args: Any, **kwargs: Any) -> None:
+            captured_kwargs.update(kwargs)
+            return None
+
+        monkeypatch.setattr(
+            "cc_session_toolkit.cli.archive_session", fake_archive_session
+        )
+
+        archive_root = tmp_path / "cc-archives"
+        code = self._run_cli_no_stdin(
+            ["archive", "--all", "--auto-metadata",
+             "--archive-root", str(archive_root)],
+            monkeypatch,
+        )
+        assert code == 0
+        assert captured_kwargs.get("auto_metadata") is True
+        assert captured_kwargs.get("archive_root") == archive_root
+
+    def test_per_project_mode_passes_auto_metadata_to_archive_session(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        Regression: ``--auto-metadata`` must flow through in
+        per-project mode too (it was silently dropped before the
+        2026-05-22 cli.py patch). Same bug as global mode but in a
+        different code path.
+        """
+        # Set HOME and create a fake project with .git so find_project_root works
+        monkeypatch.setenv("HOME", str(tmp_path))
+        proj = tmp_path / "myproject"
+        proj.mkdir()
+        (proj / ".git").mkdir()
+        # CC live store sits under tmp_path/.claude/projects/<encoded>/
+        live_dir = tmp_path / ".claude" / "projects" / "-tmp-myproject"
+        self._make_session(live_dir, "sid-001", str(proj))
+
+        # Per-project mode reads sessions via get_session_files(project_root).
+        # Mock that to return our session directly, sidestepping the
+        # CC live-store discovery path (which uses get_cc_project_path).
+        sess_file = live_dir / "sid-001.jsonl"
+
+        captured_kwargs: dict[str, Any] = {}
+
+        def fake_archive_session(*_args: Any, **kwargs: Any) -> None:
+            captured_kwargs.update(kwargs)
+            return None
+
+        monkeypatch.setattr(
+            "cc_session_toolkit.cli.archive_session", fake_archive_session
+        )
+        monkeypatch.setattr(
+            "cc_session_toolkit.cli.get_session_files",
+            lambda _root: [sess_file],
+        )
+        monkeypatch.setattr(
+            "cc_session_toolkit.cli.get_archived_session_ids",
+            lambda _f: set(),
+        )
+        monkeypatch.setattr(
+            "cc_session_toolkit.cli.find_project_root",
+            lambda *_a, **_k: proj,
+        )
+
+        code = self._run_cli_no_stdin(
+            ["archive", "--all", "--auto-metadata"],
+            monkeypatch,
+        )
+        assert code == 0
+        assert captured_kwargs.get("auto_metadata") is True
+
+
+class TestCliCatalogueGlobal:
+    """
+    Tests for ``cc-session catalogue --rebuild --archive-root ...``
+    (global mode). Symmetric with ``cc-session archive --archive-root ...``.
+    """
+
+    def _run_cli(
+        self,
+        args: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> int:
+        from cc_session_toolkit.cli import main
+
+        monkeypatch.setattr("sys.argv", ["cc-session"] + args)
+        try:
+            main()
+            return 0
+        except SystemExit as exc:
+            return exc.code if exc.code else 0
+
+    def test_archive_root_bypasses_find_project_root(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """
+        ``catalogue --rebuild --archive-root X`` operates on X directly,
+        without requiring the caller to be inside a project. Verified by
+        running from a non-project cwd.
+        """
+        # Build a minimal archive structure at archive_root
+        archive_root = tmp_path / "cc-archives"
+        proj_session_dir = (
+            archive_root / "demo-project"
+            / "2026-03-15T10-00_aaaaaaaa-1234"
+        )
+        proj_session_dir.mkdir(parents=True)
+        meta = {
+            "schema_version": "1.2",
+            "session": {
+                "id": "aaaaaaaa-1234-0000-0000-000000000001",
+                "started_at": "2026-03-15T10:00:00Z",
+                "ended_at": "2026-03-15T10:10:00Z",
+                "duration_minutes": 10,
+            },
+            "auto_generated": {
+                "title": "Test session",
+                "purpose": "demo",
+                "tags": ["test"],
+            },
+            "project": {"name": "demo-project"},
+            "statistics": {"turns": 6},
+            "archive": {"created_at": "2026-03-15T10:11:00Z"},
+        }
+        (proj_session_dir / "session.meta.json").write_text(
+            json.dumps(meta)
+        )
+
+        # Run from a non-project cwd (tmp_path itself has no .git etc.)
+        monkeypatch.chdir(tmp_path)
+
+        code = self._run_cli(
+            ["catalogue", "--rebuild",
+             "--archive-root", str(archive_root)],
+            monkeypatch,
+        )
+        assert code == 0
+
+        # Global catalogue lands at archive_root/CATALOG.json
+        catalogue_file = archive_root / "CATALOG.json"
+        assert catalogue_file.is_file()
+        data = json.loads(catalogue_file.read_text())
+        # The session we placed should now appear in the catalogue
+        session_ids = {s.get("id") for s in data.get("sessions", [])}
+        assert "aaaaaaaa-1234-0000-0000-000000000001" in session_ids
+
+
+class TestExtractCwdFromJsonl:
+    """Robustness of :func:`_extract_cwd_from_jsonl`."""
+
+    def test_reads_cwd_from_first_line(self, tmp_path: Path) -> None:
+        from cc_session_toolkit.cli import _extract_cwd_from_jsonl
+
+        jsonl = tmp_path / "s.jsonl"
+        jsonl.write_text(
+            json.dumps({"cwd": "/some/where", "msg": "hi"}) + "\n"
+        )
+        assert _extract_cwd_from_jsonl(jsonl) == Path("/some/where")
+
+    def test_falls_back_to_home_when_cwd_missing(
+        self, tmp_path: Path
+    ) -> None:
+        from cc_session_toolkit.cli import _extract_cwd_from_jsonl
+
+        jsonl = tmp_path / "s.jsonl"
+        jsonl.write_text(json.dumps({"msg": "no cwd"}) + "\n")
+        assert _extract_cwd_from_jsonl(jsonl) == Path.home()
+
+    def test_falls_back_to_home_on_unparseable_jsonl(
+        self, tmp_path: Path
+    ) -> None:
+        from cc_session_toolkit.cli import _extract_cwd_from_jsonl
+
+        jsonl = tmp_path / "bad.jsonl"
+        jsonl.write_text("not json at all\n")
+        assert _extract_cwd_from_jsonl(jsonl) == Path.home()
+
+    def test_falls_back_to_home_on_missing_file(
+        self, tmp_path: Path
+    ) -> None:
+        from cc_session_toolkit.cli import _extract_cwd_from_jsonl
+
+        assert _extract_cwd_from_jsonl(
+            tmp_path / "no-such-file.jsonl"
+        ) == Path.home()

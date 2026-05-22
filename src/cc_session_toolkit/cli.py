@@ -166,11 +166,135 @@ def _cmd_archive_from_hook(args: argparse.Namespace) -> None:
         print(f"Archived: {session_id} → {project_name}")
 
 
+def _extract_cwd_from_jsonl(jsonl_path: Path) -> Path:
+    """
+    Extract the ``cwd`` field from the first line of a CC live JSONL.
+
+    Used by ``_cmd_archive_global`` to derive each session's project
+    name from its actual working directory rather than the encoded
+    directory name under ``~/.claude/projects/`` (which is lossy:
+    slashes become hyphens, so ``~/Code/foo-bar`` and ``~/Code-foo/bar``
+    encode identically).
+
+    Returns the user's home directory as a safe fallback if the field
+    is missing or the file is unparseable.
+    """
+    try:
+        with open(jsonl_path) as f:
+            first = json.loads(f.readline())
+            cwd_str = first.get("cwd", str(Path.home()))
+            return Path(cwd_str)
+    except (json.JSONDecodeError, OSError):
+        return Path.home()
+
+
+def _cmd_archive_global(args: argparse.Namespace) -> None:
+    """
+    Handle ``cc-session archive`` in global mode (``--archive-root`` set).
+
+    Scans all live sessions under ``~/.claude/projects/*/`` across every
+    project, applies global-catalogue-based deduplication, and archives
+    each unarchived session to ``archive_root`` with the project name
+    derived per-session from the transcript's ``cwd`` field. Honours
+    ``--all``, ``--session-id``, ``--force``, ``--dry-run``, ``--gzip``,
+    ``--auto-metadata``, ``--stats-only``, and ``--title``.
+
+    This is the bulk-backfill counterpart to ``--from-hook`` (which
+    processes one session at a time from stdin JSON). Provides a
+    cross-project sweep entry point that the per-project ``cmd_archive``
+    cannot deliver because it is scoped to ``find_project_root()`` on
+    the caller's cwd.
+    """
+    archive_root = Path(args.archive_root)
+    catalogue_file = get_global_catalogue_file(archive_root)
+    archived_ids = get_archived_session_ids(catalogue_file)
+
+    cc_projects_dir = Path.home() / ".claude" / "projects"
+    if not cc_projects_dir.is_dir():
+        print(f"Error: {cc_projects_dir} not found")
+        sys.exit(1)
+
+    all_sessions = sorted(cc_projects_dir.glob("*/*.jsonl"))
+    if not all_sessions:
+        print("No live sessions found.")
+        return
+
+    if args.session_id:
+        targets = [
+            p for p in all_sessions
+            if get_session_id(p) == args.session_id
+        ]
+        if not targets:
+            print(f"Session not found: {args.session_id}")
+            return
+    elif args.all:
+        if args.force:
+            targets = all_sessions
+        else:
+            targets = [
+                p for p in all_sessions
+                if get_session_id(p) not in archived_ids
+            ]
+    else:
+        targets = [all_sessions[-1]]
+
+    if not targets:
+        print("No sessions to archive (all already archived).")
+        print("Use --force to re-archive existing sessions.")
+        return
+
+    print(f"Archiving {len(targets)} session(s) to {archive_root}...")
+
+    # Group results by project_name so update_catalogue is called once
+    # per project (it takes a single project_name argument).
+    new_sessions_by_project: dict[str, list[dict[str, Any]]] = {}
+
+    for session_path in targets:
+        cwd = _extract_cwd_from_jsonl(session_path)
+        project_name = detect_project_name_from_cwd(cwd)
+        try:
+            project_root = find_project_root(start=cwd)
+        except FileNotFoundError:
+            project_root = None
+
+        title = args.title if len(targets) == 1 else None
+        result = archive_session(
+            session_path,
+            project_root,
+            dry_run=args.dry_run,
+            stats_only=args.stats_only,
+            use_gzip=args.gzip,
+            title=title,
+            archive_root=archive_root,
+            project_name_override=project_name,
+            auto_metadata=args.auto_metadata,
+        )
+        if result:
+            new_sessions_by_project.setdefault(
+                project_name, []
+            ).append(result)
+
+    if new_sessions_by_project and not args.dry_run:
+        for project_name, results in new_sessions_by_project.items():
+            update_catalogue(
+                results, catalogue_file, archive_root, project_name
+            )
+
+    print("\nDone!")
+
+
 def cmd_archive(args: argparse.Namespace) -> None:
     """Handle ``cc-session archive``."""
     # Branch to hook mode if --from-hook is set
     if args.from_hook:
         _cmd_archive_from_hook(args)
+        return
+
+    # Branch to global mode if --archive-root is set: scan all projects
+    # under ~/.claude/projects/ and archive to archive_root, rather than
+    # the per-project archive directory of the caller's cwd.
+    if args.archive_root:
+        _cmd_archive_global(args)
         return
 
     try:
@@ -226,6 +350,7 @@ def cmd_archive(args: argparse.Namespace) -> None:
             stats_only=args.stats_only,
             use_gzip=args.gzip,
             title=title,
+            auto_metadata=args.auto_metadata,
         )
         if result:
             new_sessions.append(result)
@@ -438,14 +563,22 @@ def cmd_update(args: argparse.Namespace) -> None:
 
 def cmd_catalogue(args: argparse.Namespace) -> None:
     """Handle ``cc-session catalogue``."""
-    try:
-        root = find_project_root()
-    except FileNotFoundError:
-        print("Error: no project root found.")
-        sys.exit(1)
+    # Global mode: --archive-root set → scan the consolidated archive
+    # directly, no project root required. Symmetric with cmd_archive's
+    # global-mode dispatch.
+    if args.archive_root:
+        archive_root = Path(args.archive_root)
+        archive_dir = archive_root
+        catalogue_file = get_global_catalogue_file(archive_root)
+    else:
+        try:
+            root = find_project_root()
+        except FileNotFoundError:
+            print("Error: no project root found.")
+            sys.exit(1)
 
-    archive_dir = get_archive_dir(root)
-    catalogue_file = get_catalogue_file(root)
+        archive_dir = get_archive_dir(root)
+        catalogue_file = get_catalogue_file(root)
 
     if args.rebuild:
         print("Rebuilding catalogue from archived sessions...")
@@ -763,6 +896,17 @@ def main() -> None:
         "--markdown",
         action="store_true",
         help="Also generate CATALOG.md (used with --rebuild).",
+    )
+    p_catalogue.add_argument(
+        "--archive-root",
+        type=str,
+        default=None,
+        help=(
+            "Global archive root directory. When set, rebuild scans "
+            "this directory's project subtrees rather than the caller's "
+            "per-project archive/cc-sessions/. Mirrors the same flag "
+            "on `cc-session archive`."
+        ),
     )
     p_catalogue.set_defaults(func=cmd_catalogue)
 
