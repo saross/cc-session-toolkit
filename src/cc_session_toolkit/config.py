@@ -32,12 +32,22 @@ SCHEMA_VERSION = "1.2"
 # cost (~½ Haiku), and architectural simplicity (single one-shot
 # call vs chunking + stitching).
 #
+# 2026-05-22: migrated to ``gemini-3.5-flash`` (Google, Flex tier, GA)
+# after a 3-session head-to-head comparison (small/medium/large amd-tower
+# unarchived sessions). 3.5 Flash showed materially better named-entity
+# preservation (commit hashes, tags, CI bounds, people's names), more
+# numeric specificity, ~20% faster wall-clock, and zero JSON structural
+# defects vs 1-in-3 for 3 Flash Preview (a stray ``three_ps.``-prefixed
+# key under ``three_ps``). 3× Flex price accepted (envelope $25 for the
+# 107-session Step 2 sweep). 3 Flash Preview retained "Preview" status
+# and would have needed migration eventually anyway.
+#
 # Bumping this constant: change in lockstep with the call shape in
 # ``archive.generate_auto_metadata`` and flag in the changelog. PA's
 # ``hooks/extraction-hook.py`` carries an independent ``HAIKU_MODEL``
 # constant for memory extraction; the two are deliberately
 # loose-coupled because they may move on different cadences.
-EXTRACTOR_MODEL_ID = "gemini-3-flash-preview"
+EXTRACTOR_MODEL_ID = "gemini-3.5-flash"
 
 # ---------------------------------------------------------------------------
 # Auto-metadata extraction tuning
@@ -55,10 +65,12 @@ AUTO_METADATA_MAX_OUTPUT_TOKENS = 1024
 AUTO_METADATA_FLEX_RETRY_WAITS_SECONDS = (30, 60, 120)
 
 # Gemini Flex list price (USD per million tokens) — see
-# https://ai.google.dev/gemini-api/docs/pricing#flex (verified
-# 2026-05-17). Surfaced for cost estimation in backfill / batch code.
-GEMINI_FLEX_INPUT_PRICE_PER_MTOK = 0.25
-GEMINI_FLEX_OUTPUT_PRICE_PER_MTOK = 1.50
+# https://ai.google.dev/gemini-api/docs/pricing#flex. Verified
+# 2026-05-22 for Gemini 3.5 Flash (3× the 3 Flash Preview Flex rate);
+# tracks ``EXTRACTOR_MODEL_ID`` and must be re-verified whenever it
+# changes. Surfaced for cost estimation in backfill / batch code.
+GEMINI_FLEX_INPUT_PRICE_PER_MTOK = 0.75
+GEMINI_FLEX_OUTPUT_PRICE_PER_MTOK = 4.50
 
 # ---------------------------------------------------------------------------
 # Sharing licence default
