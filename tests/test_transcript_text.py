@@ -20,7 +20,9 @@ from cc_session_toolkit import transcript_text as tt
 from cc_session_toolkit.transcript_text import (
     SESSION_CHAR_BUDGET,
     SESSION_TOKEN_BUDGET,
+    TOKENISER_SECOND_PASS_MARGIN,
     extract_transcript_text,
+    extract_transcript_text_for_gemini,
     estimate_tokens,
     _apply_session_budget,
 )
@@ -234,8 +236,8 @@ class TestSessionEmergencyCap:
 
     def test_production_budget_constant(self) -> None:
         """Sanity-check the shipped budget."""
-        # Gemini 3 Flash Preview context = 1,000,000 input tokens; 85% is
-        # the documented safety margin (room for system prompt + framing).
+        # Gemini 3.5 Flash context = 1,000,000 input tokens; 85% is the
+        # documented safety margin (room for system prompt + framing).
         assert SESSION_TOKEN_BUDGET == 850_000
         assert SESSION_CHAR_BUDGET == 850_000 * 4
 
@@ -449,3 +451,197 @@ class TestEstimateTokens:
         assert estimate_tokens("") == 0
         assert estimate_tokens("abcd") == 1
         assert estimate_tokens("x" * 400) == 100
+
+
+# ---------------------------------------------------------------------------
+# Tokeniser-calibrated extraction (extract_transcript_text_for_gemini)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractTranscriptTextForGemini:
+    """Tests for the tokeniser-calibrated session-budget path.
+
+    Closes the 2026-05-23 calibration finding: the chars-per-token=4
+    heuristic under-counts code-heavy / tool-output-heavy sessions, so
+    the helper verifies against the real tokeniser (injected via
+    ``count_tokens_fn``) and re-truncates with the observed ratio when
+    the first-pass output exceeds the real-tokeniser budget.
+    """
+
+    def _write_session(self, tmp_path: Path, fragments: list[str]) -> Path:
+        """Build a session with the given user-message fragments."""
+        path = tmp_path / "session.jsonl"
+        _write_jsonl(path, [_user_text(f) for f in fragments])
+        return path
+
+    def test_count_tokens_fn_none_matches_first_pass(
+        self, tmp_path: Path
+    ) -> None:
+        """Without a tokeniser, the helper returns the heuristic-only output."""
+        session = self._write_session(
+            tmp_path, ["first message", "second message", "third message"]
+        )
+        with_fn = extract_transcript_text_for_gemini(session, count_tokens_fn=None)
+        without_helper = extract_transcript_text(session)
+        assert with_fn == without_helper
+
+    def test_under_budget_returns_first_pass_unchanged(
+        self, tmp_path: Path
+    ) -> None:
+        """When count_tokens reports under budget, no second pass fires."""
+        session = self._write_session(tmp_path, ["only message"])
+        calls: list[str] = []
+
+        def _fake_count(text: str) -> int:
+            calls.append(text)
+            return 10  # well under any reasonable budget
+
+        text = extract_transcript_text_for_gemini(
+            session, budget_tokens=1_000, count_tokens_fn=_fake_count
+        )
+        assert text == extract_transcript_text(session, budget_tokens=1_000)
+        assert len(calls) == 1, (
+            "Under-budget path should call count_tokens exactly once"
+        )
+
+    def test_over_budget_triggers_calibrated_second_pass(
+        self, tmp_path: Path
+    ) -> None:
+        """When count_tokens reports over budget, the helper re-truncates.
+
+        Build a session whose heuristic-only output exceeds a small custom
+        budget under the real tokeniser, and verify the second-pass output
+        is shorter than the first-pass output.
+        """
+        # 5 fragments × 400 chars each → ~2000 chars → 500 chars/token=4
+        # heuristic tokens. With budget_tokens=400, heuristic char_budget=1600
+        # so the helper will middle-truncate to fit. Then count_tokens
+        # reports 600 tokens (over the 400 budget) → second pass.
+        fragments = ["x" * 400 for _ in range(5)]
+        session = self._write_session(tmp_path, fragments)
+        calls: list[str] = []
+
+        def _fake_count(text: str) -> int:
+            calls.append(text)
+            # Report a count above the budget so a second pass fires;
+            # second-pass output is shorter so its real count would be
+            # smaller — but the helper trusts the first observed ratio.
+            return 600
+
+        first_pass = extract_transcript_text(session, budget_tokens=400)
+        second_pass = extract_transcript_text_for_gemini(
+            session, budget_tokens=400, count_tokens_fn=_fake_count
+        )
+        assert len(second_pass) < len(first_pass), (
+            "Second pass should produce shorter text than first pass when "
+            "the real tokeniser reports over-budget"
+        )
+        assert len(calls) == 1, (
+            "Exactly one tokeniser call expected (first-pass verification); "
+            "the second pass uses the observed ratio, not a re-measurement"
+        )
+
+    def test_observed_ratio_calibration_formula(
+        self, tmp_path: Path
+    ) -> None:
+        """Second-pass char budget = budget_tokens × observed_chars_per_token × margin.
+
+        Verifies the calibration formula by reproducing it from
+        externally-observable inputs and asserting the truncation
+        respects the resulting char ceiling.
+        """
+        fragments = ["abcdefgh" * 100 for _ in range(10)]  # ~8000 chars total
+        session = self._write_session(tmp_path, fragments)
+        budget_tokens = 500
+
+        first_pass = extract_transcript_text(session, budget_tokens=budget_tokens)
+        # Report a count that yields an observed ratio of 2.0 chars/token
+        # (i.e., the heuristic over-allocated by 2×). The second pass
+        # should then cap chars at budget_tokens × 2.0 × margin.
+        reported_count = len(first_pass) // 2
+
+        def _fake_count(_text: str) -> int:
+            return reported_count
+
+        result = extract_transcript_text_for_gemini(
+            session, budget_tokens=budget_tokens, count_tokens_fn=_fake_count
+        )
+
+        observed_cpt = len(first_pass) / reported_count
+        expected_max_chars = int(
+            budget_tokens * observed_cpt * TOKENISER_SECOND_PASS_MARGIN
+        )
+        # Result may be slightly shorter (truncation aligns to fragment
+        # boundaries) but must not exceed the calibrated char budget.
+        assert len(result) <= expected_max_chars, (
+            f"Second-pass output ({len(result)} chars) exceeded the "
+            f"calibrated char budget ({expected_max_chars}); formula drift"
+        )
+
+    def test_empty_session_short_circuits_no_tokeniser_call(
+        self, tmp_path: Path
+    ) -> None:
+        """Empty session must not invoke the tokeniser API."""
+        session = tmp_path / "empty.jsonl"
+        session.write_text("")
+        calls: list[str] = []
+
+        def _fake_count(text: str) -> int:
+            calls.append(text)
+            return 0
+
+        text = extract_transcript_text_for_gemini(
+            session, count_tokens_fn=_fake_count
+        )
+        assert text == ""
+        assert calls == [], (
+            "Empty session should bypass the tokeniser entirely "
+            "(no wasted API call, and Gemini would reject empty input)"
+        )
+
+    def test_count_tokens_exception_graceful_degrade(
+        self, tmp_path: Path
+    ) -> None:
+        """Any tokeniser-side exception falls back to the first-pass output.
+
+        Production resilience: a network blip on count_tokens must not
+        kill the whole auto-metadata path. We're no worse off than the
+        pre-tokeniser-aware code, which never called count_tokens at all.
+        """
+        session = self._write_session(tmp_path, ["one", "two", "three"])
+
+        def _broken_count(_text: str) -> int:
+            raise RuntimeError("simulated network failure")
+
+        text = extract_transcript_text_for_gemini(
+            session, count_tokens_fn=_broken_count
+        )
+        assert text == extract_transcript_text(session)
+
+    def test_count_tokens_non_int_return_graceful_degrade(
+        self, tmp_path: Path
+    ) -> None:
+        """Non-coercible return value (e.g., a stray None) falls back cleanly."""
+        session = self._write_session(tmp_path, ["alpha", "beta"])
+
+        def _bad_count(_text: str) -> int:
+            return None  # type: ignore[return-value]
+
+        text = extract_transcript_text_for_gemini(
+            session, count_tokens_fn=_bad_count
+        )
+        assert text == extract_transcript_text(session)
+
+    def test_custom_budget_tokens_narrows_truncation(
+        self, tmp_path: Path
+    ) -> None:
+        """A tighter budget_tokens produces a shorter output than the default."""
+        fragments = ["x" * 1000 for _ in range(8)]
+        session = self._write_session(tmp_path, fragments)
+        big = extract_transcript_text_for_gemini(
+            session, budget_tokens=2000, count_tokens_fn=None
+        )
+        small = extract_transcript_text_for_gemini(
+            session, budget_tokens=500, count_tokens_fn=None
+        )
+        assert len(small) < len(big)

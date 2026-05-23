@@ -7,8 +7,8 @@ Ported from ``personal-assistant/scripts/extract-transcript-text.py`` (the
 script-form sibling kept in the PA repo for ad-hoc smoke-testing). The
 module-form lives here so the cc-session-toolkit archiver can produce a
 faithful, framing-free representation of the whole transcript and feed it
-to the auto-metadata extractor (Gemini 3 Flash Preview, Flex tier) without
-the sampled-message machinery that preceded it.
+to the auto-metadata extractor (Gemini 3.5 Flash, Flex tier) without the
+sampled-message machinery that preceded it.
 
 What is kept
 ------------
@@ -72,7 +72,7 @@ import gzip
 import json
 import re
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -107,9 +107,14 @@ TOOL_USE_INPUT_MAX_CHARS: int | None = None
 
 # Session-level emergency cap. Triggers middle-truncation when the
 # full distilled transcript would exceed this many tokens. Set to 85%
-# of Gemini 3 Flash Preview's 1,000,000-token input context to leave
-# room for the system prompt (~6,400 tokens) plus framing overhead
-# (~1,000 tokens) and a healthy safety margin.
+# of Gemini 3.5 Flash's 1,000,000-token input context to leave room
+# for the system prompt (~6,400 tokens) plus framing overhead (~1,000
+# tokens) and a healthy safety margin. The 2026-05-23 calibration
+# finding showed that this 15% absolute margin is consumed by
+# chars-per-token undercount on code-heavy sessions —
+# ``extract_transcript_text_for_gemini`` adds a real-tokeniser check on
+# top so the budget is enforced against actual Gemini tokens, not the
+# chars/4 heuristic.
 SESSION_TOKEN_BUDGET: int = 850_000
 SESSION_CHAR_BUDGET: int = SESSION_TOKEN_BUDGET * 4  # chars-per-token heuristic
 
@@ -306,11 +311,30 @@ def _stringify_tool_result(content: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
-def extract_transcript_text(path: str | Path) -> str:
+def extract_transcript_text(
+    path: str | Path,
+    budget_tokens: int | None = None,
+) -> str:
     """Return a single distilled-text representation of the transcript.
 
     See module docstring for the inclusion / exclusion contract and the
-    session-level emergency-cap policy.
+    session-level emergency-cap policy. ``budget_tokens`` selects the
+    session-level cap; when ``None`` (default), the module-level
+    ``SESSION_TOKEN_BUDGET`` is used at call time (so test-suite
+    monkey-patching of the module constant continues to work). Callers
+    that need calibration against a real tokeniser should use
+    :func:`extract_transcript_text_for_gemini` instead.
+    """
+    fragments = _load_fragments(path)
+    return _apply_session_budget(fragments, budget_tokens=budget_tokens)
+
+
+def _load_fragments(path: str | Path) -> list[str]:
+    """Walk a transcript and return the list of role-tagged text fragments.
+
+    Carved out of :func:`extract_transcript_text` so callers that want to
+    re-apply the session-level budget multiple times (e.g. the
+    tokeniser-calibrating helper) can pay the disk read once.
     """
     p = Path(path)
     if not p.exists():
@@ -344,13 +368,26 @@ def extract_transcript_text(path: str | Path) -> str:
 
         # Anything else (None, dict, etc.) is dropped.
 
-    return _apply_session_budget(fragments)
+    return fragments
 
 
-def _apply_session_budget(fragments: list[str]) -> str:
+def _apply_session_budget(
+    fragments: list[str],
+    budget_tokens: int | None = None,
+    char_budget: int | None = None,
+) -> str:
     """
     Join ``fragments`` into the final distilled string, applying the
     session-level emergency cap by middle-truncation if necessary.
+
+    ``budget_tokens`` is the nominal session-level token cap (used in
+    marker labels so a downstream LLM sees the actual ceiling). When
+    ``None``, the module-level ``SESSION_TOKEN_BUDGET`` is read at call
+    time. If ``char_budget`` is ``None``, the module-level
+    ``SESSION_CHAR_BUDGET`` is read at call time (so monkey-patching
+    either constant continues to work for tests). Callers that have
+    measured the true chars-per-token ratio against a real tokeniser may
+    pass an explicit ``char_budget`` to override the heuristic.
 
     The join contract — ``"\\n\\n".join(...)`` — is mirrored here so the
     accumulated char count corresponds exactly to the final output. We
@@ -369,13 +406,33 @@ def _apply_session_budget(fragments: list[str]) -> str:
     if not fragments:
         return ""
 
+    # Resolve None-defaults with the semantics callers expect:
+    #   - Both unset → read module-level globals (so test-suite
+    #     monkey-patching of SESSION_TOKEN_BUDGET / SESSION_CHAR_BUDGET
+    #     continues to work).
+    #   - budget_tokens explicit, char_budget None → derive char_budget
+    #     from budget_tokens via the chars-per-token heuristic (×4), so
+    #     callers that pass a tighter budget actually get tighter
+    #     truncation.
+    #   - char_budget explicit (calibrated from a real tokeniser),
+    #     budget_tokens None → derive budget_tokens (≈ char_budget // 4)
+    #     for the marker labels.
+    #   - Both explicit → use both as given.
+    if budget_tokens is None and char_budget is None:
+        budget_tokens = SESSION_TOKEN_BUDGET
+        char_budget = SESSION_CHAR_BUDGET
+    elif char_budget is None:
+        char_budget = budget_tokens * 4
+    elif budget_tokens is None:
+        budget_tokens = char_budget // 4
+
     separator = "\n\n"
     sep_len = len(separator)
 
     sizes = [len(f) for f in fragments]
     # Total chars if joined verbatim.
     total = sum(sizes) + sep_len * (len(fragments) - 1)
-    if total <= SESSION_CHAR_BUDGET:
+    if total <= char_budget:
         return separator.join(fragments).strip()
 
     # Need to middle-truncate. Reserve room for the marker.
@@ -383,9 +440,9 @@ def _apply_session_budget(fragments: list[str]) -> str:
         dropped_fragments=999_999,
         dropped_chars=999_999_999,
         dropped_tokens=999_999_999,
-        budget_tokens=SESSION_TOKEN_BUDGET,
+        budget_tokens=budget_tokens,
     ))
-    effective_budget = SESSION_CHAR_BUDGET - marker_overhead
+    effective_budget = char_budget - marker_overhead
     half_budget = effective_budget // 2
 
     # Walk forwards: largest prefix [0..head_end) fitting in half_budget.
@@ -435,7 +492,7 @@ def _apply_session_budget(fragments: list[str]) -> str:
         # values in the overhead estimate so the actual marker (which
         # carries smaller real numbers) is guaranteed to fit.
         pathological_overhead = len(TAIL_TRUNCATION_MARKER_TEMPLATE.format(
-            budget_tokens=SESSION_TOKEN_BUDGET,
+            budget_tokens=budget_tokens,
             kept_chars=999_999_999,
             kept_tokens=999_999_999,
             dropped_chars=999_999_999,
@@ -446,12 +503,12 @@ def _apply_session_budget(fragments: list[str]) -> str:
         # marker (truthful provenance is more important than fitting),
         # but we keep zero content rather than slicing with a negative
         # index (which would silently return content from the tail).
-        pathological_keep = max(0, SESSION_CHAR_BUDGET - pathological_overhead)
+        pathological_keep = max(0, char_budget - pathological_overhead)
         full_text = separator.join(fragments)
         kept = full_text[:pathological_keep]
         dropped_chars = len(full_text) - len(kept)
         marker = TAIL_TRUNCATION_MARKER_TEMPLATE.format(
-            budget_tokens=SESSION_TOKEN_BUDGET,
+            budget_tokens=budget_tokens,
             kept_chars=len(kept),
             kept_tokens=len(kept) // 4,
             dropped_chars=dropped_chars,
@@ -467,7 +524,7 @@ def _apply_session_budget(fragments: list[str]) -> str:
         dropped_fragments=len(dropped),
         dropped_chars=dropped_chars,
         dropped_tokens=dropped_chars // 4,
-        budget_tokens=SESSION_TOKEN_BUDGET,
+        budget_tokens=budget_tokens,
     )
 
     return separator.join(
@@ -478,3 +535,87 @@ def _apply_session_budget(fragments: list[str]) -> str:
 def estimate_tokens(text: str) -> int:
     """Estimate token count using the chars-divided-by-four heuristic."""
     return max(0, len(text) // 4)
+
+
+# Margin applied when re-truncating with an observed chars-per-token ratio.
+# Tightens the second-pass char budget by 8% to absorb intra-session
+# tokeniser-ratio variation (different content mixes per fragment) and
+# keep a small safety buffer below the hard ceiling.
+TOKENISER_SECOND_PASS_MARGIN: float = 0.92
+
+
+def extract_transcript_text_for_gemini(
+    path: str | Path,
+    budget_tokens: int | None = None,
+    count_tokens_fn: Callable[[str], int] | None = None,
+) -> str:
+    """Distil a transcript with tokeniser-calibrated session-level capping.
+
+    Two-pass strategy:
+
+    1. **First pass** — run :func:`extract_transcript_text` with the
+       default chars-per-token heuristic (``budget_tokens * 4``). For the
+       vast majority of sessions, this produces text that is already
+       under the real-tokeniser budget.
+
+    2. **Verify, then optional second pass** — if ``count_tokens_fn`` is
+       provided, call it on the first-pass text. When the real count
+       exceeds ``budget_tokens``, re-truncate using the *observed*
+       chars-per-token ratio (with a small safety margin) so the second
+       pass converges on a result that fits. This handles the code-heavy
+       / tool-output-heavy long-tail where the 4-chars-per-token
+       heuristic systematically undercounts.
+
+    When ``count_tokens_fn`` is ``None``, the function falls back to the
+    first-pass result — preserving offline-test behaviour and providing
+    a graceful degrade path when the live tokeniser is unavailable.
+
+    The injected ``count_tokens_fn`` should be a closure that calls the
+    Gemini API's ``client.models.count_tokens(model=..., contents=text)``
+    and returns ``response.total_tokens``. This call is metered as
+    free-tier by Google (no input / output token billing) per the API
+    docs, so adding it to every session-end auto-metadata firing is
+    cost-neutral.
+    """
+    if budget_tokens is None:
+        budget_tokens = SESSION_TOKEN_BUDGET
+
+    fragments = _load_fragments(path)
+    text = _apply_session_budget(fragments, budget_tokens=budget_tokens)
+
+    if not text or count_tokens_fn is None:
+        # Empty session or offline / unavailable-tokeniser path: keep the
+        # first-pass heuristic result. Empty text would also be rejected
+        # by the tokeniser API. Callers using the heuristic-only fallback
+        # should treat this as a best-effort output; the heuristic is
+        # known to undercount for code-heavy sessions (see workstream F
+        # calibration finding, 2026-05-23).
+        return text
+
+    # Verify against the real tokeniser. Any failure (network blip,
+    # malformed return, type mismatch) falls back to the first-pass
+    # output rather than killing the whole metadata-generation path —
+    # the heuristic is no worse than the pre-tokeniser-aware code, which
+    # is what we had until now.
+    try:
+        actual_tokens = int(count_tokens_fn(text))
+    except (TypeError, ValueError, Exception):  # noqa: BLE001
+        return text
+
+    if actual_tokens <= budget_tokens:
+        return text
+
+    # First-pass char budget undershot the real tokeniser. Recompute the
+    # char budget using the *observed* chars-per-token ratio plus a
+    # safety margin (TOKENISER_SECOND_PASS_MARGIN, 8% pull-back), then
+    # re-apply the truncation. Operates on the cached fragment list so
+    # we do not re-read the transcript from disk.
+    observed_chars_per_token = len(text) / max(1, actual_tokens)
+    second_pass_char_budget = int(
+        budget_tokens * observed_chars_per_token * TOKENISER_SECOND_PASS_MARGIN
+    )
+    return _apply_session_budget(
+        fragments,
+        budget_tokens=budget_tokens,
+        char_budget=second_pass_char_budget,
+    )

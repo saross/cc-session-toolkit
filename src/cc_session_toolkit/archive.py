@@ -350,10 +350,11 @@ def _call_gemini_once(
     Single Flex-tier Gemini call. Raises on any error; returns raw text.
 
     ``thinking_budget=0`` is mandatory (architectural decision
-    2026-05-18): Gemini 3 Flash Preview is a reasoning model and without
+    2026-05-18, carried forward to the 2026-05-22 Gemini 3.5 Flash
+    migration): Gemini's Flash family is a reasoning model and without
     this flag thinking tokens consume the output budget before any JSON
     is emitted. ``service_tier="flex"`` selects the discounted tier;
-    list price ~½ Haiku Batch.
+    list price ~3× Gemini 3 Flash Preview but JSON-defect-free.
 
     ``response.text`` can be ``None`` when the model is blocked by a
     safety filter, when ``finish_reason`` is ``MAX_TOKENS`` with no
@@ -446,16 +447,21 @@ def generate_auto_metadata(
     """
     Generate title / purpose / tags / Three Ps via Gemini Flex.
 
-    Architecture (2026-05-18 bake-off winner):
-    - Full distilled transcript via :func:`transcript_text.extract_transcript_text`
-      (not first-and-last sampled messages).
+    Architecture (2026-05-18 bake-off winner; refined 2026-05-22 + 2026-05-23):
+    - Full distilled transcript via
+      :func:`transcript_text.extract_transcript_text_for_gemini`, which
+      verifies the session-level budget against Gemini's real tokeniser
+      (replaces the 2026-05-23-deprecated chars/4 heuristic that
+      systematically undercounted code-heavy sessions).
     - Production prompt loaded from package data at
       ``cc_session_toolkit/prompts/auto_metadata.md`` (override via
       ``CC_AUTO_METADATA_PROMPT_PATH`` env var).
-    - Gemini 3 Flash Preview (Flex tier) via ``google.genai`` with
+    - Gemini 3.5 Flash (Flex tier) via ``google.genai`` with
       ``thinking_budget=0`` and 503-retry backoff.
 
-    Budget: ~$0.027 per session (~½ Haiku Batch list price).
+    Budget: ~$0.08 per session at Gemini 3.5 Flash Flex (3× the 2026-05-18
+    Gemini 3 Flash Preview Flex price; accepted on 2026-05-22 for zero
+    JSON defects + better named-entity preservation).
 
     Falls back to *None* on any of: ``google-genai`` not installed, no
     API key available, transcript extraction failure, persistent 503,
@@ -498,14 +504,49 @@ def generate_auto_metadata(
         )
         return None
 
-    # Distil the full transcript. The extractor strips framing,
-    # preserves tool calls + results, and is gzip-aware.
+    # Build the Gemini client up-front so we can use the real tokeniser
+    # for the session-budget truncation (count_tokens is a free, no-cost
+    # API call per Google's docs — input/output token billing does not
+    # apply). Falling back to the chars-per-token heuristic when client
+    # construction fails preserves the prior behaviour.
+    try:
+        client = genai.Client()
+    except Exception as exc:  # noqa: BLE001 — graceful degradation
+        _log_metadata_event(
+            f"Gemini client construction failed for {session_path.name}: "
+            f"{type(exc).__name__}: {exc}",
+            level="ERROR",
+        )
+        print(f"  Warning: Gemini client construction failed: {exc}")
+        return None
+
+    def _count_tokens(text: str) -> int:
+        """Call the Gemini API's count_tokens with the configured model.
+
+        Free per Google's docs; only network latency, no $$ cost. Used by
+        the session-budget truncation path to calibrate the
+        chars-per-token ratio for the actual content mix, replacing the
+        4-chars-per-token heuristic that systematically undercounted on
+        code-heavy / tool-output-heavy sessions (see 2026-05-23
+        calibration finding).
+        """
+        return client.models.count_tokens(
+            model=EXTRACTOR_MODEL_ID, contents=text
+        ).total_tokens
+
+    # Distil the full transcript with tokeniser-calibrated truncation.
+    # The extractor strips framing, preserves tool calls + results, and
+    # is gzip-aware. The injected count_tokens_fn means the session-level
+    # cap is verified against Gemini's actual tokeniser, and re-truncated
+    # using the observed chars-per-token ratio when the first-pass
+    # heuristic undercount would otherwise blow the 1M-token ceiling.
     try:
         from cc_session_toolkit.transcript_text import (
-            estimate_tokens,
-            extract_transcript_text,
+            extract_transcript_text_for_gemini,
         )
-        transcript_text = extract_transcript_text(session_path)
+        transcript_text = extract_transcript_text_for_gemini(
+            session_path, count_tokens_fn=_count_tokens
+        )
     except (
         FileNotFoundError, OSError, EOFError, UnicodeDecodeError,
     ) as exc:
@@ -524,7 +565,25 @@ def generate_auto_metadata(
         )
         return None
 
-    content_tokens = estimate_tokens(transcript_text)
+    # Use Gemini's authoritative count for the user-message header and
+    # the log line, replacing the chars-per-token heuristic that
+    # previously reported here. One extra free call vs the prior path.
+    # ``int()`` coercion ensures the value is format-spec-safe; any
+    # exception or non-int return falls back to the heuristic, which is
+    # acceptable because the truncation step already brought the text
+    # under budget.
+    try:
+        content_tokens = int(_count_tokens(transcript_text))
+    except (TypeError, ValueError, Exception) as exc:  # noqa: BLE001
+        from cc_session_toolkit.transcript_text import estimate_tokens
+        content_tokens = estimate_tokens(transcript_text)
+        _log_metadata_event(
+            f"count_tokens for log header failed; using heuristic "
+            f"({content_tokens:,} estimated tokens): "
+            f"{type(exc).__name__}: {exc}",
+            level="WARNING",
+        )
+
     system_prompt = _load_auto_metadata_prompt()
     user_message = _build_auto_metadata_user_message(
         session_id=stats.get("session_id") or session_path.stem,
@@ -535,7 +594,6 @@ def generate_auto_metadata(
     )
 
     try:
-        client = genai.Client()
         _log_metadata_event(
             f"Calling Gemini Flex for {session_path.name} "
             f"({content_tokens:,} content tokens)"

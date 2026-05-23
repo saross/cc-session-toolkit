@@ -32,8 +32,10 @@ classifiers = [
 [project.optional-dependencies]
 yaml = ["PyYAML>=6.0"]
 # ``api`` shipped with anthropic when auto-metadata used Haiku. As of
-# 2026-05-18 the production extractor is Gemini 3 Flash Preview (Flex
-# tier) via google-genai; the constant ``EXTRACTOR_MODEL_ID`` and the
+# 2026-05-18 the production extractor is on Google's Gemini Flash family
+# via google-genai (initially Gemini 3 Flash Preview; migrated to Gemini
+# 3.5 Flash 2026-05-22 for zero JSON defects + better named-entity
+# preservation at 3× price). The constant ``EXTRACTOR_MODEL_ID`` and the
 # call shape in ``archive.generate_auto_metadata`` reflect this.
 api = ["google-genai>=2.3"]
 db = ["psycopg2-binary>=2.9"]

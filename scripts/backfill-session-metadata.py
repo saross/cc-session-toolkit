@@ -12,12 +12,13 @@ Usage:
     python scripts/backfill-session-metadata.py [--dry-run] [--archive-root DIR]
                                                 [--cost-sample-size N]
 
-Cost: ~$0.027 per session via Gemini 3 Flash Preview Flex tier (was
-~$0.001 under Haiku). The ``--dry-run`` mode samples ``--cost-sample-size``
-sessions (default 20), distils them locally with no API spend, and
-reports mean / p90 / worst-case-envelope cost estimates grounded in the
-actual size distribution of the sessions in the archive — rather than
-the flat $0.027 average, which can understate cost when the archive
+Cost: ~$0.08 per session via Gemini 3.5 Flash Flex tier (3× the prior
+Gemini 3 Flash Preview ~$0.027 figure; was ~$0.001 under Haiku). The
+``--dry-run`` mode samples ``--cost-sample-size`` sessions (default 20),
+distils them locally with no API spend, and reports mean / p90 /
+worst-case-envelope cost estimates grounded in the actual size
+distribution of the sessions in the archive — rather than a flat
+per-session average, which can understate cost when the archive
 contains long-tail sessions that approach the 850K-token transcript cap.
 """
 
