@@ -299,7 +299,10 @@ class TestAutoMetadataHelpers:
         """v3 schema with phases / decisions / key_exchanges arrays parses cleanly.
 
         Regression guard for the wire-up landing 2026-05-24 — confirms
-        that the parser does not break on the richer v3 payload shape.
+        that the parser does not break on the richer v3 payload shape
+        AND that the nested ``three_ps`` mapping survives the parse
+        intact. Without the nested asserts, a future regression that
+        dropped ``three_ps`` (or flattened it) would still pass.
         """
         raw = (
             '{"title": "t", "purpose": "p", "tags": ["a"], '
@@ -312,11 +315,30 @@ class TestAutoMetadataHelpers:
         assert result["phases"] == []
         assert result["decisions"] == []
         assert result["key_exchanges"] == []
+        assert result["three_ps"]["prompt_summary"] == "ps"
+        assert result["three_ps"]["process_summary"] == "pr"
+        assert result["three_ps"]["provenance_summary"] == "pv"
 
-    def test_parse_response_raises_on_non_object_root(self) -> None:
-        """A bare list or string at root raises ValueError, not silently passes."""
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            '["just", "a", "list"]',
+            '"hello"',
+            "42",
+            "true",
+        ],
+    )
+    def test_parse_response_raises_on_non_object_root(self, raw: str) -> None:
+        """A bare list, string, number, or boolean at root raises ValueError.
+
+        The ``isinstance(obj, dict)`` guard in
+        :func:`_parse_metadata_response_json` should catch every
+        non-object JSON root, not just lists. Parametrised so a future
+        regression that, say, accepted bare strings as valid metadata
+        would surface here rather than at runtime in the archive path.
+        """
         with pytest.raises(ValueError):
-            _parse_metadata_response_json('["just", "a", "list"]')
+            _parse_metadata_response_json(raw)
 
     def test_ensure_gemini_api_key_prefers_env(
         self, monkeypatch: pytest.MonkeyPatch
