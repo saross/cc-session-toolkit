@@ -270,6 +270,54 @@ class TestAutoMetadataHelpers:
         with pytest.raises(ValueError):
             _parse_metadata_response_json("not json at all")
 
+    def test_parse_response_tolerates_trailing_brace_artefact(self) -> None:
+        """Trailing stray brace after a valid object is ignored.
+
+        Observed 2026-05-24: 1-in-3 v3 Gemini 3.5 Flash outputs under
+        ``response_mime_type=application/json`` had a trailing extra ``}``.
+        The robust parser must extract the first balanced object.
+        """
+        raw = '{"title": "t", "tags": ["a"]}}'
+        result = _parse_metadata_response_json(raw)
+        assert result == {"title": "t", "tags": ["a"]}
+
+    def test_parse_response_tolerates_trailing_whitespace_and_junk(
+        self,
+    ) -> None:
+        """Whitespace, newlines, or stray prose after the JSON object are ignored."""
+        raw = '{"title": "t"}\n\nSome stray trailing prose the model emitted.'
+        result = _parse_metadata_response_json(raw)
+        assert result == {"title": "t"}
+
+    def test_parse_response_tolerates_leading_prose(self) -> None:
+        """Stray leading prose before the first ``{`` is skipped."""
+        raw = 'Here is the metadata:\n{"title": "t"}'
+        result = _parse_metadata_response_json(raw)
+        assert result == {"title": "t"}
+
+    def test_parse_response_handles_v3_schema_shape(self) -> None:
+        """v3 schema with phases / decisions / key_exchanges arrays parses cleanly.
+
+        Regression guard for the wire-up landing 2026-05-24 — confirms
+        that the parser does not break on the richer v3 payload shape.
+        """
+        raw = (
+            '{"title": "t", "purpose": "p", "tags": ["a"], '
+            '"three_ps": {"prompt_summary": "ps", "process_summary": "pr", '
+            '"provenance_summary": "pv"}, '
+            '"phases": [], "decisions": [], "key_exchanges": []}'
+        )
+        result = _parse_metadata_response_json(raw)
+        assert result["title"] == "t"
+        assert result["phases"] == []
+        assert result["decisions"] == []
+        assert result["key_exchanges"] == []
+
+    def test_parse_response_raises_on_non_object_root(self) -> None:
+        """A bare list or string at root raises ValueError, not silently passes."""
+        with pytest.raises(ValueError):
+            _parse_metadata_response_json('["just", "a", "list"]')
+
     def test_ensure_gemini_api_key_prefers_env(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

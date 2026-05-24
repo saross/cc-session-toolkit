@@ -12,7 +12,11 @@ from typing import Any
 # Schema
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = "1.2"
+SCHEMA_VERSION = "1.3"
+# 1.3 (2026-05-24): auto_generated gains optional phases[], decisions[],
+# and key_exchanges[] arrays; top-level subagent_summaries[] added for
+# lightweight per-subagent narrative summaries. All new fields are
+# additive — 1.2 consumers continue to work unchanged.
 
 # ---------------------------------------------------------------------------
 # Extractor model
@@ -52,10 +56,17 @@ EXTRACTOR_MODEL_ID = "gemini-3.5-flash"
 # ---------------------------------------------------------------------------
 # Auto-metadata extraction tuning
 # ---------------------------------------------------------------------------
-# Output cap for the JSON object the extractor emits. The target object
-# runs ~300 tokens (title, purpose, tags, three_ps); 1024 is a safe
-# ceiling that still beats Gemini Flash's per-call limit comfortably.
-AUTO_METADATA_MAX_OUTPUT_TOKENS = 1024
+# Output cap for the JSON object the extractor emits.
+# v3 schema (2026-05-24) added phases[], decisions[], key_exchanges[]
+# alongside the existing title/purpose/tags/three_ps; long sessions
+# can produce ~3-5K-token outputs (process_summary up to ~1000 words
+# plus the arrays). Raised from 1024 → 8192 so the v3 ceiling is the
+# binding constraint, not the API budget. Short sessions still produce
+# small responses; this is an upper bound, not a target. The same cap
+# applies to the subagent-narrative call path — subagent outputs are
+# much smaller (~60–200 words) so the cap is non-binding there, and a
+# separate constant would be dead code per the 2026-05-24 audit.
+AUTO_METADATA_MAX_OUTPUT_TOKENS = 8192
 
 # Wait pattern for Flex preemption (HTTP 503) retries. Per Google's
 # Flex documentation, preemption surfaces as HTTP 503 "Service

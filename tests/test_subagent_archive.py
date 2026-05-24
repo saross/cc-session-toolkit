@@ -663,10 +663,10 @@ class TestArchiveSubagentTranscripts:
 # Schema v1.2 integration
 # -------------------------------------------------------------------------
 
-class TestSessionMetaV12:
-    """Tests for v1.2 ``session.meta.json`` shape."""
+class TestSessionMetaV13:
+    """Tests for v1.3 ``session.meta.json`` shape (2026-05-24)."""
 
-    def test_schema_version_is_1_2(
+    def test_schema_version_is_1_3(
         self, sample_session_jsonl: Path
     ) -> None:
         stats = extract_session_stats(sample_session_jsonl)
@@ -675,8 +675,37 @@ class TestSessionMetaV12:
             session_path=sample_session_jsonl,
             stats=stats,
         )
-        assert meta["schema_version"] == "1.2"
-        assert SCHEMA_VERSION == "1.2"
+        assert meta["schema_version"] == "1.3"
+        assert SCHEMA_VERSION == "1.3"
+
+    def test_subagent_summaries_empty_list_by_default(
+        self, sample_session_jsonl: Path
+    ) -> None:
+        """When no subagent_summaries are passed, the field is [] not absent."""
+        stats = extract_session_stats(sample_session_jsonl)
+        meta = create_session_metadata(
+            session_id="abc12345",
+            session_path=sample_session_jsonl,
+            stats=stats,
+        )
+        assert meta["subagent_summaries"] == []
+
+    def test_subagent_summaries_passed_through(
+        self, sample_session_jsonl: Path
+    ) -> None:
+        """Provided subagent_summaries land in session.meta.json verbatim."""
+        stats = extract_session_stats(sample_session_jsonl)
+        summaries = [
+            {"agent_id": "agent-a", "narrative": "Did the thing."},
+            {"agent_id": "agent-b", "narrative": "Did the other thing."},
+        ]
+        meta = create_session_metadata(
+            session_id="abc12345",
+            session_path=sample_session_jsonl,
+            stats=stats,
+            subagent_summaries=summaries,
+        )
+        assert meta["subagent_summaries"] == summaries
 
     def test_subagents_empty_list_by_default(
         self, sample_session_jsonl: Path

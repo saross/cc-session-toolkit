@@ -267,6 +267,34 @@ def _load_auto_metadata_prompt() -> str:
     )
 
 
+def _load_auto_metadata_subagent_prompt() -> str:
+    """
+    Load the lightweight subagent-summary system prompt (v3, 2026-05-24).
+
+    Companion to :func:`_load_auto_metadata_prompt`. Produces a single
+    ~60–200-word narrative paragraph per subagent rather than a full
+    Three Ps summary (the parent's record covers session-level
+    methodology and provenance; subagents are delegated tasks within it).
+
+    Environment variable ``CC_AUTO_METADATA_SUBAGENT_PROMPT_PATH``
+    overrides the bundled prompt with an arbitrary filesystem path —
+    same mechanism as the parent prompt.
+    """
+    import os
+
+    override = os.environ.get("CC_AUTO_METADATA_SUBAGENT_PROMPT_PATH")
+    if override:
+        return Path(override).read_text(encoding="utf-8")
+
+    from importlib.resources import files
+
+    return (
+        files("cc_session_toolkit.prompts")
+        .joinpath("auto_metadata_subagent.md")
+        .read_text(encoding="utf-8")
+    )
+
+
 def _build_auto_metadata_user_message(
     *,
     session_id: str,
@@ -322,10 +350,17 @@ def _parse_metadata_response_json(raw_text: str) -> dict[str, Any]:
     Parse a JSON object out of a model response.
 
     The prompt instructs the model to emit bare JSON (no fences), but
-    real-world models intermittently wrap output in ``` json blocks.
-    This strips any single leading/trailing fence and then tries
-    ``json.loads``. On any failure, raises ``ValueError`` so callers
-    can record the raw text for diagnosis.
+    real-world models intermittently:
+    - wrap output in ```json``` blocks
+    - emit a trailing stray brace, comma, or whitespace after a valid
+      object (observed 2026-05-24: 1 in 3 v3 Gemini 3.5 Flash outputs
+      had a trailing brace artefact under ``response_mime_type=application/json``)
+
+    Defence-in-depth: strip any single leading/trailing markdown fence,
+    locate the first opening brace, then use ``JSONDecoder.raw_decode``
+    to parse the first complete JSON object and ignore any trailing junk.
+    On any failure, raises ``ValueError`` so callers can record the raw
+    text for diagnosis.
     """
     text = raw_text.strip()
     if text.startswith("```"):
@@ -335,10 +370,21 @@ def _parse_metadata_response_json(raw_text: str) -> dict[str, Any]:
         else:
             text = "\n".join(lines[1:])
         text = text.strip()
+    start = text.find("{")
+    if start < 0:
+        raise ValueError(
+            f"JSON parse failed: no opening brace in response "
+            f"(text starts with: {text[:80]!r})"
+        )
     try:
-        return json.loads(text)
+        obj, _consumed = json.JSONDecoder().raw_decode(text[start:])
     except json.JSONDecodeError as exc:
         raise ValueError(f"JSON parse failed: {exc}") from exc
+    if not isinstance(obj, dict):
+        raise ValueError(
+            f"JSON parse returned non-object type: {type(obj).__name__}"
+        )
+    return obj
 
 
 def _call_gemini_once(
@@ -374,6 +420,13 @@ def _call_gemini_once(
             "max_output_tokens": AUTO_METADATA_MAX_OUTPUT_TOKENS,
             "system_instruction": system_prompt,
             "thinking_config": {"thinking_budget": 0},
+            # 2026-05-24: enforce JSON output mode so Gemini cannot wrap
+            # its response in markdown fences or trailing prose. The
+            # 2026-05-24 bake-off observed that v3 prompts without this
+            # mode produced occasional parse failures even with the
+            # robust JSON parser; the mode eliminates the failure class
+            # at source.
+            "response_mime_type": "application/json",
         },
     )
     raw = response.text
@@ -642,7 +695,187 @@ def generate_auto_metadata(
             "process_summary": three_ps.get("process_summary") or "",
             "provenance_summary": three_ps.get("provenance_summary") or "",
         }
+    # v3 schema additions (2026-05-24): optional structured arrays for
+    # phases, decisions, key_exchanges. Each is normalised to [] when
+    # absent or malformed so downstream consumers can always iterate
+    # without isinstance() guards. The prompt explicitly allows empty
+    # arrays for short / single-thread / sparse sessions.
+    for v3_field in ("phases", "decisions", "key_exchanges"):
+        raw = result.get(v3_field)
+        auto_meta[v3_field] = raw if isinstance(raw, list) else []
     return auto_meta
+
+
+def generate_subagent_summaries(
+    dest_dir: Path,
+    subagents: list[dict[str, Any]],
+    parent_session_id: str,
+) -> list[dict[str, str]]:
+    """
+    Generate lightweight narrative summaries for each archived subagent.
+
+    For every entry in ``subagents`` (the structural metadata list
+    produced by :func:`archive_subagent_transcripts`), this function
+    reads the archived transcript at ``dest_dir / archive_path``,
+    distils it through the toolkit's tokeniser-calibrated extractor, and
+    calls Gemini Flex with the v3 subagent prompt to produce a single
+    ~60–200-word narrative paragraph capturing what the subagent did and
+    what it returned to the parent.
+
+    Return shape: ``[{"agent_id": "...", "narrative": "..."}, ...]``.
+    Subagents whose summarisation fails for any reason (missing
+    transcript, distillation failure, Gemini call failure, JSON parse
+    failure) are **omitted** from the returned list rather than
+    propagating — a single failed subagent should not block the parent
+    archive, and an empty entry is worse than no entry.
+
+    Returns an empty list when the input ``subagents`` list is empty,
+    when ``google-genai`` is not installed, when no API key is
+    available, or when none of the subagent summarisations succeed.
+    """
+    if not subagents:
+        return []
+
+    try:
+        from google import genai  # noqa: WPS433 — optional dependency
+    except ImportError:
+        _log_metadata_event(
+            "google-genai not installed; skipping subagent summaries",
+            level="WARNING",
+        )
+        return []
+
+    api_key = _ensure_gemini_api_key()
+    if not api_key:
+        _log_metadata_event(
+            "No GEMINI_API_KEY for subagent summaries; skipping",
+            level="WARNING",
+        )
+        return []
+
+    try:
+        client = genai.Client()
+    except Exception as exc:  # noqa: BLE001 — graceful degradation
+        _log_metadata_event(
+            f"Gemini client construction failed for subagent summaries: "
+            f"{type(exc).__name__}: {exc}",
+            level="ERROR",
+        )
+        return []
+
+    def _count_tokens(text: str) -> int:
+        return client.models.count_tokens(
+            model=EXTRACTOR_MODEL_ID, contents=text
+        ).total_tokens
+
+    system_prompt = _load_auto_metadata_subagent_prompt()
+    summaries: list[dict[str, str]] = []
+
+    for sa in subagents:
+        agent_id = sa.get("agent_id") or ""
+        archive_relpath = sa.get("archive_path") or ""
+        if not agent_id or not archive_relpath:
+            continue
+        sa_path = dest_dir / archive_relpath
+        if not sa_path.exists():
+            _log_metadata_event(
+                f"Subagent transcript missing for {agent_id}: {sa_path}",
+                level="WARNING",
+            )
+            continue
+
+        try:
+            from cc_session_toolkit.transcript_text import (
+                extract_transcript_text_for_gemini,
+            )
+            distilled = extract_transcript_text_for_gemini(
+                sa_path, count_tokens_fn=_count_tokens
+            )
+        except Exception as exc:  # noqa: BLE001 — graceful degradation
+            _log_metadata_event(
+                f"Subagent distillation failed for {agent_id}: "
+                f"{type(exc).__name__}: {exc}",
+                level="ERROR",
+            )
+            continue
+
+        if not distilled:
+            continue
+
+        try:
+            distilled_tokens = int(_count_tokens(distilled))
+        except (TypeError, ValueError, Exception):  # noqa: BLE001
+            from cc_session_toolkit.transcript_text import estimate_tokens
+            distilled_tokens = estimate_tokens(distilled)
+
+        # Defensive ``.get(...) or default`` (not ``.get(..., default)``)
+        # because ``archive_subagent_transcripts`` is allowed to emit
+        # explicit ``None`` for these fields (e.g. when an ISO timestamp
+        # parse fails). Format-spec on ``None`` raises TypeError; the
+        # ``or`` form coerces both absent-key and present-but-None to the
+        # default. Audit follow-up 2026-05-24.
+        duration_seconds = sa.get("duration_seconds") or 0.0
+        tool_calls_total = (sa.get("tool_calls") or {}).get("total", 0)
+        first_prompt_preview = sa.get("first_prompt_preview") or ""
+        header = (
+            "## Subagent metadata header (not authoritative — transcript wins)\n"
+            f"- agent_id: {agent_id}\n"
+            f"- parent_session_id: {parent_session_id}\n"
+            f"- agent_kind: {sa.get('agent_kind', 'unknown')}\n"
+            f"- depth: {sa.get('depth', 0)}\n"
+            f"- duration_seconds: {duration_seconds:.1f}\n"
+            f"- tool_call_count: {tool_calls_total}\n"
+            f"- distilled_input_tokens: {distilled_tokens:,}\n"
+            f"- first_prompt_preview: {first_prompt_preview[:200]!r}\n"
+        )
+        reminder = (
+            "\nProduce the JSON object now per the v3 subagent schema. "
+            "Start with `{` on the very next character."
+        )
+        user_msg = (
+            f"{header}\n<transcript>\n{distilled}\n</transcript>\n{reminder}"
+        )
+
+        try:
+            raw_text = _call_gemini_with_retry(
+                client, user_msg, system_prompt
+            )
+        except Exception as exc:  # noqa: BLE001 — graceful degradation
+            _log_metadata_event(
+                f"Subagent Gemini call failed for {agent_id}: "
+                f"{type(exc).__name__}: {exc}",
+                level="ERROR",
+            )
+            continue
+
+        try:
+            result = _parse_metadata_response_json(raw_text)
+        except ValueError as exc:
+            _log_metadata_event(
+                f"Subagent JSON parse failed for {agent_id}: {exc}; "
+                f"raw[:200]={raw_text[:200]!r}",
+                level="ERROR",
+            )
+            continue
+
+        narrative = result.get("narrative")
+        if not isinstance(narrative, str) or not narrative.strip():
+            _log_metadata_event(
+                f"Subagent summary for {agent_id} missing or empty 'narrative'",
+                level="WARNING",
+            )
+            continue
+
+        summaries.append({
+            "agent_id": agent_id,
+            "narrative": narrative.strip(),
+        })
+        _log_metadata_event(
+            f"Subagent summary success for {agent_id} "
+            f"({len(narrative.split())} words)"
+        )
+
+    return summaries
 
 
 # -------------------------------------------------------------------------
@@ -915,12 +1148,13 @@ def create_session_metadata(
     project_name_override: str | None = None,
     capture_type: str | None = None,
     subagents: list[dict[str, Any]] | None = None,
+    subagent_summaries: list[dict[str, str]] | None = None,
     licence: str | None = None,
     extractor_model_id: str | None = None,
     code_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
-    Create the complete ``session.meta.json`` structure (v1.2 schema).
+    Create the complete ``session.meta.json`` structure (v1.3 schema).
 
     Args:
         session_id: Session identifier.
@@ -944,6 +1178,11 @@ def create_session_metadata(
             :func:`archive_subagent_transcripts`.  Populates the v1.2
             ``subagents`` top-level field and the
             ``statistics.subagents_summary`` rollup.
+        subagent_summaries: Lightweight per-subagent narrative summaries
+            from :func:`generate_subagent_summaries` (v1.3, 2026-05-24).
+            Each entry is ``{"agent_id": str, "narrative": str}``.
+            Empty list when ``auto_metadata`` was off, when there were
+            no subagents, or when no summarisation succeeded.
         licence: Optional licence string for sharing the record (RO-Crate
             field, provenance audit Gap 3).  Defaults to
             :data:`cc_session_toolkit.config.DEFAULT_LICENCE` (``None``)
@@ -1138,6 +1377,12 @@ def create_session_metadata(
         "extractor_model_id": resolved_extractor,
         "archive": archive,
         "subagents": subagents_list,
+        # v1.3 (2026-05-24): lightweight per-subagent narrative
+        # summaries paired with the structural ``subagents`` entries
+        # above. Empty when auto-metadata is off, when the session has
+        # no subagents, or when subagent summarisation skipped/failed.
+        # Each entry: ``{"agent_id": str, "narrative": str}``.
+        "subagent_summaries": subagent_summaries or [],
     }
 
     if capture_type:
@@ -1270,6 +1515,14 @@ def archive_session(
                 "process_summary": "",
                 "provenance_summary": "",
             },
+            # v1.3 schema invariant: phases/decisions/key_exchanges are
+            # always present (possibly empty) so downstream consumers
+            # can iterate without isinstance() guards. The empty-arrays
+            # form here mirrors the prompt's explicit
+            # "[] is acceptable" contract for sparse sessions.
+            "phases": [],
+            "decisions": [],
+            "key_exchanges": [],
         }
 
     dest_dir = get_archive_directory(
@@ -1408,6 +1661,35 @@ def archive_session(
             f"user-invoked)"
         )
 
+    # v3 schema (2026-05-24): generate lightweight per-subagent narrative
+    # summaries when auto_metadata is on. Each subagent gets one Gemini
+    # call (~$0.02–0.10) producing a ~60–200-word paragraph capturing
+    # what was delegated, what the subagent did, and what it returned.
+    # Failures here never propagate — the parent record is more valuable
+    # than any subagent summary, and a partial subagent_summaries list
+    # is acceptable (per-subagent failures are logged but omitted from
+    # the list rather than crashing the archive).
+    subagent_summaries: list[dict[str, str]] = []
+    if auto_metadata and subagents:
+        try:
+            subagent_summaries = generate_subagent_summaries(
+                dest_dir=dest_dir,
+                subagents=subagents,
+                parent_session_id=session_id,
+            )
+            if subagent_summaries:
+                print(
+                    f"  Subagent summaries: {len(subagent_summaries)} / "
+                    f"{len(subagents)} generated"
+                )
+        except Exception as exc:  # noqa: BLE001 — never fail parent archive
+            print(f"  [warn] Subagent summary generation failed: {exc}")
+            _log_metadata_event(
+                f"Subagent summary generation failed for session_id={session_id}: "
+                f"{type(exc).__name__}: {exc}",
+                level="WARNING",
+            )
+
     metadata = create_session_metadata(
         session_id=session_id,
         session_path=session_path,
@@ -1423,6 +1705,7 @@ def archive_session(
         project_name_override=project_name_override,
         capture_type=capture_type,
         subagents=subagents,
+        subagent_summaries=subagent_summaries,
     )
 
     metadata_path = dest_dir / "session.meta.json"
