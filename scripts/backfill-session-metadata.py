@@ -1,16 +1,30 @@
 #!/usr/bin/env python3
 """
-Backfill auto-metadata for archived sessions missing it.
+Backfill auto-metadata for archived sessions missing it, or upgrade
+existing v1.2-or-earlier metadata to the v1.3 schema.
 
-Finds all session.meta.json files with "Auto-metadata unavailable",
-decompresses the session JSONL, runs generate_auto_metadata via Gemini
-Flex (production-switched 2026-05-18; see workstream F in
+Default mode: finds all session.meta.json files with
+``auto_generated.purpose == "Auto-metadata unavailable"``, decompresses
+the session JSONL, runs generate_auto_metadata via Gemini Flex
+(production-switched 2026-05-18; see workstream F in
 ``personal-assistant/planning/continuity.md``), and updates the metadata
-in-place.
+in-place to the current schema (v1.3).
+
+--upgrade-to-v13 mode: finds sessions that already have populated
+auto_generated metadata but on a pre-v1.3 schema (typically v1.2 —
+Three Ps only). Re-summarises them on v1.3, producing the richer
+phases / decisions / key_exchanges / subagent_summaries structure. The
+original session.meta.json is preserved side-by-side at
+``session.meta.v2-backup.json`` before the overwrite. The two finders
+partition the archive into disjoint populations: missing-metadata
+sessions go through the default path, pre-v1.3 populated sessions go
+through the upgrade path, and v1.3 sessions are skipped entirely.
 
 Usage:
-    python scripts/backfill-session-metadata.py [--dry-run] [--archive-root DIR]
+    python scripts/backfill-session-metadata.py [--dry-run]
+                                                [--archive-root DIR]
                                                 [--cost-sample-size N]
+                                                [--upgrade-to-v13]
 
 Cost: ~$0.08 per session via Gemini 3.5 Flash Flex tier (3× the prior
 Gemini 3 Flash Preview ~$0.027 figure; was ~$0.001 under Haiku). The
@@ -70,6 +84,63 @@ def find_sessions_needing_backfill(
         if auto_gen.get("purpose") == "Auto-metadata unavailable":
             results.append(meta_path)
     return results
+
+
+def find_sessions_needing_v13_upgrade(
+    archive_root: Path,
+) -> list[Path]:
+    """Return paths to session.meta.json files on a pre-v1.3 schema.
+
+    Targets sessions that already have populated auto_generated metadata
+    (i.e., NOT "Auto-metadata unavailable") but were summarised under a
+    schema older than v1.3 — typically v1.2 (Three Ps only, no
+    phases / decisions / key_exchanges / subagent_summaries).
+    Re-summarising these on the v1.3 schema unlocks the richer
+    narrative structure for the open-science / transparency artefact
+    framing adopted in the 2026-05-24 wire-up.
+
+    Filter is the inverse of :func:`find_sessions_needing_backfill` —
+    these two finders partition the "needs API spend" archive into
+    distinct populations:
+      * find_sessions_needing_backfill: empty (purpose marker)
+      * find_sessions_needing_v13_upgrade: populated but pre-v1.3
+      * (remainder): already on v1.3, nothing to do
+    """
+    results: list[Path] = []
+    for meta_path in sorted(archive_root.rglob("session.meta.json")):
+        with open(meta_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        schema_version = data.get("schema_version")
+        auto_gen = data.get("auto_generated", {})
+        purpose = auto_gen.get("purpose")
+        # Skip if already on the target schema.
+        if schema_version == SCHEMA_VERSION:
+            continue
+        # Skip the empty-metadata population — they belong to the
+        # default backfill, not the upgrade path.
+        if purpose == "Auto-metadata unavailable" or not purpose:
+            continue
+        results.append(meta_path)
+    return results
+
+
+def backup_pre_v13_meta(meta_path: Path) -> Path | None:
+    """Copy session.meta.json to session.meta.v2-backup.json before upgrade.
+
+    Mirrors the convention used by the 2026-05-24 production-path
+    validator: when a v1.2-or-earlier meta is replaced by a v1.3
+    rebuild, the original is preserved side-by-side under
+    ``session.meta.v2-backup.json`` for comparison.
+
+    If a backup already exists at the destination, the function does
+    nothing and returns the existing backup path — the original is
+    already preserved from a prior upgrade attempt.
+    """
+    backup_path = meta_path.with_name("session.meta.v2-backup.json")
+    if backup_path.exists():
+        return backup_path
+    shutil.copy2(meta_path, backup_path)
+    return backup_path
 
 
 def decompress_session(archive_dir: Path) -> Path | None:
@@ -304,6 +375,18 @@ def main() -> None:
             "subagent calls not modelled). Default: 20."
         ),
     )
+    parser.add_argument(
+        "--upgrade-to-v13",
+        action="store_true",
+        help=(
+            "Re-summarise sessions that already have v1.2-or-earlier "
+            "auto_generated metadata, producing v1.3 output (phases, "
+            "decisions, key_exchanges, subagent_summaries). The original "
+            "session.meta.json is backed up to session.meta.v2-backup.json "
+            "side-by-side before the rebuild. Mutually exclusive with the "
+            "default missing-metadata backfill."
+        ),
+    )
     args = parser.parse_args()
 
     # Ensure API key is available before starting.
@@ -314,12 +397,20 @@ def main() -> None:
         )
         sys.exit(1)
 
-    sessions = find_sessions_needing_backfill(args.archive_root)
+    if args.upgrade_to_v13:
+        sessions = find_sessions_needing_v13_upgrade(args.archive_root)
+        mode_label = "v1.3 upgrade"
+    else:
+        sessions = find_sessions_needing_backfill(args.archive_root)
+        mode_label = "metadata backfill"
     if not sessions:
-        print("All sessions already have metadata. Nothing to do.")
+        if args.upgrade_to_v13:
+            print("All sessions already on v1.3 schema. Nothing to do.")
+        else:
+            print("All sessions already have metadata. Nothing to do.")
         return
 
-    print(f"Found {len(sessions)} session(s) needing metadata backfill.")
+    print(f"Found {len(sessions)} session(s) needing {mode_label}.")
     if args.dry_run:
         for meta_path in sessions:
             rel = meta_path.parent.relative_to(args.archive_root)
@@ -393,6 +484,12 @@ def main() -> None:
                         level="WARNING",
                     )
 
+            # Upgrade path: preserve the pre-v1.3 meta side-by-side
+            # before overwriting. Matches the 2026-05-24 production-path
+            # validator convention. No-op when --upgrade-to-v13 is not set
+            # (the empty-metadata backfill has nothing worth preserving).
+            if args.upgrade_to_v13:
+                backup_pre_v13_meta(meta_path)
             update_metadata(meta_path, result, subagent_summaries)
             title = result.get("title", "?")
             n_phases = len((result.get("phases") or []))
