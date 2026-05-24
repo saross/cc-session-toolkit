@@ -1,10 +1,11 @@
-"""Tests for sub-agent transcript archiving (v1.2 schema)."""
+"""Tests for sub-agent transcript archiving (v1.3 schema)."""
 
 from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -22,6 +23,7 @@ from cc_session_toolkit.archive import (
     archive_subagent_transcripts,
     capture_code_state,
     create_session_metadata,
+    generate_subagent_summaries,
     get_session_files,
     summarise_subagents,
 )
@@ -1132,3 +1134,247 @@ class TestSessionMetaProvenance:
             extractor_model_id="claude-opus-4-7",
         )
         assert meta["extractor_model_id"] == "claude-opus-4-7"
+
+
+# -------------------------------------------------------------------------
+# generate_subagent_summaries — unit tests (audit follow-up, 2026-05-24)
+# -------------------------------------------------------------------------
+
+class TestGenerateSubagentSummaries:
+    """Unit tests for :func:`generate_subagent_summaries`.
+
+    The function is the v1.3 subagent fan-out: one Gemini Flex call per
+    archived subagent, producing a single-paragraph narrative. These
+    tests mock the Gemini client following the
+    :class:`TestAutoMetadataGeminiIntegration` pattern in
+    ``tests/test_hook.py`` — the mock accepts the ``response_schema``
+    kwarg landed today (``SUBAGENT_NARRATIVE_SCHEMA``) so behaviour
+    remains compatible with strict-schema enforcement on the subagent
+    path.
+    """
+
+    @staticmethod
+    def _mock_gemini_response(payload: dict[str, str]) -> "Any":
+        """Build a minimal mock for ``client.models.generate_content``."""
+        from unittest.mock import MagicMock
+
+        response = MagicMock()
+        response.text = json.dumps(payload)
+        return response
+
+    @staticmethod
+    def _build_mock_client(
+        narratives: "list[str | RuntimeError | dict[str, str | None]]",
+    ) -> "Any":
+        """Build a mocked Gemini client.
+
+        ``narratives`` is the side-effect list for
+        ``generate_content``. Each entry is one of:
+
+        - ``str``  → returned as the ``narrative`` field of a JSON
+          payload.
+        - ``dict`` → returned verbatim as the JSON payload (used to
+          inject non-string ``narrative`` fields).
+        - ``Exception`` → raised by ``generate_content``.
+
+        ``count_tokens`` is stubbed to return a stable small int so the
+        transcript-distillation second-pass logic is exercised but does
+        not budget-truncate.
+        """
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        count_response = MagicMock()
+        count_response.total_tokens = 100
+        client.models.count_tokens.return_value = count_response
+
+        side_effects: list[Any] = []
+        for entry in narratives:
+            if isinstance(entry, Exception):
+                side_effects.append(entry)
+            elif isinstance(entry, dict):
+                side_effects.append(
+                    TestGenerateSubagentSummaries._mock_gemini_response(entry)
+                )
+            else:
+                side_effects.append(
+                    TestGenerateSubagentSummaries._mock_gemini_response(
+                        {"narrative": entry}
+                    )
+                )
+        client.models.generate_content.side_effect = side_effects
+        return client
+
+    @staticmethod
+    def _stage_archived_subagent(
+        tmp_path: Path,
+        agent_id: str,
+        first_prompt: str = "Audit the thing.",
+    ) -> tuple[Path, dict[str, Any]]:
+        """Stage one archived (uncompressed) subagent transcript on disk.
+
+        Returns the ``dest_dir`` and the structural-metadata dict the
+        production path passes to :func:`generate_subagent_summaries`
+        (``agent_id`` + ``archive_path`` are the only required keys).
+        """
+        dest_dir = tmp_path / "archive"
+        sub_dir = dest_dir / "subagents"
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        archive_file = sub_dir / f"agent-{agent_id}.jsonl"
+        _write_subagent_jsonl(
+            archive_file,
+            agent_id,
+            "parent-session-id",
+            first_prompt=first_prompt,
+            extra_turns=2,
+        )
+        sa_meta = {
+            "agent_id": agent_id,
+            "archive_path": f"subagents/agent-{agent_id}.jsonl",
+            "agent_kind": "user_invoked",
+            "depth": 0,
+            "duration_seconds": 12.5,
+            "tool_calls": {"total": 2},
+            "first_prompt_preview": first_prompt,
+        }
+        return dest_dir, sa_meta
+
+    # -- core cases ------------------------------------------------------
+
+    def test_empty_subagents_returns_empty_list(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``subagents=[]`` short-circuits before any Gemini import."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        from unittest.mock import patch
+
+        with patch("google.genai.Client") as MockClient:
+            result = generate_subagent_summaries(
+                tmp_path / "archive", [], "parent-session-id",
+            )
+            # Empty input means we never even reach client construction.
+            MockClient.assert_not_called()
+        assert result == []
+
+    def test_missing_transcript_file_logged_and_skipped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A subagent whose ``archive_path`` points nowhere is skipped."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        from unittest.mock import patch
+
+        dest_dir = tmp_path / "archive"
+        dest_dir.mkdir()
+        sa_meta = {
+            "agent_id": "missing01",
+            "archive_path": "subagents/agent-missing01.jsonl",
+            "agent_kind": "user_invoked",
+        }
+        with patch("google.genai.Client") as MockClient:
+            MockClient.return_value = self._build_mock_client(
+                ["unused narrative"]
+            )
+            result = generate_subagent_summaries(
+                dest_dir, [sa_meta], "parent-session-id",
+            )
+            # ``generate_content`` must NOT be called — we bail before
+            # the Gemini round-trip when the transcript is missing.
+            client = MockClient.return_value
+            assert client.models.generate_content.call_count == 0
+        assert result == []
+
+    def test_gemini_call_failure_logged_and_skipped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A ``generate_content`` exception is caught and the entry skipped."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        from unittest.mock import patch
+
+        # Disable retry sleeps so a 503-shaped error doesn't slow the test.
+        monkeypatch.setattr(
+            "cc_session_toolkit.archive.AUTO_METADATA_FLEX_RETRY_WAITS_SECONDS",
+            (0, 0, 0),
+        )
+        dest_dir, sa_meta = self._stage_archived_subagent(
+            tmp_path, "failboat1",
+        )
+        with patch("google.genai.Client") as MockClient:
+            # 400-shaped error (not 503): propagates out of the retry
+            # loop and is caught by the per-subagent ``except`` block.
+            MockClient.return_value = self._build_mock_client(
+                [RuntimeError("400 invalid argument")],
+            )
+            result = generate_subagent_summaries(
+                dest_dir, [sa_meta], "parent-session-id",
+            )
+        assert result == []
+
+    def test_non_string_narrative_skipped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A JSON payload whose ``narrative`` is not a string is dropped."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        from unittest.mock import patch
+
+        dest_dir, sa_meta = self._stage_archived_subagent(
+            tmp_path, "weirdnar1",
+        )
+        with patch("google.genai.Client") as MockClient:
+            # Payload with a *None* narrative — passes JSON parse but
+            # fails the ``isinstance(narrative, str)`` guard.
+            MockClient.return_value = self._build_mock_client(
+                [{"narrative": None}],
+            )
+            result = generate_subagent_summaries(
+                dest_dir, [sa_meta], "parent-session-id",
+            )
+        assert result == []
+
+    def test_multiple_subagents_accumulated_correctly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Three subagents yield three narratives, in order, with stripped whitespace."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        from unittest.mock import patch
+
+        dest_dir = tmp_path / "archive"
+        (dest_dir / "subagents").mkdir(parents=True)
+        metas: list[dict[str, Any]] = []
+        for i, aid in enumerate(["aaa1", "bbb2", "ccc3"]):
+            archive_file = dest_dir / "subagents" / f"agent-{aid}.jsonl"
+            _write_subagent_jsonl(
+                archive_file, aid, "parent-session-id",
+                first_prompt=f"Prompt {i}", extra_turns=1,
+            )
+            metas.append({
+                "agent_id": aid,
+                "archive_path": f"subagents/agent-{aid}.jsonl",
+                "agent_kind": "user_invoked",
+                "depth": 0,
+                "duration_seconds": 5.0,
+                "tool_calls": {"total": 1},
+                "first_prompt_preview": f"Prompt {i}",
+            })
+
+        with patch("google.genai.Client") as MockClient:
+            MockClient.return_value = self._build_mock_client([
+                "  Narrative one.  ",
+                "Narrative two.",
+                "Narrative three.",
+            ])
+            result = generate_subagent_summaries(
+                dest_dir, metas, "parent-session-id",
+            )
+            client = MockClient.return_value
+            # Confirm the response_schema kwarg landed on every call —
+            # the SUBAGENT_NARRATIVE_SCHEMA enforcement must be applied
+            # uniformly across the fan-out, not just the first call.
+            for call in client.models.generate_content.call_args_list:
+                cfg = call.kwargs["config"]
+                assert "response_schema" in cfg
+                assert cfg["response_schema"]["required"] == ["narrative"]
+
+        assert [s["agent_id"] for s in result] == ["aaa1", "bbb2", "ccc3"]
+        assert result[0]["narrative"] == "Narrative one."  # stripped
+        assert result[1]["narrative"] == "Narrative two."
+        assert result[2]["narrative"] == "Narrative three."
