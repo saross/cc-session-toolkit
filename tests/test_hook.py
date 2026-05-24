@@ -558,6 +558,150 @@ class TestAutoMetadataGeminiIntegration:
 
 
 # -------------------------------------------------------------------------
+# Subagent response_schema + parse-failure logging (F5, 2026-05-25)
+# -------------------------------------------------------------------------
+
+class TestCallGeminiOnceResponseSchema:
+    """`_call_gemini_once` forwards the optional `response_schema` kwarg."""
+
+    @staticmethod
+    def _mock_response(payload: dict[str, Any]) -> Any:
+        from unittest.mock import MagicMock
+
+        response = MagicMock()
+        response.text = json.dumps(payload)
+        return response
+
+    def test_response_schema_absent_by_default(self) -> None:
+        """When the caller omits `response_schema`, it is NOT placed in the config.
+
+        Preserves the parent-path call shape: the v3 parent prompt's
+        optional arrays (phases/decisions/key_exchanges) do not yet have
+        a schema spec, so schema enforcement must remain opt-in.
+        """
+        from unittest.mock import MagicMock
+
+        from cc_session_toolkit.archive import _call_gemini_once
+
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_response(
+            {"title": "t"}
+        )
+        _call_gemini_once(mock_client, "user msg", "system msg")
+        cfg = mock_client.models.generate_content.call_args.kwargs["config"]
+        assert "response_schema" not in cfg
+        # response_mime_type still active — JSON mode without strict schema.
+        assert cfg["response_mime_type"] == "application/json"
+
+    def test_response_schema_forwarded_when_supplied(self) -> None:
+        """A supplied schema lands verbatim in the Gemini config dict."""
+        from unittest.mock import MagicMock
+
+        from cc_session_toolkit.archive import (
+            SUBAGENT_NARRATIVE_SCHEMA,
+            _call_gemini_once,
+        )
+
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_response(
+            {"narrative": "n"}
+        )
+        _call_gemini_once(
+            mock_client, "user msg", "system msg",
+            response_schema=SUBAGENT_NARRATIVE_SCHEMA,
+        )
+        cfg = mock_client.models.generate_content.call_args.kwargs["config"]
+        assert cfg["response_schema"] == SUBAGENT_NARRATIVE_SCHEMA
+        assert cfg["response_schema"]["properties"]["narrative"]["type"] == (
+            "string"
+        )
+
+    def test_subagent_schema_shape(self) -> None:
+        """`SUBAGENT_NARRATIVE_SCHEMA` enforces single-field `{narrative: str}`."""
+        from cc_session_toolkit.archive import SUBAGENT_NARRATIVE_SCHEMA
+
+        assert SUBAGENT_NARRATIVE_SCHEMA["type"] == "object"
+        assert "narrative" in SUBAGENT_NARRATIVE_SCHEMA["required"]
+        assert SUBAGENT_NARRATIVE_SCHEMA["properties"]["narrative"] == {
+            "type": "string"
+        }
+
+
+class TestParseFailureLoggingCaptures:
+    """Parse-failure log lines capture the full raw response, not just 200 chars.
+
+    Regression guard for the F5 2026-05-24 b089991e/ab92875b failure,
+    where the malformed character at char 1144 was invisible under the
+    previous `raw[:200]` truncation. Both the parent path
+    (`generate_auto_metadata`) and the subagent path
+    (`generate_subagent_summaries`) must include `raw_len=` plus a
+    raw[:8192] window.
+    """
+
+    def test_parent_path_log_includes_full_raw(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A 1500-char malformed response is logged in full (>200 chars)."""
+        from unittest.mock import MagicMock, patch as mpatch
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        # Build a session that survives is_trivial_session().
+        session_path = tmp_path / "session.jsonl"
+        lines = []
+        base_t = datetime(2026, 5, 25, 10, 0, 0, tzinfo=timezone.utc)
+        for i in range(20):
+            lines.append(json.dumps({
+                "type": "user" if i % 2 == 0 else "assistant",
+                "message": {
+                    "role": "user" if i % 2 == 0 else "assistant",
+                    "content": "Substantive content line " * 5,
+                },
+                "timestamp": base_t.isoformat().replace("+00:00", "Z"),
+            }))
+        session_path.write_text("\n".join(lines))
+
+        # Construct a 1500-char malformed response so we can verify
+        # the full payload (not just the first 200) appears in the log.
+        bad_payload = "{\"narrative\": \"" + ("x" * 1500) + "\""  # missing close
+        bad_response = MagicMock()
+        bad_response.text = bad_payload
+
+        captured: list[str] = []
+
+        def fake_log(msg: str, level: str = "INFO", **_: Any) -> None:
+            captured.append(msg)
+
+        with mpatch("google.genai.Client") as MockClient, mpatch(
+            "cc_session_toolkit.archive._log_metadata_event", fake_log
+        ):
+            MockClient.return_value.models.generate_content.return_value = (
+                bad_response
+            )
+            generate_auto_metadata(
+                session_path,
+                {
+                    "turns": 20,
+                    "duration_minutes": 30,
+                    "tool_calls": {"total": 0, "by_type": {}},
+                    "session_id": "f5-test",
+                    "project_name": "test",
+                    "started_at": base_t.isoformat(),
+                },
+            )
+
+        parse_msgs = [m for m in captured if "not parseable as JSON" in m]
+        assert parse_msgs, f"No parse-failure log line; captured: {captured}"
+        msg = parse_msgs[0]
+        assert "raw_len=" in msg
+        assert "raw[:8192]" in msg
+        # The repr-encoded payload of a 1500-char string is >>300 chars
+        # — confirms we are no longer truncating at raw[:300].
+        assert len(msg) > 1500
+
+
+# -------------------------------------------------------------------------
 # Project detection from CWD
 # -------------------------------------------------------------------------
 

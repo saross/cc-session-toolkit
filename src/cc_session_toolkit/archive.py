@@ -391,6 +391,7 @@ def _call_gemini_once(
     client: Any,
     user_message: str,
     system_prompt: str,
+    response_schema: dict[str, Any] | None = None,
 ) -> str:
     """
     Single Flex-tier Gemini call. Raises on any error; returns raw text.
@@ -411,23 +412,35 @@ def _call_gemini_once(
     propagate to ``_parse_metadata_response_json``, where ``.strip()``
     would raise an uncaught ``AttributeError`` and crash the entire
     archive.
+
+    When ``response_schema`` is supplied (an OpenAPI-style dict), Gemini
+    validates its output against the schema before emitting and rejects
+    malformed JSON at source. Used on the subagent path (single-field
+    ``{"narrative": str}``) to close the residual ~4 % stochastic-JSON
+    failure rate observed on the 2026-05-24 backfill (b089991e/ab92875b).
+    Not enabled on the parent path: the v3 parent schema's optional
+    arrays (phases/decisions/key_exchanges) would need a richer schema
+    spec — deferred as a separate design decision.
     """
+    config: dict[str, Any] = {
+        "service_tier": "flex",
+        "max_output_tokens": AUTO_METADATA_MAX_OUTPUT_TOKENS,
+        "system_instruction": system_prompt,
+        "thinking_config": {"thinking_budget": 0},
+        # 2026-05-24: enforce JSON output mode so Gemini cannot wrap
+        # its response in markdown fences or trailing prose. The
+        # 2026-05-24 bake-off observed that v3 prompts without this
+        # mode produced occasional parse failures even with the
+        # robust JSON parser; the mode eliminates the failure class
+        # at source.
+        "response_mime_type": "application/json",
+    }
+    if response_schema is not None:
+        config["response_schema"] = response_schema
     response = client.models.generate_content(
         model=EXTRACTOR_MODEL_ID,
         contents=user_message,
-        config={
-            "service_tier": "flex",
-            "max_output_tokens": AUTO_METADATA_MAX_OUTPUT_TOKENS,
-            "system_instruction": system_prompt,
-            "thinking_config": {"thinking_budget": 0},
-            # 2026-05-24: enforce JSON output mode so Gemini cannot wrap
-            # its response in markdown fences or trailing prose. The
-            # 2026-05-24 bake-off observed that v3 prompts without this
-            # mode produced occasional parse failures even with the
-            # robust JSON parser; the mode eliminates the failure class
-            # at source.
-            "response_mime_type": "application/json",
-        },
+        config=config,
     )
     raw = response.text
     if raw is None:
@@ -449,6 +462,7 @@ def _call_gemini_with_retry(
     client: Any,
     user_message: str,
     system_prompt: str,
+    response_schema: dict[str, Any] | None = None,
 ) -> str:
     """
     Call Gemini Flex with exponential-backoff retries on HTTP 503.
@@ -457,6 +471,9 @@ def _call_gemini_with_retry(
     Google's Flex documentation). We retry on 503 specifically; other
     errors propagate. The schedule is configurable via
     ``AUTO_METADATA_FLEX_RETRY_WAITS_SECONDS``.
+
+    ``response_schema`` is forwarded verbatim to :func:`_call_gemini_once`
+    on every attempt.
     """
     import time
 
@@ -473,7 +490,9 @@ def _call_gemini_with_retry(
             )
             time.sleep(wait_seconds)
         try:
-            return _call_gemini_once(client, user_message, system_prompt)
+            return _call_gemini_once(
+                client, user_message, system_prompt, response_schema
+            )
         except Exception as exc:  # noqa: BLE001 — narrow below
             last_exc = exc
             # Detect 503 from the exception text rather than importing
@@ -666,9 +685,15 @@ def generate_auto_metadata(
     try:
         result = _parse_metadata_response_json(raw_text)
     except ValueError as exc:
+        # Log the full raw response (cap at 8 KB) so the malformed
+        # character can be located post-hoc. The previous raw[:300]
+        # truncation was too tight to diagnose long-narrative failures
+        # (the 2026-05-24 b089991e/ab92875b subagent failure broke at
+        # char 1144, invisible under raw[:200]/[:300]).
         _log_metadata_event(
             f"Gemini response not parseable as JSON for "
-            f"{session_path.name}: {exc}; raw[:300]={raw_text[:300]!r}",
+            f"{session_path.name}: {exc}; "
+            f"raw_len={len(raw_text)}; raw[:8192]={raw_text[:8192]!r}",
             level="ERROR",
         )
         print(f"  Warning: auto-metadata JSON parse failed: {exc}")
@@ -704,6 +729,22 @@ def generate_auto_metadata(
         raw = result.get(v3_field)
         auto_meta[v3_field] = raw if isinstance(raw, list) else []
     return auto_meta
+
+
+# Gemini structured-output schema for the subagent narrative call. Passed
+# as ``response_schema`` to ``_call_gemini_once`` to enforce the
+# single-field ``{"narrative": str}`` contract at the API layer. Gemini
+# rejects malformed JSON before emitting it, closing the residual ~4 %
+# stochastic-JSON failure rate observed on the 2026-05-24 backfill
+# (b089991e/ab92875b broke mid-narrative at char 1144 under the prior
+# response_mime_type-only configuration).
+SUBAGENT_NARRATIVE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "narrative": {"type": "string"},
+    },
+    "required": ["narrative"],
+}
 
 
 def generate_subagent_summaries(
@@ -838,7 +879,10 @@ def generate_subagent_summaries(
 
         try:
             raw_text = _call_gemini_with_retry(
-                client, user_msg, system_prompt
+                client,
+                user_msg,
+                system_prompt,
+                response_schema=SUBAGENT_NARRATIVE_SCHEMA,
             )
         except Exception as exc:  # noqa: BLE001 — graceful degradation
             _log_metadata_event(
@@ -851,9 +895,13 @@ def generate_subagent_summaries(
         try:
             result = _parse_metadata_response_json(raw_text)
         except ValueError as exc:
+            # Log the full raw response (cap at 8 KB) so the malformed
+            # character can be located post-hoc. See parent-path comment
+            # above; raw[:200] was too tight to diagnose the 2026-05-24
+            # ab92875b failure that broke mid-narrative at char 1144.
             _log_metadata_event(
                 f"Subagent JSON parse failed for {agent_id}: {exc}; "
-                f"raw[:200]={raw_text[:200]!r}",
+                f"raw_len={len(raw_text)}; raw[:8192]={raw_text[:8192]!r}",
                 level="ERROR",
             )
             continue
