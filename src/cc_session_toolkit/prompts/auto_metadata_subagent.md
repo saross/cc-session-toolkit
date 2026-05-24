@@ -76,9 +76,8 @@ must carry a fact, a name, or a number. No padding.
 The same anti-abstraction rules as the parent prompt apply:
 
 - **People, files, identifiers, counts, dates, named concepts,
-  numeric outcomes** — preserved verbatim or near-verbatim where the
-  transcript provides them. Never abstract proper nouns into category
-  words.
+  numeric outcomes** — preserved verbatim where the transcript provides
+  them. Never abstract proper nouns into category words.
 - **Contrastive number pairs** — both numbers if before/after; never
   "reduced" without the numbers.
 - **Tool sequence** — named tools in chronological order; not a
