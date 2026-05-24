@@ -84,6 +84,19 @@ GEMINI_FLEX_INPUT_PRICE_PER_MTOK = 0.75
 GEMINI_FLEX_OUTPUT_PRICE_PER_MTOK = 4.50
 
 # ---------------------------------------------------------------------------
+# Subagent summary fan-out cap
+# ---------------------------------------------------------------------------
+# Upper bound on the number of subagents summarised in a single archive
+# call. Each subagent triggers an independent Gemini Flex call costing
+# ~$0.02–$0.10, so a runaway orchestrator with 50+ subagents could
+# quietly spend $5+ per session. The cap is a circuit breaker, not a
+# target — typical sessions have 0–5 subagents and never approach it.
+# When the cap is hit, ``generate_subagent_summaries`` slices the list
+# and emits a WARN log line recording the actual N and the cap so the
+# truncation is auditable. Audit follow-up 2026-05-24.
+MAX_SUBAGENT_SUMMARIES = 20
+
+# ---------------------------------------------------------------------------
 # Sharing licence default
 # ---------------------------------------------------------------------------
 # Default ``licence`` field for ``session.meta.json`` records (provenance

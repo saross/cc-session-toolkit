@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -161,9 +162,18 @@ def update_metadata(
     # bump auto-propagates here.
     data["schema_version"] = SCHEMA_VERSION
 
-    with open(meta_path, "w", encoding="utf-8") as fh:
+    # Atomic overwrite: write to a sibling ``.json.tmp`` first, then
+    # ``os.replace`` it over the canonical path. The plain
+    # ``open(..., "w")`` form truncates ``meta_path`` immediately, so a
+    # SIGINT or crash between the truncate and the ``json.dump``
+    # completion would leave a zero-length or partial file — fatal given
+    # v1.3 mutates three additional fields. ``os.replace`` is atomic on
+    # POSIX (and on Windows since 3.3). Audit follow-up 2026-05-24.
+    tmp_path = meta_path.with_suffix(".json.tmp")
+    with open(tmp_path, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2, ensure_ascii=False)
         fh.write("\n")
+    os.replace(tmp_path, meta_path)
 
 
 def _per_session_cost(input_tokens: int) -> float:
@@ -175,10 +185,10 @@ def _per_session_cost(input_tokens: int) -> float:
     ~1000–2000 tokens (parent + arrays). Using the ceiling here would
     inflate the estimate ~4–8× and mislead the user on dry-runs.
 
-    The estimate **does not** cover per-subagent calls (each subagent
-    adds 1 Gemini call at ~$0.02–$0.10). Sessions with subagents will
-    cost meaningfully more than this function suggests; the dry-run
-    output should flag that caveat.
+    The estimate covers the **parent** call only. Subagent calls are
+    modelled separately via :func:`_per_subagent_cost` and aggregated by
+    :func:`_estimate_total_cost` so the dry-run reports a parent-plus-
+    subagent total (audit follow-up 2026-05-24).
     """
     # Expected output size for the v3 parent call. Calibrated against
     # the 2026-05-24 bake-off: short sessions ~300 output tokens; long
@@ -190,6 +200,53 @@ def _per_session_cost(input_tokens: int) -> float:
         + (expected_output_tokens / 1_000_000)
         * GEMINI_FLEX_OUTPUT_PRICE_PER_MTOK
     )
+
+
+# Typical per-subagent Gemini Flex call cost in USD. Subagent transcripts
+# are typically small (a few thousand distilled tokens) and the v3
+# subagent prompt emits short narratives (~60–200 words, ~80–250 output
+# tokens). $0.05 is the per-subagent figure already documented in the
+# audit follow-ups doc and in ``_per_session_cost`` history; using a
+# flat value here keeps the estimate within the ~10% target without
+# requiring a second sampling pass over the subagent transcripts.
+# Audit follow-up 2026-05-24.
+PER_SUBAGENT_COST_USD = 0.05
+
+
+def _per_subagent_cost() -> float:
+    """Estimated USD cost for summarising one subagent.
+
+    Returns the flat ``PER_SUBAGENT_COST_USD`` constant — see its
+    docstring for the calibration rationale.
+    """
+    return PER_SUBAGENT_COST_USD
+
+
+def _sample_subagent_counts(meta_paths: list[Path]) -> list[int]:
+    """
+    Return per-session subagent counts for every meta file in the list.
+
+    Reads the ``subagents`` array length from each ``session.meta.json``
+    so the dry-run cost estimate can attribute per-subagent calls
+    correctly. Meta files that cannot be read or whose ``subagents``
+    field is not a list contribute 0 (best-effort; matches the
+    summarisation path, which silently emits ``[]`` in those cases).
+
+    No API calls and no transcript decompression — this is a quick scan
+    of the meta JSON only, so it runs over the full set rather than a
+    sample. Audit follow-up 2026-05-24.
+    """
+    counts: list[int] = []
+    for meta_path in meta_paths:
+        try:
+            with open(meta_path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:  # noqa: BLE001 — sampling is best-effort
+            counts.append(0)
+            continue
+        subagents = data.get("subagents")
+        counts.append(len(subagents) if isinstance(subagents, list) else 0)
+    return counts
 
 
 def _sample_distilled_token_counts(
@@ -236,24 +293,41 @@ def _sample_distilled_token_counts(
 def _estimate_total_cost(meta_paths: list[Path], sample_size: int) -> str:
     """Build a human-readable cost estimate for the dry-run output.
 
-    Falls back to a flat ``$0.10 × N`` quote if no sample sessions
-    could be distilled (calibrated to Gemini 3.5 Flash + v3 schema +
-    one subagent typical; the 2026-05-22 head-to-head migration raised
-    list price 3×, and v3 produces ~3-5× larger outputs than v2).
+    Reports parent and subagent costs separately so the total reflects
+    the full v1.3 call shape (one parent Gemini call plus one Gemini
+    call per archived subagent at ~$0.05 each). The 2026-05-22
+    head-to-head migration raised list price 3×, and v3 produces ~3–5×
+    larger outputs than v2; the parent calibration is captured in
+    :func:`_per_session_cost`, the subagent calibration in
+    :func:`_per_subagent_cost`. Subagent counts are read directly from
+    every ``session.meta.json`` (cheap), so the subagent total is exact
+    for the input set rather than sampled. Audit follow-up 2026-05-24.
 
-    **Caveat**: per-subagent calls are not modelled here. Sessions
-    with N subagents cost an extra ~$0.02–$0.10 × N. The refined
-    sampled estimate below is still parent-only.
+    Falls back to a flat ``$0.10 × N`` parent quote if no sample
+    sessions could be distilled (calibrated to Gemini 3.5 Flash + v3
+    schema + one subagent typical); the subagent count is still scanned
+    in that branch.
     """
     samples = _sample_distilled_token_counts(meta_paths, sample_size)
+    subagent_counts = _sample_subagent_counts(meta_paths)
+    total_subagents = sum(subagent_counts)
+    subagent_cost = total_subagents * _per_subagent_cost()
+    sessions_with_subagents = sum(1 for c in subagent_counts if c > 0)
+
     if not samples:
         # Calibrated to Gemini 3.5 Flash + v3 schema; was $0.027/session
         # under Gemini 3 Flash Preview + v2 schema (1024-token output).
-        flat_estimate = len(meta_paths) * 0.10
+        flat_parent_estimate = len(meta_paths) * 0.10
+        flat_total = flat_parent_estimate + subagent_cost
         return (
-            f"Est. cost (Gemini Flex, flat $0.10/session): ~${flat_estimate:.2f}\n"
-            f"  (could not sample real sessions for a refined estimate;\n"
-            f"  per-subagent calls not modelled — add ~$0.05 per subagent)"
+            f"Est. cost (Gemini Flex, flat $0.10/session, parent-only): "
+            f"~${flat_parent_estimate:.2f}\n"
+            f"  (could not sample real sessions for a refined parent estimate)\n"
+            f"  subagent calls: {total_subagents} across "
+            f"{sessions_with_subagents} session(s) "
+            f"× ${PER_SUBAGENT_COST_USD:.2f} ~= ${subagent_cost:.2f}\n"
+            f"  total estimate (parent + subagent): "
+            f"~${flat_total:.2f}"
         )
     samples_sorted = sorted(samples)
     mean = sum(samples) / len(samples)
@@ -263,17 +337,24 @@ def _estimate_total_cost(meta_paths: list[Path], sample_size: int) -> str:
     mean_cost = _per_session_cost(int(mean))
     p90_cost = _per_session_cost(p90)
     max_cost = _per_session_cost(sample_max)
-    total_estimate = mean_cost * len(meta_paths)
+    parent_total = mean_cost * len(meta_paths)
     # Worst-case envelope: assume every session is at the sample's p90.
-    worst_envelope = p90_cost * len(meta_paths)
+    parent_worst = p90_cost * len(meta_paths)
+    grand_total = parent_total + subagent_cost
+    grand_worst = parent_worst + subagent_cost
     return (
         f"Est. cost (Gemini Flex, sampled n={len(samples)} sessions):\n"
         f"  per-session input tokens — "
         f"mean: {int(mean):,}  median: {p50:,}  p90: {p90:,}  max: {sample_max:,}\n"
-        f"  per-session cost — "
+        f"  per-session parent cost — "
         f"mean: ${mean_cost:.4f}  p90: ${p90_cost:.4f}  max: ${max_cost:.4f}\n"
-        f"  total estimate (mean × {len(meta_paths)}): ~${total_estimate:.2f}\n"
-        f"  worst-case envelope (p90 × {len(meta_paths)}): ~${worst_envelope:.2f}"
+        f"  parent total (mean × {len(meta_paths)}): ~${parent_total:.2f}\n"
+        f"  subagent calls: {total_subagents} across "
+        f"{sessions_with_subagents} session(s) "
+        f"× ${PER_SUBAGENT_COST_USD:.2f} ~= ${subagent_cost:.2f}\n"
+        f"  total estimate (parent + subagent): ~${grand_total:.2f}\n"
+        f"  worst-case envelope "
+        f"(p90 parent + subagent): ~${grand_worst:.2f}"
     )
 
 
