@@ -30,6 +30,7 @@ from cc_session_toolkit.config import (
     DEFAULT_THINKING_SHARING,
     DEFAULT_THINKING_USE_CONSTRAINTS,
     EXTRACTOR_MODEL_ID,
+    MAX_SUBAGENT_SUMMARIES,
     SCHEMA_VERSION,
     load_defaults,
 )
@@ -646,7 +647,12 @@ def generate_auto_metadata(
     # under budget.
     try:
         content_tokens = int(_count_tokens(transcript_text))
-    except (TypeError, ValueError, Exception) as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 — any failure falls back to the heuristic
+        # ``Exception`` already subsumes ``TypeError`` and ``ValueError``;
+        # the broad catch is intentional because the heuristic fallback
+        # is correct for every failure mode (transport error, schema
+        # surprise, non-int return) — losing the precise log header for
+        # this call is acceptable. Audit follow-up 2026-05-24.
         from cc_session_toolkit.transcript_text import estimate_tokens
         content_tokens = estimate_tokens(transcript_text)
         _log_metadata_event(
@@ -777,6 +783,20 @@ def generate_subagent_summaries(
     if not subagents:
         return []
 
+    # Cost-control circuit breaker: a runaway orchestrator with 50+
+    # subagents could quietly spend $5+ at ~$0.05 per subagent call.
+    # Slice to ``MAX_SUBAGENT_SUMMARIES`` and emit a WARN line recording
+    # the actual N and the cap so the truncation is auditable. Audit
+    # follow-up 2026-05-24.
+    if len(subagents) > MAX_SUBAGENT_SUMMARIES:
+        _log_metadata_event(
+            f"Subagent fan-out cap hit: {len(subagents)} subagents "
+            f"truncated to first {MAX_SUBAGENT_SUMMARIES} for summarisation "
+            f"(parent_session_id={parent_session_id})",
+            level="WARNING",
+        )
+        subagents = subagents[:MAX_SUBAGENT_SUMMARIES]
+
     try:
         from google import genai  # noqa: WPS433 — optional dependency
     except ImportError:
@@ -845,7 +865,11 @@ def generate_subagent_summaries(
 
         try:
             distilled_tokens = int(_count_tokens(distilled))
-        except (TypeError, ValueError, Exception):  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — any failure falls back to the heuristic
+            # Same rationale as the parent-path call above: ``Exception``
+            # already subsumes ``TypeError`` and ``ValueError``, and the
+            # heuristic fallback is correct for every failure mode.
+            # Audit follow-up 2026-05-24.
             from cc_session_toolkit.transcript_text import estimate_tokens
             distilled_tokens = estimate_tokens(distilled)
 
@@ -1729,6 +1753,17 @@ def archive_session(
                 print(
                     f"  Subagent summaries: {len(subagent_summaries)} / "
                     f"{len(subagents)} generated"
+                )
+            else:
+                # All-failures case (e.g., transient Gemini outage): the
+                # success-only branch above would print nothing, leaving
+                # the user with no console signal that summarisation was
+                # attempted. Surface the 0/N count and point at the log
+                # for the per-subagent error lines. Audit follow-up
+                # 2026-05-24.
+                print(
+                    f"  Subagent summaries: 0 / {len(subagents)} succeeded "
+                    "— see auto-metadata.log"
                 )
         except Exception as exc:  # noqa: BLE001 — never fail parent archive
             print(f"  [warn] Subagent summary generation failed: {exc}")
