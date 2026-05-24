@@ -677,7 +677,10 @@ def generate_auto_metadata(
             f"({content_tokens:,} content tokens)"
         )
         raw_text = _call_gemini_with_retry(
-            client, user_message, system_prompt
+            client,
+            user_message,
+            system_prompt,
+            response_schema=PARENT_METADATA_SCHEMA,
         )
     except Exception as exc:  # noqa: BLE001 — graceful degradation
         _log_metadata_event(
@@ -750,6 +753,127 @@ SUBAGENT_NARRATIVE_SCHEMA: dict[str, Any] = {
         "narrative": {"type": "string"},
     },
     "required": ["narrative"],
+}
+
+
+# Gemini structured-output schema for the parent v3 auto-metadata call.
+# Passed as ``response_schema`` to ``_call_gemini_with_retry`` from
+# :func:`generate_auto_metadata` to enforce the v3 JSON shape at the API
+# layer — the same mechanism the subagent path uses, applied to the
+# richer parent payload. Closes the parent-path equivalent of the
+# residual ~4 % stochastic-JSON failure rate that motivated
+# ``SUBAGENT_NARRATIVE_SCHEMA`` (commit 8e44f1a).
+#
+# Required-vs-optional choices follow the v3 prompt's own intent:
+#
+# - Top-level required: ``title``, ``purpose``, ``tags``, ``three_ps``
+#   (the "Required JSON output" section lists these as the always-emitted
+#   headline + Three Ps layers).
+# - ``three_ps`` required sub-fields: all three
+#   (``prompt_summary``, ``process_summary``, ``provenance_summary``) —
+#   the prompt's "Field contracts" section treats each as a required
+#   contract with its own length curve.
+# - ``phases`` / ``decisions`` / ``key_exchanges`` required at the
+#   top level *but* the schema requires only an array of the documented
+#   shape and explicitly accepts an empty array: "Empty arrays (`[]`)
+#   are valid and expected for short or sparse sessions" (auto_metadata.md,
+#   "Required JSON output" section). The structured-output mode permits
+#   ``minItems`` to be unset / 0, so an empty list satisfies the
+#   constraint.
+# - Within each ``phases[]`` / ``decisions[]`` / ``key_exchanges[]``
+#   object, *every* documented field is marked required — the v3 prompt's
+#   per-array schemas list a fixed set of fields and the worked example
+#   emits all of them on every populated item. A populated item missing
+#   one of these fields is incomplete by the prompt's own contract.
+# - ``options_considered`` is an array of strings (the prompt's
+#   "Decision schema" snippet and the worked example both emit short
+#   string descriptions, not nested objects).
+#
+# OpenAPI-3 dict only — no Pydantic, no external schema lib. If the
+# schema is ill-formed at runtime, Gemini raises and the existing
+# ``_call_gemini_with_retry`` exception handler collapses to None and
+# falls through to graceful degradation.
+PARENT_METADATA_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "purpose": {"type": "string"},
+        "tags": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "three_ps": {
+            "type": "object",
+            "properties": {
+                "prompt_summary": {"type": "string"},
+                "process_summary": {"type": "string"},
+                "provenance_summary": {"type": "string"},
+            },
+            "required": [
+                "prompt_summary",
+                "process_summary",
+                "provenance_summary",
+            ],
+        },
+        "phases": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "approx_start": {"type": "string"},
+                },
+                "required": ["title", "summary", "approx_start"],
+            },
+        },
+        "decisions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    "options_considered": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "chosen": {"type": "string"},
+                    "rationale": {"type": "string"},
+                },
+                "required": [
+                    "question",
+                    "options_considered",
+                    "chosen",
+                    "rationale",
+                ],
+            },
+        },
+        "key_exchanges": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "context": {"type": "string"},
+                    "user_quote": {"type": "string"},
+                    "assistant_response_paraphrase": {"type": "string"},
+                },
+                "required": [
+                    "context",
+                    "user_quote",
+                    "assistant_response_paraphrase",
+                ],
+            },
+        },
+    },
+    "required": [
+        "title",
+        "purpose",
+        "tags",
+        "three_ps",
+        "phases",
+        "decisions",
+        "key_exchanges",
+    ],
 }
 
 

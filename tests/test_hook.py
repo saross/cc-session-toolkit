@@ -649,6 +649,163 @@ class TestCallGeminiOnceResponseSchema:
         }
 
 
+class TestParentMetadataSchema:
+    """`PARENT_METADATA_SCHEMA` enforces the v3 parent JSON shape (2026-05-25).
+
+    Companion to `SUBAGENT_NARRATIVE_SCHEMA` — applies structured-output
+    validation to the richer parent payload (Three Ps + optional
+    phases/decisions/key_exchanges arrays). Required-vs-optional choices
+    follow the v3 prompt's "Required JSON output" section and worked
+    example: top-level fields + Three Ps sub-fields are required; the
+    structured arrays are required at top level but accept empty lists.
+    """
+
+    @staticmethod
+    def _v3_mock_response() -> Any:
+        """A minimal-but-complete v3 payload (all required fields, empty arrays)."""
+        from unittest.mock import MagicMock
+
+        response = MagicMock()
+        response.text = json.dumps({
+            "title": "Wire-up parent response_schema",
+            "purpose": "Close residual parent-path JSON failures.",
+            "tags": ["cc-session-toolkit", "gemini"],
+            "three_ps": {
+                "prompt_summary": "Asked to plumb response_schema.",
+                "process_summary": "Defined schema, wired it in, tested.",
+                "provenance_summary": "Follows commit 8e44f1a precedent.",
+            },
+            "phases": [],
+            "decisions": [],
+            "key_exchanges": [],
+        })
+        return response
+
+    def test_parent_schema_shape_matches_v3_prompt(self) -> None:
+        """Schema matches the documented v3 JSON shape (assertion of intent).
+
+        Cross-checks against the same shape exercised by
+        ``test_parse_response_handles_v3_schema_shape`` — top-level
+        keys, Three Ps triple, and the three structured arrays.
+        """
+        from cc_session_toolkit.archive import PARENT_METADATA_SCHEMA
+
+        assert PARENT_METADATA_SCHEMA["type"] == "object"
+        # Top-level required: every documented headline + Three Ps +
+        # structured-array key. The v3 prompt's "Required JSON output"
+        # section emits all seven; an absent key would silently degrade
+        # the archive's queryability.
+        assert set(PARENT_METADATA_SCHEMA["required"]) == {
+            "title",
+            "purpose",
+            "tags",
+            "three_ps",
+            "phases",
+            "decisions",
+            "key_exchanges",
+        }
+        # Three Ps inner sub-fields all required (per "Field contracts").
+        three_ps = PARENT_METADATA_SCHEMA["properties"]["three_ps"]
+        assert three_ps["type"] == "object"
+        assert set(three_ps["required"]) == {
+            "prompt_summary",
+            "process_summary",
+            "provenance_summary",
+        }
+        # ``tags`` is an array of strings (lowercase hyphenated retrieval keys).
+        tags = PARENT_METADATA_SCHEMA["properties"]["tags"]
+        assert tags["type"] == "array"
+        assert tags["items"] == {"type": "string"}
+
+    def test_parent_schema_phase_item_shape(self) -> None:
+        """``phases[]`` items require title, summary, approx_start (per prompt's phase schema)."""
+        from cc_session_toolkit.archive import PARENT_METADATA_SCHEMA
+
+        phases = PARENT_METADATA_SCHEMA["properties"]["phases"]
+        assert phases["type"] == "array"
+        item = phases["items"]
+        assert item["type"] == "object"
+        assert set(item["required"]) == {"title", "summary", "approx_start"}
+        assert item["properties"]["title"] == {"type": "string"}
+        assert item["properties"]["summary"] == {"type": "string"}
+        assert item["properties"]["approx_start"] == {"type": "string"}
+
+    def test_parent_schema_decision_item_shape(self) -> None:
+        """``decisions[]`` items require question, options_considered, chosen, rationale."""
+        from cc_session_toolkit.archive import PARENT_METADATA_SCHEMA
+
+        decisions = PARENT_METADATA_SCHEMA["properties"]["decisions"]
+        assert decisions["type"] == "array"
+        item = decisions["items"]
+        assert item["type"] == "object"
+        assert set(item["required"]) == {
+            "question",
+            "options_considered",
+            "chosen",
+            "rationale",
+        }
+        # ``options_considered`` is an array of strings — the v3 prompt's
+        # Decision schema and worked example both emit short string
+        # descriptions, not nested objects.
+        opts = item["properties"]["options_considered"]
+        assert opts["type"] == "array"
+        assert opts["items"] == {"type": "string"}
+
+    def test_parent_schema_key_exchange_item_shape(self) -> None:
+        """``key_exchanges[]`` items require context, user_quote, assistant_response_paraphrase."""
+        from cc_session_toolkit.archive import PARENT_METADATA_SCHEMA
+
+        exchanges = PARENT_METADATA_SCHEMA["properties"]["key_exchanges"]
+        assert exchanges["type"] == "array"
+        item = exchanges["items"]
+        assert item["type"] == "object"
+        assert set(item["required"]) == {
+            "context",
+            "user_quote",
+            "assistant_response_paraphrase",
+        }
+
+    def test_parent_schema_forwarded_on_generate_auto_metadata(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`generate_auto_metadata` plumbs `PARENT_METADATA_SCHEMA` into the Gemini config.
+
+        Companion to ``test_response_schema_forwarded_when_supplied``
+        (which checks the lower-level ``_call_gemini_once`` plumbing);
+        this asserts the parent path actually supplies the schema on
+        every call, not just that the plumbing exists.
+        """
+        from cc_session_toolkit.archive import PARENT_METADATA_SCHEMA
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        session = _build_session_jsonl(tmp_path, ["Substantive ask"])
+        stats: dict[str, Any] = {
+            "turns": 10,
+            "duration_minutes": 30,
+            "tool_calls": {"total": 5, "by_type": {"Read": 5}},
+            "session_id": "parent-schema-test",
+            "project_name": "test-project",
+            "started_at": "2026-05-25T10:00:00+00:00",
+        }
+        with patch("google.genai.Client") as MockClient:
+            mock_client = MockClient.return_value
+            mock_client.models.generate_content.return_value = (
+                self._v3_mock_response()
+            )
+            result = generate_auto_metadata(session, stats)
+            call_args = mock_client.models.generate_content.call_args
+
+        assert result is not None
+        cfg = call_args.kwargs["config"]
+        assert "response_schema" in cfg
+        assert cfg["response_schema"] is PARENT_METADATA_SCHEMA
+        # And response_mime_type is still present — the schema augments,
+        # rather than replaces, JSON mode.
+        assert cfg["response_mime_type"] == "application/json"
+
+
 class TestParseFailureLoggingCaptures:
     """Parse-failure log lines capture the full raw response, not just 200 chars.
 
