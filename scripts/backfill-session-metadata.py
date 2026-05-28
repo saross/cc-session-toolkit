@@ -75,6 +75,17 @@ from cc_session_toolkit.transcript_text import (  # noqa: E402
 )
 
 
+# Threshold below which a session's distilled content is considered
+# empty (an abandoned shell, a JSONL with only a header turn, etc.).
+# Used by the preflight skip in :func:`main` and by the standalone
+# helper that retroactively marks the 11 known-empty sessions from the
+# 2026-05-26 archive-wide upgrade. Calibrated against the empty
+# theseus-ship and map-reader-llm "empty-abandoned-session" archives
+# observed during that run, whose extract_transcript_text outputs
+# rounded to ~1 token under the tokeniser.
+EMPTY_TRANSCRIPT_TOKEN_THRESHOLD = 50
+
+
 def find_sessions_needing_backfill(
     archive_root: Path,
 ) -> list[Path]:
@@ -83,6 +94,12 @@ def find_sessions_needing_backfill(
     for meta_path in sorted(archive_root.rglob("session.meta.json")):
         with open(meta_path, encoding="utf-8") as fh:
             data = json.load(fh)
+        # Honour the permanent-skip marker — applied by the preflight
+        # when a session's distilled transcript is below the empty
+        # threshold (no point spending another API call on the same
+        # near-empty content). Audit follow-up 2026-05-28.
+        if data.get("auto_metadata_skip_permanent"):
+            continue
         auto_gen = data.get("auto_generated", {})
         if auto_gen.get("purpose") == "Auto-metadata unavailable":
             results.append(meta_path)
@@ -107,12 +124,15 @@ def find_sessions_needing_v13_upgrade(
     distinct populations:
       * find_sessions_needing_backfill: empty (purpose marker)
       * find_sessions_needing_v13_upgrade: populated but pre-v1.3
-      * (remainder): already on v1.3, nothing to do
+      * (remainder): already on v1.3 or permanently skipped, nothing to do
     """
     results: list[Path] = []
     for meta_path in sorted(archive_root.rglob("session.meta.json")):
         with open(meta_path, encoding="utf-8") as fh:
             data = json.load(fh)
+        # Honour the permanent-skip marker (see find_sessions_needing_backfill).
+        if data.get("auto_metadata_skip_permanent"):
+            continue
         schema_version = data.get("schema_version")
         auto_gen = data.get("auto_generated", {})
         purpose = auto_gen.get("purpose")
@@ -125,6 +145,33 @@ def find_sessions_needing_v13_upgrade(
             continue
         results.append(meta_path)
     return results
+
+
+def mark_session_permanently_skipped(
+    meta_path: Path, reason: str
+) -> None:
+    """Set the ``auto_metadata_skip_permanent`` marker on a meta file.
+
+    Both finders honour this field — once set, the session is excluded
+    from both backfill modes. Applied by the preflight when a session's
+    distilled transcript is below the empty threshold, and by the
+    standalone helper that retroactively marks the 11 known-empty
+    sessions from the 2026-05-26 archive-wide upgrade.
+
+    Writes atomically (tmp + os.replace) and includes a human-readable
+    reason for the skip alongside the boolean flag so the marker is
+    self-documenting.
+    """
+    with open(meta_path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    data["auto_metadata_skip_permanent"] = True
+    data["auto_metadata_skip_reason"] = reason
+    tmp = meta_path.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(tmp, meta_path)
 
 
 def backup_pre_v13_meta(meta_path: Path) -> Path | None:
@@ -721,6 +768,7 @@ def main() -> None:
 
     succeeded = 0
     failed = 0
+    skipped_empty = 0
 
     # Monkey-patch the production Gemini call helper so every charged
     # call lands in ``_CALL_RECORDS``. ``_call_gemini_with_retry``
@@ -748,6 +796,34 @@ def main() -> None:
                     continue
 
                 stats = extract_session_stats(tmp_path)
+
+                # Preflight: skip sessions whose distilled transcript is
+                # below the empty threshold. These are typically
+                # abandoned shells or JSONLs with only a header turn —
+                # Gemini reliably returns None on them (the 2026-05-26
+                # upgrade run wasted 11 calls on this class). Mark the
+                # meta with a permanent-skip flag so future --upgrade-
+                # to-v13 / default-backfill runs auto-skip them too.
+                distilled = extract_transcript_text(tmp_path)
+                content_tokens = estimate_tokens(distilled)
+                if content_tokens < EMPTY_TRANSCRIPT_TOKEN_THRESHOLD:
+                    print(
+                        f"SKIP-EMPTY ({content_tokens} content tokens "
+                        f"< {EMPTY_TRANSCRIPT_TOKEN_THRESHOLD} threshold)"
+                    )
+                    mark_session_permanently_skipped(
+                        meta_path,
+                        reason=(
+                            f"Transcript below empty threshold "
+                            f"({content_tokens} < "
+                            f"{EMPTY_TRANSCRIPT_TOKEN_THRESHOLD}); marked "
+                            f"in backfill preflight on "
+                            f"{datetime.now(timezone.utc).date().isoformat()}."
+                        ),
+                    )
+                    skipped_empty += 1
+                    continue
+
                 # Tag every Gemini call this iteration emits with the
                 # session's relative archive path + the current phase
                 # (parent vs subagent). The wrapper reads these on every
@@ -828,7 +904,10 @@ def main() -> None:
                 ):
                     tmp_path.unlink(missing_ok=True)
 
-        print(f"\nDone: {succeeded} succeeded, {failed} failed.")
+        print(
+            f"\nDone: {succeeded} succeeded, {failed} failed, "
+            f"{skipped_empty} skipped (empty transcript)."
+        )
     finally:
         # Always restore the original helper, even on KeyboardInterrupt
         # mid-run, so an interactive re-run starts clean.
