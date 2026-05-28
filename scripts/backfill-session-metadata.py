@@ -45,6 +45,8 @@ import os
 import shutil
 import sys
 import tempfile
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +75,17 @@ from cc_session_toolkit.transcript_text import (  # noqa: E402
 )
 
 
+# Threshold below which a session's distilled content is considered
+# empty (an abandoned shell, a JSONL with only a header turn, etc.).
+# Used by the preflight skip in :func:`main` and by the standalone
+# helper that retroactively marks the 11 known-empty sessions from the
+# 2026-05-26 archive-wide upgrade. Calibrated against the empty
+# theseus-ship and map-reader-llm "empty-abandoned-session" archives
+# observed during that run, whose extract_transcript_text outputs
+# rounded to ~1 token under the tokeniser.
+EMPTY_TRANSCRIPT_TOKEN_THRESHOLD = 50
+
+
 def find_sessions_needing_backfill(
     archive_root: Path,
 ) -> list[Path]:
@@ -81,6 +94,12 @@ def find_sessions_needing_backfill(
     for meta_path in sorted(archive_root.rglob("session.meta.json")):
         with open(meta_path, encoding="utf-8") as fh:
             data = json.load(fh)
+        # Honour the permanent-skip marker — applied by the preflight
+        # when a session's distilled transcript is below the empty
+        # threshold (no point spending another API call on the same
+        # near-empty content). Audit follow-up 2026-05-28.
+        if data.get("auto_metadata_skip_permanent"):
+            continue
         auto_gen = data.get("auto_generated", {})
         if auto_gen.get("purpose") == "Auto-metadata unavailable":
             results.append(meta_path)
@@ -105,12 +124,15 @@ def find_sessions_needing_v13_upgrade(
     distinct populations:
       * find_sessions_needing_backfill: empty (purpose marker)
       * find_sessions_needing_v13_upgrade: populated but pre-v1.3
-      * (remainder): already on v1.3, nothing to do
+      * (remainder): already on v1.3 or permanently skipped, nothing to do
     """
     results: list[Path] = []
     for meta_path in sorted(archive_root.rglob("session.meta.json")):
         with open(meta_path, encoding="utf-8") as fh:
             data = json.load(fh)
+        # Honour the permanent-skip marker (see find_sessions_needing_backfill).
+        if data.get("auto_metadata_skip_permanent"):
+            continue
         schema_version = data.get("schema_version")
         auto_gen = data.get("auto_generated", {})
         purpose = auto_gen.get("purpose")
@@ -123,6 +145,33 @@ def find_sessions_needing_v13_upgrade(
             continue
         results.append(meta_path)
     return results
+
+
+def mark_session_permanently_skipped(
+    meta_path: Path, reason: str
+) -> None:
+    """Set the ``auto_metadata_skip_permanent`` marker on a meta file.
+
+    Both finders honour this field — once set, the session is excluded
+    from both backfill modes. Applied by the preflight when a session's
+    distilled transcript is below the empty threshold, and by the
+    standalone helper that retroactively marks the 11 known-empty
+    sessions from the 2026-05-26 archive-wide upgrade.
+
+    Writes atomically (tmp + os.replace) and includes a human-readable
+    reason for the skip alongside the boolean flag so the marker is
+    self-documenting.
+    """
+    with open(meta_path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    data["auto_metadata_skip_permanent"] = True
+    data["auto_metadata_skip_reason"] = reason
+    tmp = meta_path.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(tmp, meta_path)
 
 
 def backup_pre_v13_meta(meta_path: Path) -> Path | None:
@@ -429,6 +478,198 @@ def _estimate_total_cost(meta_paths: list[Path], sample_size: int) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Cost tracking (audit follow-up 2026-05-28).
+#
+# Mirrors the validate-production-path.py pattern (Agent D commit bbe2a7b in
+# pa-data, audit follow-up #12). The production ``_call_gemini_once`` helper
+# returns only ``raw_text`` and does not surface ``usage_metadata``, so to
+# capture per-call cost without modifying the toolkit we monkey-patch the
+# archive module's ``_call_gemini_once`` with a wrapper that:
+#
+# 1. Performs the same call with the same config.
+# 2. Reads ``usage_metadata`` from the response and computes Flex-tier cost.
+# 3. Treats a missing ``usage_metadata`` as ``cost = None`` (unknown, but
+#    the call WAS billed — distinguish from "no charge").
+# 4. Appends a per-call record to ``_CALL_RECORDS``.
+#
+# ``_call_gemini_with_retry`` (in the same module) resolves the patched name
+# on every attempt, so a single replacement covers both the parent path and
+# the per-subagent loop. ``_CURRENT_CONTEXT`` is updated before each call
+# type so per-call records carry the target session and the phase
+# (``parent`` / ``subagent``).
+# ---------------------------------------------------------------------------
+
+_CALL_RECORDS: list[dict[str, Any]] = []
+_CURRENT_CONTEXT: dict[str, str] = {"target": "?", "phase": "?"}
+
+
+def _instrumented_call_gemini_once(
+    client: Any,
+    user_message: str,
+    system_prompt: str,
+    response_schema: dict[str, Any] | None = None,
+) -> str:
+    """Wrapper around production ``_call_gemini_once`` that captures cost.
+
+    Mirrors the production helper's behaviour exactly (config keys,
+    ``thinking_budget=0``, optional ``response_schema``, RuntimeError on
+    ``response.text is None``) while additionally recording per-call
+    usage tokens + cost into ``_CALL_RECORDS``.
+    """
+    from cc_session_toolkit.config import (
+        AUTO_METADATA_MAX_OUTPUT_TOKENS,
+        EXTRACTOR_MODEL_ID,
+    )
+
+    config: dict[str, Any] = {
+        "service_tier": "flex",
+        "max_output_tokens": AUTO_METADATA_MAX_OUTPUT_TOKENS,
+        "system_instruction": system_prompt,
+        "thinking_config": {"thinking_budget": 0},
+        "response_mime_type": "application/json",
+    }
+    if response_schema is not None:
+        config["response_schema"] = response_schema
+
+    t0 = time.time()
+    response = client.models.generate_content(
+        model=EXTRACTOR_MODEL_ID,
+        contents=user_message,
+        config=config,
+    )
+    wall_seconds = round(time.time() - t0, 2)
+
+    # Capture usage_metadata before touching response.text — if text is
+    # None, we still want the cost record (the call was billed regardless).
+    um = getattr(response, "usage_metadata", None)
+    if um is None:
+        in_tok: int | None = None
+        out_tok: int | None = None
+        cost_usd: float | None = None
+        cost_unknown_reason: str | None = "usage_metadata missing on response"
+    else:
+        in_tok = getattr(um, "prompt_token_count", None)
+        out_tok = getattr(um, "candidates_token_count", None)
+        if in_tok is None or out_tok is None:
+            cost_usd = None
+            cost_unknown_reason = (
+                "usage_metadata present but token counts missing"
+            )
+        else:
+            cost_in = (
+                in_tok / 1_000_000 * GEMINI_FLEX_INPUT_PRICE_PER_MTOK
+            )
+            cost_out = (
+                out_tok / 1_000_000 * GEMINI_FLEX_OUTPUT_PRICE_PER_MTOK
+            )
+            cost_usd = round(cost_in + cost_out, 6)
+            cost_unknown_reason = None
+
+    _CALL_RECORDS.append({
+        "target": _CURRENT_CONTEXT["target"],
+        "phase": _CURRENT_CONTEXT["phase"],
+        "model": EXTRACTOR_MODEL_ID,
+        "input_tokens_charged": in_tok,
+        "output_tokens": out_tok,
+        "cost_usd": cost_usd,
+        "cost_unknown_reason": cost_unknown_reason,
+        "wall_seconds": wall_seconds,
+        "had_response_schema": response_schema is not None,
+    })
+
+    raw = response.text
+    if raw is None:
+        finish_reason = None
+        try:
+            finish_reason = response.candidates[0].finish_reason
+        except (AttributeError, IndexError, TypeError):
+            pass
+        raise RuntimeError(
+            f"Gemini returned response.text=None "
+            f"(finish_reason={finish_reason!r}); likely safety-filtered, "
+            f"MAX_TOKENS with no parts, or no candidates."
+        )
+    return raw
+
+
+def _summarise_cost_records(
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build the aggregate cost summary written to the cost log.
+
+    Calls with ``cost_usd is None`` are counted but excluded from the
+    sum; the ``total_cost_usd`` is then flagged as a lower bound.
+    """
+    measured_costs = [
+        r["cost_usd"] for r in records if r["cost_usd"] is not None
+    ]
+    unknown_count = sum(1 for r in records if r["cost_usd"] is None)
+    total = round(sum(measured_costs), 6) if measured_costs else 0.0
+    by_phase: dict[str, dict[str, Any]] = {}
+    for r in records:
+        p = r["phase"]
+        bucket = by_phase.setdefault(
+            p, {"calls": 0, "total_cost_usd": 0.0, "unknown_cost_calls": 0}
+        )
+        bucket["calls"] += 1
+        if r["cost_usd"] is None:
+            bucket["unknown_cost_calls"] += 1
+        else:
+            bucket["total_cost_usd"] = round(
+                bucket["total_cost_usd"] + r["cost_usd"], 6
+            )
+    return {
+        "total_calls": len(records),
+        "total_cost_usd": total,
+        "total_cost_usd_is_lower_bound": unknown_count > 0,
+        "unknown_cost_calls": unknown_count,
+        "by_phase": by_phase,
+    }
+
+
+def _default_cost_log_path() -> Path:
+    """Choose a sensible default cost-log path.
+
+    Prefers ``~/personal-assistant/data/logs/`` (matches the existing
+    ``auto-metadata.log`` location on Shawn's setup); falls back to
+    ``$CWD`` for portability when that tree is absent.
+    """
+    candidates = [
+        Path.home() / "personal-assistant" / "data" / "logs",
+        Path.cwd(),
+    ]
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    for d in candidates:
+        if d.exists() and d.is_dir():
+            return d / f"backfill-cost-log-{ts}.json"
+    # Last-ditch: cwd anyway (will fail at write time if cwd is unwritable
+    # but that surfaces a clearer error than silently dropping the log).
+    return Path.cwd() / f"backfill-cost-log-{ts}.json"
+
+
+def _write_cost_log(
+    records: list[dict[str, Any]],
+    summary: dict[str, Any],
+    log_path: Path,
+    mode: str,
+    run_started_at: str,
+) -> None:
+    """Persist the per-call records + aggregate summary as JSON."""
+    payload = {
+        "schema": "backfill-cost-log/1",
+        "mode": mode,
+        "run_started_at": run_started_at,
+        "run_finished_at": datetime.now(timezone.utc).isoformat(),
+        "summary": summary,
+        "records": records,
+    }
+    log_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+
 def main() -> None:
     """Run the backfill."""
     parser = argparse.ArgumentParser(
@@ -466,6 +707,20 @@ def main() -> None:
             "session.meta.json is backed up to session.meta.v2-backup.json "
             "side-by-side before the rebuild. Mutually exclusive with the "
             "default missing-metadata backfill."
+        ),
+    )
+    parser.add_argument(
+        "--cost-log",
+        type=Path,
+        default=None,
+        help=(
+            "Path for the per-call cost-audit JSON log. Defaults to "
+            "~/personal-assistant/data/logs/backfill-cost-log-<UTC>.json "
+            "(or $CWD if that tree is absent). The log captures each "
+            "Gemini call's input/output tokens, Flex-tier cost, wall "
+            "time, and phase (parent/subagent); a missing usage_metadata "
+            "block produces cost=None with the total flagged as a lower "
+            "bound. Audit follow-up 2026-05-28."
         ),
     )
     args = parser.parse_args()
@@ -513,94 +768,181 @@ def main() -> None:
 
     succeeded = 0
     failed = 0
+    skipped_empty = 0
 
-    for i, meta_path in enumerate(sessions, 1):
-        archive_dir = meta_path.parent
-        rel = archive_dir.relative_to(args.archive_root)
-        print(f"[{i}/{len(sessions)}] {rel} ... ", end="", flush=True)
+    # Monkey-patch the production Gemini call helper so every charged
+    # call lands in ``_CALL_RECORDS``. ``_call_gemini_with_retry``
+    # resolves the patched name on every attempt, so the single
+    # replacement covers both the parent path and the subagent loop.
+    # Restored in the ``finally`` block at end of main so any subsequent
+    # in-process run starts from a clean accumulator + original symbol.
+    from cc_session_toolkit import archive as _archive_module
+    original_call_gemini_once = _archive_module._call_gemini_once
+    _archive_module._call_gemini_once = _instrumented_call_gemini_once
+    run_started_at = datetime.now(timezone.utc).isoformat()
 
-        tmp_path = None
-        try:
-            tmp_path = decompress_session(archive_dir)
-            if tmp_path is None:
-                print("SKIP (no session JSONL found)")
-                failed += 1
-                continue
+    try:
+        for i, meta_path in enumerate(sessions, 1):
+            archive_dir = meta_path.parent
+            rel = archive_dir.relative_to(args.archive_root)
+            print(f"[{i}/{len(sessions)}] {rel} ... ", end="", flush=True)
 
-            stats = extract_session_stats(tmp_path)
-            result = generate_auto_metadata(tmp_path, stats)
+            tmp_path = None
+            try:
+                tmp_path = decompress_session(archive_dir)
+                if tmp_path is None:
+                    print("SKIP (no session JSONL found)")
+                    failed += 1
+                    continue
 
-            if result is None:
-                print("FAIL (Gemini returned None)")
-                failed += 1
-                continue
+                stats = extract_session_stats(tmp_path)
 
-            # v1.3 (2026-05-24): if the existing session.meta.json
-            # already lists archived subagents, generate the matching
-            # lightweight per-subagent narrative summaries. Failures
-            # don't block the parent's auto_generated update — the
-            # backfill still ships, just with empty subagent_summaries.
-            with open(meta_path, encoding="utf-8") as fh:
-                existing_meta = json.load(fh)
-            existing_subagents = existing_meta.get("subagents") or []
-            subagent_summaries: list[dict[str, str]] = []
-            if existing_subagents:
-                try:
-                    subagent_summaries = generate_subagent_summaries(
-                        dest_dir=archive_dir,
-                        subagents=existing_subagents,
-                        parent_session_id=existing_meta.get(
-                            "session", {}
-                        ).get("id", ""),
-                    )
-                except Exception as sa_exc:
+                # Preflight: skip sessions whose distilled transcript is
+                # below the empty threshold. These are typically
+                # abandoned shells or JSONLs with only a header turn —
+                # Gemini reliably returns None on them (the 2026-05-26
+                # upgrade run wasted 11 calls on this class). Mark the
+                # meta with a permanent-skip flag so future --upgrade-
+                # to-v13 / default-backfill runs auto-skip them too.
+                distilled = extract_transcript_text(tmp_path)
+                content_tokens = estimate_tokens(distilled)
+                if content_tokens < EMPTY_TRANSCRIPT_TOKEN_THRESHOLD:
                     print(
-                        f"\n    [warn] subagent summaries failed: "
-                        f"{type(sa_exc).__name__}: {sa_exc}",
-                        end="",
+                        f"SKIP-EMPTY ({content_tokens} content tokens "
+                        f"< {EMPTY_TRANSCRIPT_TOKEN_THRESHOLD} threshold)"
                     )
-                    _log_metadata_event(
-                        f"Backfill subagent summaries failed for {rel}: "
-                        f"{type(sa_exc).__name__}: {sa_exc}",
-                        level="WARNING",
+                    mark_session_permanently_skipped(
+                        meta_path,
+                        reason=(
+                            f"Transcript below empty threshold "
+                            f"({content_tokens} < "
+                            f"{EMPTY_TRANSCRIPT_TOKEN_THRESHOLD}); marked "
+                            f"in backfill preflight on "
+                            f"{datetime.now(timezone.utc).date().isoformat()}."
+                        ),
                     )
+                    skipped_empty += 1
+                    continue
 
-            # Upgrade path: preserve the pre-v1.3 meta side-by-side
-            # before overwriting. Matches the 2026-05-24 production-path
-            # validator convention. No-op when --upgrade-to-v13 is not set
-            # (the empty-metadata backfill has nothing worth preserving).
-            if args.upgrade_to_v13:
-                backup_pre_v13_meta(meta_path)
-            update_metadata(meta_path, result, subagent_summaries)
-            title = result.get("title", "?")
-            n_phases = len((result.get("phases") or []))
-            n_decisions = len((result.get("decisions") or []))
-            n_exchanges = len((result.get("key_exchanges") or []))
-            n_sa = len(subagent_summaries)
+                # Tag every Gemini call this iteration emits with the
+                # session's relative archive path + the current phase
+                # (parent vs subagent). The wrapper reads these on every
+                # call when appending to ``_CALL_RECORDS``.
+                _CURRENT_CONTEXT["target"] = str(rel)
+                _CURRENT_CONTEXT["phase"] = "parent"
+                result = generate_auto_metadata(tmp_path, stats)
+
+                if result is None:
+                    print("FAIL (Gemini returned None)")
+                    failed += 1
+                    continue
+
+                # v1.3 (2026-05-24): if the existing session.meta.json
+                # already lists archived subagents, generate the matching
+                # lightweight per-subagent narrative summaries. Failures
+                # don't block the parent's auto_generated update — the
+                # backfill still ships, just with empty subagent_summaries.
+                with open(meta_path, encoding="utf-8") as fh:
+                    existing_meta = json.load(fh)
+                existing_subagents = existing_meta.get("subagents") or []
+                subagent_summaries: list[dict[str, str]] = []
+                if existing_subagents:
+                    _CURRENT_CONTEXT["phase"] = "subagent"
+                    try:
+                        subagent_summaries = generate_subagent_summaries(
+                            dest_dir=archive_dir,
+                            subagents=existing_subagents,
+                            parent_session_id=existing_meta.get(
+                                "session", {}
+                            ).get("id", ""),
+                        )
+                    except Exception as sa_exc:
+                        print(
+                            f"\n    [warn] subagent summaries failed: "
+                            f"{type(sa_exc).__name__}: {sa_exc}",
+                            end="",
+                        )
+                        _log_metadata_event(
+                            f"Backfill subagent summaries failed for {rel}: "
+                            f"{type(sa_exc).__name__}: {sa_exc}",
+                            level="WARNING",
+                        )
+
+                # Upgrade path: preserve the pre-v1.3 meta side-by-side
+                # before overwriting. Matches the 2026-05-24 production-path
+                # validator convention. No-op when --upgrade-to-v13 is not
+                # set (the empty-metadata backfill has nothing worth
+                # preserving).
+                if args.upgrade_to_v13:
+                    backup_pre_v13_meta(meta_path)
+                update_metadata(meta_path, result, subagent_summaries)
+                title = result.get("title", "?")
+                n_phases = len((result.get("phases") or []))
+                n_decisions = len((result.get("decisions") or []))
+                n_exchanges = len((result.get("key_exchanges") or []))
+                n_sa = len(subagent_summaries)
+                print(
+                    f"OK: {title} "
+                    f"[phases={n_phases} dec={n_decisions} exch={n_exchanges} "
+                    f"subagents={n_sa}/{len(existing_subagents)}]"
+                )
+                succeeded += 1
+
+            except Exception as exc:
+                print(f"ERROR: {type(exc).__name__}: {exc}")
+                _log_metadata_event(
+                    f"Backfill error for {rel}: {type(exc).__name__}: {exc}",
+                    level="ERROR",
+                )
+                failed += 1
+
+            finally:
+                # Clean up temp file (but not if it was the original)
+                if (
+                    tmp_path is not None
+                    and tmp_path != archive_dir / "session.jsonl"
+                ):
+                    tmp_path.unlink(missing_ok=True)
+
+        print(
+            f"\nDone: {succeeded} succeeded, {failed} failed, "
+            f"{skipped_empty} skipped (empty transcript)."
+        )
+    finally:
+        # Always restore the original helper, even on KeyboardInterrupt
+        # mid-run, so an interactive re-run starts clean.
+        _archive_module._call_gemini_once = original_call_gemini_once
+        # Persist the cost log + print a brief summary regardless of
+        # how the run exited — partial data is better than none.
+        log_path = args.cost_log or _default_cost_log_path()
+        summary = _summarise_cost_records(_CALL_RECORDS)
+        try:
+            _write_cost_log(
+                _CALL_RECORDS, summary, log_path, mode_label, run_started_at,
+            )
+            print(f"\nCost log written: {log_path}")
+        except OSError as log_exc:
             print(
-                f"OK: {title} "
-                f"[phases={n_phases} dec={n_decisions} exch={n_exchanges} "
-                f"subagents={n_sa}/{len(existing_subagents)}]"
+                f"\nWARN: could not write cost log to {log_path}: {log_exc}"
             )
-            succeeded += 1
-
-        except Exception as exc:
-            print(f"ERROR: {type(exc).__name__}: {exc}")
-            _log_metadata_event(
-                f"Backfill error for {rel}: {type(exc).__name__}: {exc}",
-                level="ERROR",
-            )
-            failed += 1
-
-        finally:
-            # Clean up temp file (but not if it was the original)
-            if (
-                tmp_path is not None
-                and tmp_path != archive_dir / "session.jsonl"
-            ):
-                tmp_path.unlink(missing_ok=True)
-
-    print(f"\nDone: {succeeded} succeeded, {failed} failed.")
+        bound_note = (
+            " (lower bound — some calls missing usage_metadata)"
+            if summary["total_cost_usd_is_lower_bound"] else ""
+        )
+        parent = summary["by_phase"].get(
+            "parent", {"calls": 0, "total_cost_usd": 0.0}
+        )
+        subagent = summary["by_phase"].get(
+            "subagent", {"calls": 0, "total_cost_usd": 0.0}
+        )
+        print(
+            f"Total spend: ${summary['total_cost_usd']:.4f} across "
+            f"{summary['total_calls']} calls{bound_note}\n"
+            f"  parent:   {parent['calls']:>4} calls  "
+            f"${parent['total_cost_usd']:.4f}\n"
+            f"  subagent: {subagent['calls']:>4} calls  "
+            f"${subagent['total_cost_usd']:.4f}"
+        )
 
 
 if __name__ == "__main__":

@@ -88,13 +88,20 @@ GEMINI_FLEX_OUTPUT_PRICE_PER_MTOK = 4.50
 # ---------------------------------------------------------------------------
 # Upper bound on the number of subagents summarised in a single archive
 # call. Each subagent triggers an independent Gemini Flex call costing
-# ~$0.02–$0.10, so a runaway orchestrator with 50+ subagents could
-# quietly spend $5+ per session. The cap is a circuit breaker, not a
-# target — typical sessions have 0–5 subagents and never approach it.
-# When the cap is hit, ``generate_subagent_summaries`` slices the list
-# and emits a WARN log line recording the actual N and the cap so the
-# truncation is auditable. Audit follow-up 2026-05-24.
-MAX_SUBAGENT_SUMMARIES = 20
+# ~$0.04 actual ($0.05 budgeted), so a runaway orchestrator with 100+
+# subagents could quietly spend $4-5 per session. The cap is a circuit
+# breaker, not a target — typical sessions have 0–5 subagents and never
+# approach it. When the cap is hit, ``generate_subagent_summaries``
+# slices the list and emits a WARN log line recording the actual N and
+# the cap so the truncation is auditable.
+#
+# Calibrated 2026-05-28 against the live archive: 17 sessions out of 637
+# in the v1.3 upgrade run exceeded the original 20-cap, with the
+# heaviest at 68 subagents. Raised to 70 to cover Shawn's full empirical
+# distribution (worst-case session ~$3 vs ~$1 at the 20-cap; per-session
+# blast radius still small relative to $216 archive-wide envelope).
+# Originally 20 (audit follow-up 2026-05-24); bumped to 70 (2026-05-28).
+MAX_SUBAGENT_SUMMARIES = 70
 
 # ---------------------------------------------------------------------------
 # Sharing licence default

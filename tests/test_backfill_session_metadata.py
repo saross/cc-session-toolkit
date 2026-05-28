@@ -208,3 +208,262 @@ class TestBackupPreV13Meta:
         assert returned == prior_backup
         # Prior backup untouched.
         assert prior_backup.read_text() == prior_backup_content
+
+
+# -------------------------------------------------------------------------
+# Permanent-skip marker (added 2026-05-28)
+# -------------------------------------------------------------------------
+
+
+class TestMarkSessionPermanentlySkipped:
+    """``mark_session_permanently_skipped`` adds the skip flag + reason."""
+
+    def test_writes_flag_and_reason(
+        self,
+        backfill: ModuleType,
+        tmp_path: Path,
+    ) -> None:
+        """Both fields land in the meta after the helper runs."""
+        meta_path = _write_meta(
+            tmp_path, "proj/2026-01-01_a",
+            schema_version="1.2", purpose="x",
+        )
+        backfill.mark_session_permanently_skipped(
+            meta_path, reason="Test empty session"
+        )
+        data = json.loads(meta_path.read_text())
+        assert data["auto_metadata_skip_permanent"] is True
+        assert data["auto_metadata_skip_reason"] == "Test empty session"
+        # Original fields preserved.
+        assert data["schema_version"] == "1.2"
+        assert data["auto_generated"]["purpose"] == "x"
+
+
+class TestFindersHonourSkipMarker:
+    """Both finders skip sessions with auto_metadata_skip_permanent=True."""
+
+    def test_v13_finder_skips_marked_session(
+        self,
+        backfill: ModuleType,
+        tmp_path: Path,
+    ) -> None:
+        """A v1.2 populated session that would normally be picked up
+        is excluded once the skip marker is set."""
+        meta_path = _write_meta(
+            tmp_path, "proj/2026-01-01_a",
+            schema_version="1.2", purpose="Real purpose",
+        )
+        # Confirm baseline: finder DOES pick it up.
+        assert len(backfill.find_sessions_needing_v13_upgrade(tmp_path)) == 1
+        # Now mark and re-check.
+        backfill.mark_session_permanently_skipped(meta_path, "test")
+        assert backfill.find_sessions_needing_v13_upgrade(tmp_path) == []
+
+    def test_default_finder_skips_marked_session(
+        self,
+        backfill: ModuleType,
+        tmp_path: Path,
+    ) -> None:
+        """The default backfill finder also honours the marker."""
+        meta_path = _write_meta(
+            tmp_path, "proj/2026-01-01_a",
+            schema_version="1.2", purpose="Auto-metadata unavailable",
+        )
+        assert len(backfill.find_sessions_needing_backfill(tmp_path)) == 1
+        backfill.mark_session_permanently_skipped(meta_path, "test")
+        assert backfill.find_sessions_needing_backfill(tmp_path) == []
+
+
+# -------------------------------------------------------------------------
+# Cost tracking (added 2026-05-28)
+# -------------------------------------------------------------------------
+
+
+class _MockUsageMetadata:
+    """Minimal stand-in for genai's UsageMetadata response attribute."""
+
+    def __init__(
+        self,
+        prompt_token_count: int | None = 1000,
+        candidates_token_count: int | None = 500,
+    ) -> None:
+        self.prompt_token_count = prompt_token_count
+        self.candidates_token_count = candidates_token_count
+
+
+class _MockGeminiResponse:
+    """Minimal stand-in for client.models.generate_content's return."""
+
+    def __init__(
+        self,
+        text: str = '{"narrative": "ok"}',
+        usage_metadata: _MockUsageMetadata | None = None,
+    ) -> None:
+        self.text = text
+        self.usage_metadata = (
+            usage_metadata if usage_metadata is not None
+            else _MockUsageMetadata()
+        )
+
+
+class _MockClient:
+    """Records the most recent generate_content call for assertion."""
+
+    def __init__(self, response: _MockGeminiResponse) -> None:
+        self._response = response
+        self.last_kwargs: dict | None = None
+
+        class _Models:
+            def __init__(_self) -> None:  # noqa: N805
+                _self.parent = self
+
+            def generate_content(_self, **kwargs):  # noqa: N805
+                _self.parent.last_kwargs = kwargs
+                return _self.parent._response
+
+        self.models = _Models()
+
+
+class TestInstrumentedCallGeminiOnce:
+    """Wrapper records cost + forwards config + respects schema kwarg."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_records(self, backfill: ModuleType) -> None:
+        """Ensure module-level state is fresh for each test."""
+        backfill._CALL_RECORDS.clear()
+        backfill._CURRENT_CONTEXT["target"] = "test-target"
+        backfill._CURRENT_CONTEXT["phase"] = "parent"
+
+    def test_records_cost_from_usage_metadata(
+        self, backfill: ModuleType
+    ) -> None:
+        """Happy path: cost computed from prompt/candidate token counts."""
+        client = _MockClient(_MockGeminiResponse(
+            usage_metadata=_MockUsageMetadata(
+                prompt_token_count=1_000_000,  # exactly 1 MTok input
+                candidates_token_count=100_000,  # 0.1 MTok output
+            ),
+        ))
+        backfill._instrumented_call_gemini_once(
+            client, "user msg", "system msg"
+        )
+        assert len(backfill._CALL_RECORDS) == 1
+        rec = backfill._CALL_RECORDS[0]
+        # At $0.75/MTok input + $4.50/MTok output:
+        # cost = 1.0 * 0.75 + 0.1 * 4.50 = 0.75 + 0.45 = 1.20
+        assert rec["cost_usd"] == pytest.approx(1.20, abs=1e-6)
+        assert rec["cost_unknown_reason"] is None
+        assert rec["input_tokens_charged"] == 1_000_000
+        assert rec["output_tokens"] == 100_000
+        assert rec["target"] == "test-target"
+        assert rec["phase"] == "parent"
+        assert rec["had_response_schema"] is False
+
+    def test_missing_usage_metadata_yields_unknown_cost(
+        self, backfill: ModuleType
+    ) -> None:
+        """A response with no usage_metadata records cost=None + reason."""
+        response = _MockGeminiResponse()
+        response.usage_metadata = None
+        backfill._instrumented_call_gemini_once(
+            _MockClient(response), "u", "s"
+        )
+        rec = backfill._CALL_RECORDS[0]
+        assert rec["cost_usd"] is None
+        assert "usage_metadata missing" in rec["cost_unknown_reason"]
+        assert rec["input_tokens_charged"] is None
+        assert rec["output_tokens"] is None
+
+    def test_partial_usage_metadata_yields_unknown_cost(
+        self, backfill: ModuleType
+    ) -> None:
+        """usage_metadata present but token counts None — cost=None."""
+        backfill._instrumented_call_gemini_once(
+            _MockClient(_MockGeminiResponse(
+                usage_metadata=_MockUsageMetadata(
+                    prompt_token_count=None, candidates_token_count=100,
+                ),
+            )),
+            "u", "s",
+        )
+        rec = backfill._CALL_RECORDS[0]
+        assert rec["cost_usd"] is None
+        assert "token counts missing" in rec["cost_unknown_reason"]
+
+    def test_response_schema_forwarded(self, backfill: ModuleType) -> None:
+        """When supplied, response_schema lands in the Gemini config."""
+        client = _MockClient(_MockGeminiResponse())
+        schema = {"type": "object", "properties": {"x": {"type": "string"}}}
+        backfill._instrumented_call_gemini_once(
+            client, "u", "s", response_schema=schema,
+        )
+        cfg = client.last_kwargs["config"]
+        assert cfg["response_schema"] == schema
+        assert backfill._CALL_RECORDS[0]["had_response_schema"] is True
+
+    def test_schema_absent_by_default(self, backfill: ModuleType) -> None:
+        """No response_schema kwarg → no schema in config."""
+        client = _MockClient(_MockGeminiResponse())
+        backfill._instrumented_call_gemini_once(client, "u", "s")
+        cfg = client.last_kwargs["config"]
+        assert "response_schema" not in cfg
+        assert cfg["response_mime_type"] == "application/json"
+
+    def test_response_text_none_raises_but_records_cost(
+        self, backfill: ModuleType
+    ) -> None:
+        """A None text raises RuntimeError but the call WAS billed —
+        record must land BEFORE the raise so the audit trail is honest."""
+        response = _MockGeminiResponse(text=None)
+        with pytest.raises(RuntimeError):
+            backfill._instrumented_call_gemini_once(
+                _MockClient(response), "u", "s"
+            )
+        # The record was appended before the raise.
+        assert len(backfill._CALL_RECORDS) == 1
+
+
+class TestSummariseCostRecords:
+    """``_summarise_cost_records`` aggregates per-phase + flags lower-bound."""
+
+    def test_empty_records(self, backfill: ModuleType) -> None:
+        s = backfill._summarise_cost_records([])
+        assert s["total_calls"] == 0
+        assert s["total_cost_usd"] == 0.0
+        assert s["total_cost_usd_is_lower_bound"] is False
+        assert s["unknown_cost_calls"] == 0
+        assert s["by_phase"] == {}
+
+    def test_aggregates_by_phase(self, backfill: ModuleType) -> None:
+        records = [
+            {"phase": "parent", "cost_usd": 0.10},
+            {"phase": "parent", "cost_usd": 0.20},
+            {"phase": "subagent", "cost_usd": 0.05},
+            {"phase": "subagent", "cost_usd": 0.05},
+            {"phase": "subagent", "cost_usd": 0.05},
+        ]
+        s = backfill._summarise_cost_records(records)
+        assert s["total_calls"] == 5
+        assert s["total_cost_usd"] == pytest.approx(0.45)
+        assert s["by_phase"]["parent"]["calls"] == 2
+        assert s["by_phase"]["parent"]["total_cost_usd"] == pytest.approx(0.30)
+        assert s["by_phase"]["subagent"]["calls"] == 3
+        assert s["by_phase"]["subagent"]["total_cost_usd"] == pytest.approx(0.15)
+        assert s["total_cost_usd_is_lower_bound"] is False
+
+    def test_unknown_cost_flags_lower_bound(
+        self, backfill: ModuleType
+    ) -> None:
+        """A single None cost flips total_cost_usd_is_lower_bound to True."""
+        records = [
+            {"phase": "parent", "cost_usd": 0.10},
+            {"phase": "parent", "cost_usd": None},
+            {"phase": "subagent", "cost_usd": 0.05},
+        ]
+        s = backfill._summarise_cost_records(records)
+        assert s["total_cost_usd_is_lower_bound"] is True
+        assert s["unknown_cost_calls"] == 1
+        # Only measured costs contribute to the sum.
+        assert s["total_cost_usd"] == pytest.approx(0.15)
+        assert s["by_phase"]["parent"]["unknown_cost_calls"] == 1
+        assert s["by_phase"]["parent"]["total_cost_usd"] == pytest.approx(0.10)
