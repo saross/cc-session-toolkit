@@ -49,9 +49,13 @@ class TestInitialiseProject:
         assert reflections.exists()
         assert (reflections / "session-reflection.md").exists()
         assert (reflections / "llm-observations.md").exists()
-        assert (reflections / "working-notes.md").exists()
         assert (reflections / "abductive-reasoning.md").exists()
         assert (reflections / "session-log.md").exists()
+
+        # working-notes.md is the research-notes layer (owned by /observe)
+        # and must be a SIBLING of reflections/, never inside it.
+        assert (reflections.parent / "working-notes.md").exists()
+        assert not (reflections / "working-notes.md").exists()
 
         # Check frontmatter is present
         content = (reflections / "session-reflection.md").read_text()
@@ -132,6 +136,13 @@ class TestInitialiseProject:
         assert (
             tmp_project / "notes" / "reflect"
             / "session-reflection.md"
+        ).exists()
+
+        # working-notes.md should land beside the custom reflections dir
+        # (its parent), not inside it.
+        assert (tmp_project / "notes" / "working-notes.md").exists()
+        assert not (
+            tmp_project / "notes" / "reflect" / "working-notes.md"
         ).exists()
 
         # SKILL.md should reference the custom path

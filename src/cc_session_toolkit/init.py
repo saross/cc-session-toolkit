@@ -76,7 +76,18 @@ def initialise_project(
     1. ``archive/cc-sessions/queries/`` with LLM extraction prompts
     2. ``archive/cc-sessions/archive-defaults.yaml`` from template
     3. Reflection document directory with stub templates
-    4. ``.claude/skills/reflect/SKILL.md`` from protocol template
+    4. ``working-notes.md`` as a *sibling* of the reflections directory
+    5. ``.claude/skills/reflect/SKILL.md`` from protocol template
+
+    ``working-notes.md`` is the research-notes layer (owned by ``/observe``)
+    and is deliberately placed *beside* the reflections directory, never
+    inside it: ``reflections/`` is the meta-research layer (owned by
+    ``/reflect``). A historical version of this scaffold shipped the
+    template inside ``data/reflections/``, so it was copied into the
+    ``reflections/`` directory and the misplacement regenerated in every
+    newly-scaffolded project. The template now lives at
+    ``data/working-notes.md`` and is placed at the parent of
+    ``reflections_dir``.
 
     With ``--update``, regenerates SKILL.md and query prompts from the
     current package version without touching reflection content or
@@ -141,7 +152,25 @@ def initialise_project(
                 label=f"{reflections_dir}/{src_file.name}",
             )
 
-    # 4. SKILL.md
+    # 4. Working notes — sibling of reflections/, NOT inside it.
+    #    working-notes.md is the research-notes layer (owned by /observe);
+    #    reflections/ is the meta-research layer (owned by /reflect). The
+    #    template lives at data/working-notes.md (outside data/reflections/)
+    #    precisely so the section-3 loop above cannot sweep it into
+    #    reflections_dest. The notes root is the parent of reflections_dir
+    #    (e.g. "docs/notes" when reflections_dir is "docs/notes/reflections").
+    notes_dir = (root / reflections_dir).parent
+    working_notes_src = data / "working-notes.md"
+    if working_notes_src.exists():
+        _copy_if_missing(
+            working_notes_src,
+            notes_dir / "working-notes.md",
+            label=str(
+                (Path(reflections_dir).parent / "working-notes.md")
+            ),
+        )
+
+    # 5. SKILL.md
     skill_src = data / "templates" / "reflect-skill.md"
     skill_dest = root / ".claude" / "skills" / "reflect" / "SKILL.md"
     _render_template(
@@ -155,6 +184,8 @@ def initialise_project(
     if not update:
         print(
             f"\nReflection documents: {root / reflections_dir}")
+        print(
+            f"Working notes: {notes_dir / 'working-notes.md'}")
         print(
             f"Archive queries: {queries_dest}")
         print(
