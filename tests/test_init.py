@@ -45,7 +45,7 @@ class TestInitialiseProject:
             project_name="test-project",
         )
 
-        reflections = tmp_project / "docs" / "notes" / "reflections"
+        reflections = tmp_project / "wiki" / "reflections"
         assert reflections.exists()
         assert (reflections / "session-reflection.md").exists()
         assert (reflections / "llm-observations.md").exists()
@@ -79,7 +79,7 @@ class TestInitialiseProject:
     def test_skips_existing_files(self, tmp_project: Path) -> None:
         """Should not overwrite existing files."""
         # Pre-create a reflection file with custom content
-        reflections = tmp_project / "docs" / "notes" / "reflections"
+        reflections = tmp_project / "wiki" / "reflections"
         reflections.mkdir(parents=True)
         custom = reflections / "session-reflection.md"
         custom.write_text("# My custom content\n")
@@ -107,7 +107,7 @@ class TestInitialiseProject:
         skill.write_text("# Old content\n")
 
         # Pre-create a reflection file
-        reflections = tmp_project / "docs" / "notes" / "reflections"
+        reflections = tmp_project / "wiki" / "reflections"
         custom = reflections / "session-reflection.md"
         original_content = custom.read_text()
 
