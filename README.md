@@ -86,12 +86,13 @@ my-project/
 ├── archive/cc-sessions/
 │   ├── queries/              # LLM extraction prompts
 │   └── archive-defaults.yaml # Project-specific defaults
-├── docs/notes/reflections/   # Reflection documents (with frontmatter)
-│   ├── session-reflection.md
-│   ├── llm-observations.md
-│   ├── working-notes.md
-│   ├── abductive-reasoning.md
-│   └── session-log.md
+├── wiki/                     # Canonical four-artefact wiki layout
+│   ├── working-notes.md      # Research-notes layer (owned by /observe)
+│   └── reflections/          # Reflection documents (owned by /reflect)
+│       ├── session-reflection.md
+│       ├── llm-observations.md
+│       ├── abductive-reasoning.md
+│       └── session-log.md
 └── .claude/skills/reflect/
     └── SKILL.md              # Reflection protocol (regenerable)
 ```

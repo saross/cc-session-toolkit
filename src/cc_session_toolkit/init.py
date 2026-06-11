@@ -66,7 +66,7 @@ def initialise_project(
     project_name: str | None = None,
     *,
     update: bool = False,
-    reflections_dir: str = "docs/notes/reflections",
+    reflections_dir: str = "wiki/reflections",
 ) -> None:
     """
     Scaffold project files for cc-session-toolkit.
@@ -98,7 +98,8 @@ def initialise_project(
         project_name: Explicit project name.  Defaults to auto-detection.
         update: If True, overwrite SKILL.md and queries (not content).
         reflections_dir: Relative path for reflection documents
-            (default: ``docs/notes/reflections``).
+            (default: ``wiki/reflections`` — the canonical four-artefact
+            wiki layout; working-notes lands at its parent, ``wiki/``).
     """
     root = project_root or find_project_root()
     name = project_name or get_project_name(root)
@@ -158,7 +159,7 @@ def initialise_project(
     #    template lives at data/working-notes.md (outside data/reflections/)
     #    precisely so the section-3 loop above cannot sweep it into
     #    reflections_dest. The notes root is the parent of reflections_dir
-    #    (e.g. "docs/notes" when reflections_dir is "docs/notes/reflections").
+    #    (e.g. "wiki" when reflections_dir is "wiki/reflections").
     notes_dir = (root / reflections_dir).parent
     working_notes_src = data / "working-notes.md"
     if working_notes_src.exists():
