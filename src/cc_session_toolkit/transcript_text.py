@@ -179,6 +179,34 @@ HOOK_OUTPUT_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 
+def resolve_transcript(session_dir: Path) -> Path | None:
+    """Return the transcript path for an archived session directory.
+
+    THE canonical accessor (2026-08-22): the archive holds transcripts in
+    two forms — ``session.jsonl.gz`` (canonical) and legacy raw
+    ``session.jsonl`` — and any consumer that assumes one form silently
+    drops the other population. That defect class produced a false
+    "12-week archive hole" report on 2026-08-22 (a ``*.jsonl`` glob
+    counted every gz-only session as transcript-less). Resolve through
+    this function; open the result with :func:`open_transcript`.
+
+    Prefers the compressed form when both exist. Returns ``None`` when
+    the directory holds no transcript at all (meta-only shell).
+    """
+    gz = session_dir / "session.jsonl.gz"
+    if gz.is_file():
+        return gz
+    raw = session_dir / "session.jsonl"
+    if raw.is_file():
+        return raw
+    return None
+
+
+def open_transcript(path: Path):
+    """Public alias of :func:`_open_transcript` — see below."""
+    return _open_transcript(path)
+
+
 def _open_transcript(path: Path):
     """Open a transcript regardless of whether it is gzip-compressed.
 

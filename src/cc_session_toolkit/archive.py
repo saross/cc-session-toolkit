@@ -1600,7 +1600,7 @@ def archive_session(
     *,
     dry_run: bool = False,
     stats_only: bool = False,
-    use_gzip: bool = False,
+    use_gzip: bool = True,
     title: str | None = None,
     archive_root: Path | None = None,
     project_name_override: str | None = None,
@@ -1625,7 +1625,14 @@ def archive_session(
             global mode if no project root was detected.
         dry_run: Preview without writing files.
         stats_only: Skip CC metadata generation (use placeholders).
-        use_gzip: Compress the JSONL file.
+        use_gzip: Compress the JSONL file. Defaults to ``True`` (since
+            2026-08-22): ``session.jsonl.gz`` is the canonical storage
+            form. The old ``False`` default, combined with hooks passing
+            ``--gzip``, produced three coexisting storage states across
+            the archive (729 gz-only / 88 raw-only / 34 dual, measured
+            2026-08-22) with no declared invariant — every consumer had
+            to guess the form, and consumers that guessed ``*.jsonl``
+            reported a nonexistent 12-week archive hole.
         title: Optional session title for human-readable directory name.
         archive_root: Global archive root (overrides per-project
             archive directory).
@@ -1793,9 +1800,30 @@ def archive_session(
         dest_jsonl = dest_dir / "session.jsonl.gz"
         uncompressed_size = session_path.stat().st_size
 
+        # Hash the source while compressing, then verify the written .gz
+        # by a decompress round-trip (2026-08-22). The previous
+        # unguarded write meant a truncated or corrupt compress could
+        # only be discovered when someone later tried to read the
+        # archive — the sha256 recorded below was computed over the
+        # compressed bytes as written, so it certified whatever landed
+        # on disk, corrupt or not.
+        source_hash = hashlib.sha256()
         with open(session_path, "rb") as f_in:
             with gzip.open(dest_jsonl, "wb") as f_out:
-                shutil.copyfileobj(f_in, f_out)
+                for chunk in iter(lambda: f_in.read(65536), b""):
+                    source_hash.update(chunk)
+                    f_out.write(chunk)
+
+        roundtrip_hash = hashlib.sha256()
+        with gzip.open(dest_jsonl, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                roundtrip_hash.update(chunk)
+        if roundtrip_hash.hexdigest() != source_hash.hexdigest():
+            dest_jsonl.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"gzip round-trip verification FAILED for {session_path} "
+                f"— corrupt write removed; source untouched"
+            )
 
         compressed_hash = hashlib.sha256()
         with open(dest_jsonl, "rb") as fh:
@@ -1808,7 +1836,28 @@ def archive_session(
             "compressed_bytes": dest_jsonl.stat().st_size,
             "uncompressed_bytes": uncompressed_size,
             "compressed_sha256": compressed_hash.hexdigest(),
+            "uncompressed_sha256": source_hash.hexdigest(),
         }
+
+        # Storage invariant: one form per archive dir. A raw sibling
+        # left by an earlier run with the flag flipped is removed when
+        # its content matches what we just verified; a differing
+        # sibling is kept and flagged (it may be a longer, later
+        # capture — human decision, not silent deletion).
+        raw_sibling = dest_dir / "session.jsonl"
+        if raw_sibling.exists():
+            sib_hash = hashlib.sha256()
+            with open(raw_sibling, "rb") as fh:
+                for chunk in iter(lambda: fh.read(65536), b""):
+                    sib_hash.update(chunk)
+            if sib_hash.hexdigest() == source_hash.hexdigest():
+                raw_sibling.unlink()
+                print("  Removed identical raw sibling session.jsonl")
+            else:
+                print(
+                    "  [warn] session.jsonl sibling DIFFERS from this "
+                    "capture — both forms kept; reconcile manually"
+                )
         ratio = (
             compression_info["compressed_bytes"] / uncompressed_size
             if uncompressed_size > 0

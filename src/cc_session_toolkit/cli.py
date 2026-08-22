@@ -874,8 +874,12 @@ def main() -> None:
     )
     p_archive.add_argument(
         "--gzip", "-z",
-        action="store_true",
-        help="Compress JSONL files with gzip.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compress JSONL files with gzip (the canonical storage "
+             "form; default since 2026-08-22). --no-gzip stores raw — "
+             "raw-only archives are invisible to gz-assuming consumers, "
+             "so prefer the default.",
     )
     p_archive.add_argument(
         "--title", "-t",

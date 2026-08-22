@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -82,7 +83,25 @@ def get_project_name(project_root: Path | None = None) -> str:
             r"^#\s*Project:\s*(.+)$", content, re.MULTILINE | re.IGNORECASE
         )
         if match:
-            return match.group(1).strip()
+            name = match.group(1).strip()
+            # ⚠ Identity guard (2026-08-22). The archive project name IS
+            # an identity: changing it forks the archive silently and
+            # irreversibly, and nothing reconciles the two names
+            # afterwards (map-reader-llm vs vlm-burial-mound-detection,
+            # 204 + 46 sessions split across two trees). A CLAUDE.md
+            # name that differs from the directory name is where every
+            # known fork started, so make the divergence loud at the
+            # moment it acts.
+            if name != root.name:
+                print(
+                    f"  [identity] CLAUDE.md names this project "
+                    f"'{name}' but the directory is '{root.name}' — "
+                    f"archiving under '{name}'. If that is not the "
+                    f"established archive identity, this WILL fork the "
+                    f"archive (renames need an explicit migration).",
+                    file=sys.stderr,
+                )
+            return name
 
     # 2. Try git remote
     try:
