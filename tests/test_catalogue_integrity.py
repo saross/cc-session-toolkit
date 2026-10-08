@@ -10,7 +10,9 @@ archived sessions (47 on amd-tower, 60 on zbook). Three causes:
   two sessions ending together could lose one entry, and a hook killed
   mid-write could truncate the file;
 * a catalogue that failed to parse was replaced by an EMPTY one, keeping
-  only the session being added.
+  only the session being added. (The first fix rebuilt it leniently
+  instead; since review round three of PA #172 it is kept as it is and
+  the update refuses, so recovery is an explicit, strict rebuild.)
 
 (The fourth cause, replication of the catalogue between machines, is fixed
 in personal-assistant's ``daily-sync.sh``.)
@@ -200,14 +202,27 @@ class TestSafeWrites:
         write_catalogue(catalogue_file, {"sessions": []})
         assert (tmp_path / "CATALOG.json.lock").exists()
 
-    def test_unreadable_catalogue_is_rebuilt_not_emptied(self, tmp_path: Path) -> None:
-        """A corrupt catalogue used to be replaced by one holding one session."""
+    def test_unreadable_catalogue_is_kept_and_refused(self, tmp_path: Path) -> None:
+        """A corrupt catalogue is neither emptied nor silently rebuilt.
+
+        The update refuses and leaves the bytes as they are; recovery is the
+        explicit step the error names (move it aside, strict rebuild).
+        """
+        from cc_session_toolkit.catalogue import (
+            CatalogueRebuildRefused,
+            rebuild_and_write_catalogue,
+        )
+
         _entry(tmp_path, "proj/2026-03-02_a", _meta("old1"))
         _entry(tmp_path, "proj/2026-03-02_b", _meta("old2"))
         catalogue_file = tmp_path / "CATALOG.json"
         catalogue_file.write_text('{"sessions": [', encoding="utf-8")  # truncated
 
-        update_catalogue([_meta("new1")], catalogue_file, tmp_path, "proj")
+        with pytest.raises(CatalogueRebuildRefused, match="move it aside"):
+            update_catalogue([_meta("new1")], catalogue_file, tmp_path, "proj")
+        assert catalogue_file.read_text(encoding="utf-8") == '{"sessions": ['
 
+        catalogue_file.rename(tmp_path / "CATALOG.json.corrupt")
+        rebuild_and_write_catalogue(tmp_path, catalogue_file)
         ids = {s["id"] for s in json.loads(catalogue_file.read_text())["sessions"]}
-        assert ids == {"old1", "old2", "new1"}
+        assert ids == {"old1", "old2"}

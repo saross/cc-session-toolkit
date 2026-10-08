@@ -161,23 +161,34 @@ def write_catalogue(catalogue_file: Path, catalogue: dict[str, Any]) -> None:
         _write_json_atomic(catalogue_file, catalogue)
 
 
+#: How to recover from an unreadable catalogue, named in every refusal.
+#: Deliberately a manual step: with no baseline there is nothing to check a
+#: rebuild's identities against, so an operator decides to start afresh.
+_RECOVERY_HINT = (
+    "to recover, move it aside and rebuild (cc-session catalogue --rebuild), "
+    "which then publishes the store as a strict scan finds it"
+)
+
+
 def _read_baseline(catalogue_file: Path) -> dict[str, Any] | None:
     """Return the existing catalogue, *None* if there is none.
 
-    An existing file that cannot be read or parsed raises: an uncertain
-    baseline must stop a rebuild rather than disable its checks.
+    An existing file that cannot be read or parsed raises
+    :class:`CatalogueRebuildRefused` and is left untouched: an uncertain
+    baseline must stop a writer rather than disable its checks. Both the
+    full rebuild and the hooks' incremental updates read through here.
     """
     if not catalogue_file.exists():
         return None
     try:
         data = json.loads(catalogue_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CatalogueRebuildRefused(
-            f"existing catalogue unreadable ({exc}); kept as it is"
+            f"existing catalogue unreadable ({exc}); kept as it is; {_RECOVERY_HINT}"
         ) from exc
     if not isinstance(data, dict) or not isinstance(data.get("sessions"), list):
         raise CatalogueRebuildRefused(
-            "existing catalogue has no sessions list; kept as it is"
+            f"existing catalogue has no sessions list; kept as it is; {_RECOVERY_HINT}"
         )
     return data
 
@@ -189,7 +200,7 @@ def check_rebuild_keeps_entries(
     allow_removed: Collection[str] = (),
 ) -> list[str]:
     """
-    Refuse a rebuild that drops any entry it cannot prove redundant.
+    Refuse a rebuild that drops an entry whose session it cannot still find.
 
     Review 2026-10-08, round two: absence is not evidence of a deliberate
     removal. A partially stale mount can hide directories from both the
@@ -201,10 +212,13 @@ def check_rebuild_keeps_entries(
     * its directory is listed in *allow_removed*: an authorised cleanup
       names exactly the directories it removed; or
     * its session is still catalogued from another directory whose
-      recorded transcript is at least as long (``transcript_bytes``): a
-      redundant duplicate copy, so the session stays findable and nothing
-      is lost. A baseline entry that records no length cannot be proved
-      redundant this way (catalogues written before this field existed).
+      RECORDED transcript length (``transcript_bytes``) is at least as
+      long: the session stays findable through a copy recorded as no
+      shorter. This is a findability and recorded-length check only; it
+      does not prove the two copies hold the same content (the separate
+      archive-integrity checks compare transcripts). A baseline entry that
+      records no length cannot pass it (catalogues written before this
+      field existed).
 
     Entries without a recorded directory (older catalogues) are matched by
     session id, as before. Anything else raises
@@ -212,7 +226,8 @@ def check_rebuild_keeps_entries(
     still holds metadata the scan did not return.
 
     Returns:
-        The directories dropped, as allowed or as redundant duplicates,
+        The directories dropped (named in *allow_removed*, or still
+        findable through a copy recorded as no shorter),
         so the caller can report them.
     """
     if baseline is None:
@@ -252,9 +267,10 @@ def check_rebuild_keeps_entries(
     if lost:
         raise CatalogueRebuildRefused(
             f"{len(lost)} entr{'y' if len(lost) == 1 else 'ies'} would be dropped "
-            f"without proof that {'it is' if len(lost) == 1 else 'they are'} "
-            f"redundant (e.g. {lost[0]}); a missing directory is not evidence of "
-            f"a deliberate removal. Name an authorised removal in allow_removed"
+            f"although {'its session is' if len(lost) == 1 else 'their sessions are'} "
+            f"not catalogued from another copy recorded as no shorter (e.g. "
+            f"{lost[0]}); a missing directory is not evidence of a deliberate "
+            f"removal. Name an authorised removal in allow_removed"
         )
     return dropped
 
@@ -279,10 +295,11 @@ def rebuild_and_write_catalogue(
     temporary file is removed, and the rename is the last step, so the old
     file survives any failure before it).
 
-    Unattended callers pass no *allow_removed*: then no session can leave
-    the index except as a redundant duplicate (see
-    :func:`check_rebuild_keeps_entries`). The directories dropped are
-    printed, so a reconciliation is visible in the caller's log.
+    Unattended callers pass no *allow_removed*: then an entry can leave
+    the index only while its session stays catalogued from a copy recorded
+    as no shorter (see :func:`check_rebuild_keeps_entries`). The
+    directories dropped are printed, so a reconciliation is visible in the
+    caller's log.
     """
     catalogue_file = catalogue_file or archive_dir / "CATALOG.json"
     with catalogue_lock(catalogue_file, timeout=lock_timeout):
@@ -295,8 +312,9 @@ def rebuild_and_write_catalogue(
     if dropped:
         print(
             f"Catalogue rebuild dropped {len(dropped)} entr"
-            f"{'y' if len(dropped) == 1 else 'ies'} (allowed, or a redundant "
-            f"copy of a session still catalogued): {', '.join(dropped[:5])}"
+            f"{'y' if len(dropped) == 1 else 'ies'} (named in allow_removed, or "
+            f"its session still catalogued from a copy recorded as no shorter): "
+            f"{', '.join(dropped[:5])}"
             + (" ..." if len(dropped) > 5 else "")
         )
     return rebuilt
@@ -349,22 +367,18 @@ def _update_catalogue_locked(
     archive_dir: Path,
     project_name: str,
 ) -> None:
-    """Body of :func:`update_catalogue`; the caller holds the lock."""
-    if catalogue_file.exists():
-        try:
-            catalogue = json.loads(
-                catalogue_file.read_text(encoding="utf-8")
-            )
-        except json.JSONDecodeError:
-            # Unreadable (e.g. truncated by a writer killed before writes
-            # became atomic). Rebuild from disk: the old fallback started
-            # an EMPTY catalogue, so every other session vanished from it.
-            print(
-                f"Warning: {catalogue_file} is unreadable; "
-                "rebuilding it from the archive directories"
-            )
-            catalogue = rebuild_catalogue(archive_dir)
-    else:
+    """Body of :func:`update_catalogue`; the caller holds the lock.
+
+    An unreadable catalogue raises :class:`CatalogueRebuildRefused` and is
+    left as it is (review of PA #172, round three). This used to fall back
+    to a LENIENT rebuild, which skipped any other unreadable metadata and
+    published the partial result as valid JSON; the next scheduled rebuild
+    then took that partial file as its baseline and could not see what it
+    had lost. The session's own metadata is already on disk, so nothing is
+    lost by refusing: recovery is the explicit step the error names.
+    """
+    catalogue = _read_baseline(catalogue_file)
+    if catalogue is None:
         catalogue = {"schema_version": SCHEMA_VERSION, "sessions": []}
 
     existing_ids = {s["id"] for s in catalogue["sessions"]}
@@ -445,9 +459,10 @@ def update_catalogue_entry(
         catalogue_file: Path to ``CATALOG.json``.
     """
     with catalogue_lock(catalogue_file):
-        if not catalogue_file.exists():
+        # Raises, leaving the file as it is, when it cannot be read.
+        catalogue = _read_baseline(catalogue_file)
+        if catalogue is None:
             return
-        catalogue = json.loads(catalogue_file.read_text(encoding="utf-8"))
         _apply_entry_update(catalogue, session_id, meta)
         _write_json_atomic(catalogue_file, catalogue)
 
@@ -481,8 +496,8 @@ def _apply_entry_update(
     (``_archive_directory``, set by ``archive_session``) when one matches,
     else the session's first (preferred) copy, as before. Matching the
     directory matters for ``transcript_bytes``: crediting one copy with
-    another's length would let a later rebuild treat a longer copy as a
-    redundant duplicate of a shorter one.
+    another's length would let a later rebuild drop a longer copy while
+    only a shorter one stays catalogued.
     """
     matches = [
         s for s in catalogue.get("sessions", [])
@@ -689,9 +704,10 @@ def rebuild_catalogue(
             "subagent_cost_usd": subagents_summary.get(
                 "estimated_cost_usd", 0.0
             ),
-            # The uncompressed transcript length the record claims (0 when
-            # it records none). The next rebuild uses it to tell a redundant
-            # duplicate copy from a lost session.
+                    # The uncompressed transcript length the record claims (0 when
+            # it records none). The next rebuild compares it to decide
+            # whether a vanished copy's session stays findable through a
+            # copy recorded as no shorter.
             "transcript_bytes": _recorded_bytes(meta),
         }
         catalogue["sessions"].append(session_entry)

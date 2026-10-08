@@ -11,6 +11,7 @@ import json
 import sys
 import time
 from datetime import date, datetime
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +70,27 @@ def cmd_init(args: argparse.Namespace) -> None:
         project_name=args.project_name,
         update=args.update,
     )
+
+
+def _hook_catalogue_update(update: Callable[[], None], session_id: str, where: str) -> None:
+    """Run a hook's final catalogue update; on a refusal, say so and exit 1.
+
+    By this point the session is archived and its ``session.meta.json`` is
+    on disk, so a refused update loses no record. It must not pass
+    silently either (review of PA #172, round three): an unreadable
+    catalogue is now left as it is rather than rebuilt leniently, and a
+    lock that cannot be taken fails closed. The message goes to stderr and
+    the hook exits non-zero, so the failure is visible where the hook ran.
+    """
+    try:
+        update()
+    except (CatalogueRebuildRefused, CatalogueLockError) as exc:
+        print(
+            f"Warning: session {session_id} is archived ({where}) but NOT "
+            f"catalogued: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def _cmd_archive_from_hook(args: argparse.Namespace) -> None:
@@ -180,7 +202,10 @@ def _cmd_archive_from_hook(args: argparse.Namespace) -> None:
             ),
         )
         if result:
-            update_catalogue_entry(session_id, result, catalogue_file)
+            _hook_catalogue_update(
+                lambda: update_catalogue_entry(session_id, result, catalogue_file),
+                session_id, str(plan.dest_dir),
+            )
             print(f"Superseded: {session_id} → {plan.dest_dir}")
         return
 
@@ -206,8 +231,12 @@ def _cmd_archive_from_hook(args: argparse.Namespace) -> None:
     )
 
     if result:
-        update_catalogue(
-            [result], catalogue_file, archive_root, project_name
+        where = str(result.get("_archive_directory") or project_name)
+        _hook_catalogue_update(
+            lambda: update_catalogue(
+                [result], catalogue_file, archive_root, project_name
+            ),
+            session_id, where,
         )
         print(f"Archived: {session_id} → {project_name}")
 
@@ -1184,8 +1213,8 @@ def main() -> None:
             "With --rebuild: a file listing, one per line, the archive "
             "directories (relative to the archive root) an authorised "
             "cleanup removed. Without it a rebuild refuses to drop any "
-            "entry that is not a redundant copy of a session still "
-            "catalogued."
+            "entry unless its session stays catalogued from a copy "
+            "recorded as no shorter."
         ),
     )
     p_catalogue.set_defaults(func=cmd_catalogue)

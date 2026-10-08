@@ -5,6 +5,8 @@ Tests for the catalogue fixes from Astra's review of PA #172 (2026-10-08).
   write, so an incremental update made meanwhile is never overwritten.
 * P1: the lock fails closed; a strict scan refuses unreadable metadata;
   an unreadable baseline stops the rebuild.
+* Round three: the hooks' incremental update no longer rebuilds an
+  unreadable catalogue leniently; it refuses and keeps the file.
 * Round two (F2): absence is not evidence of removal. An entry may leave
   only when an authorised cleanup names it (``allow_removed``) or it is a
   redundant copy of a session still catalogued from a copy at least as
@@ -231,6 +233,59 @@ class TestIdentityCheck:
         rebuilt = {"sessions": [{"id": "A", "directory": "proj/a", "transcript_bytes": 1}]}
         with pytest.raises(CatalogueRebuildRefused, match="session B"):
             check_rebuild_keeps_entries(baseline, rebuilt)
+
+
+class TestIncrementalUpdateKeepsAnUnreadableCatalogue:
+    """Round three: no unattended lenient recovery on the hook path.
+
+    The old fallback rebuilt a corrupt catalogue with a LENIENT scan, which
+    skips unreadable metadata, and published the partial result as valid
+    JSON; the next scheduled rebuild then trusted it as its baseline.
+    """
+
+    CORRUPT = '{"sessions": ['
+
+    def _store(self, root: Path, *, bad_sibling: bool) -> Path:
+        _entry(root, "proj/2026-03-02_a", "A", recorded=10)
+        if bad_sibling:
+            (root / "proj/2026-03-03_bad").mkdir(parents=True)
+            (root / "proj/2026-03-03_bad/session.meta.json").write_text("{trunc")
+        cat = root / "CATALOG.json"
+        cat.write_text(self.CORRUPT)
+        return cat
+
+    @pytest.mark.parametrize("bad_sibling", [True, False])
+    def test_update_refuses_and_keeps_the_bytes(
+        self, tmp_path: Path, bad_sibling: bool,
+    ) -> None:
+        cat = self._store(tmp_path, bad_sibling=bad_sibling)
+        new = json.loads((_entry(tmp_path, "proj/2026-03-04_n", "N", recorded=5)
+                          / "session.meta.json").read_text())
+        new["_archive_directory"] = str(tmp_path / "proj/2026-03-04_n")
+        with pytest.raises(CatalogueRebuildRefused, match="unreadable"):
+            update_catalogue([new], cat, tmp_path, "proj")
+        assert cat.read_text() == self.CORRUPT
+        assert not list(tmp_path.glob("CATALOG.json.*.tmp"))
+
+    def test_a_wrong_shape_is_refused_too(self, tmp_path: Path) -> None:
+        cat = tmp_path / "CATALOG.json"
+        cat.write_text('{"sessions": "not-a-list"}')
+        with pytest.raises(CatalogueRebuildRefused, match="no sessions list"):
+            update_catalogue([], cat, tmp_path, "proj")
+        assert cat.read_text() == '{"sessions": "not-a-list"}'
+
+    def test_entry_update_refuses_and_keeps_the_bytes(self, tmp_path: Path) -> None:
+        cat = self._store(tmp_path, bad_sibling=True)
+        with pytest.raises(CatalogueRebuildRefused):
+            update_catalogue_entry("A", {"auto_generated": {"title": "t"}}, cat)
+        assert cat.read_text() == self.CORRUPT
+
+    def test_a_missing_catalogue_is_still_created(self, tmp_path: Path) -> None:
+        cat = tmp_path / "CATALOG.json"
+        meta = json.loads((_entry(tmp_path, "proj/2026-03-04_n", "N", recorded=5)
+                           / "session.meta.json").read_text())
+        update_catalogue([meta], cat, tmp_path, "proj")
+        assert [s["id"] for s in json.loads(cat.read_text())["sessions"]] == ["N"]
 
 
 class TestRecordedLength:
