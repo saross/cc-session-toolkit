@@ -131,3 +131,48 @@ def sample_session_jsonl(tmp_path: Path) -> Path:
     lines = [json.dumps(entry) for entry in entries]
     session_file.write_text("\n".join(lines) + "\n")
     return session_file
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register the marker that opts a test into the OpenAI extractor."""
+    config.addinivalue_line(
+        "markers",
+        "openai_provider: run with the OpenAI extractor primary (network stubbed)",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_extractor(
+    request: pytest.FixtureRequest,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep every test off the network and out of the real metadata log.
+
+    * The auto-metadata log goes to a temporary directory. Tests used to
+      append to the real ``data/logs/auto-metadata.log`` (54 fake lines
+      found there on 2026-10-08).
+    * The extractor is pinned to Gemini with no fallback, the path the
+      tests written before 2026-10-08 exercise. Tests marked
+      ``openai_provider`` keep the production provider order instead.
+    * OpenAI requests and key lookups are stubbed for every test, so none
+      can reach the network or read a real key; OpenAI tests replace
+      ``_openai_post`` with a fake response.
+    """
+    from cc_session_toolkit import archive, config
+
+    monkeypatch.setenv("CC_SESSION_LOG_DIR", str(tmp_path_factory.mktemp("logs")))
+
+    def _blocked(*_args: object, **_kwargs: object) -> dict:
+        raise AssertionError("network blocked in tests: stub archive._openai_post")
+
+    monkeypatch.setattr(archive, "_openai_post", _blocked)
+    monkeypatch.setattr(archive, "_ensure_openai_api_key", lambda: "test-openai-key")
+    if request.node.get_closest_marker("openai_provider") is None:
+        monkeypatch.setattr(archive, "EXTRACTOR_PROVIDER", "gemini")
+        monkeypatch.setattr(archive, "EXTRACTOR_FALLBACK_PROVIDER", None)
+        monkeypatch.setattr(config, "EXTRACTOR_PROVIDER", "gemini")
+    else:
+        monkeypatch.setattr(archive, "EXTRACTOR_PROVIDER", "openai")
+        monkeypatch.setattr(archive, "EXTRACTOR_FALLBACK_PROVIDER", "gemini")
+        monkeypatch.setattr(config, "EXTRACTOR_PROVIDER", "openai")
