@@ -172,6 +172,12 @@ def _isolate_extractor(
         monkeypatch.setattr(archive, "EXTRACTOR_PROVIDER", "gemini")
         monkeypatch.setattr(archive, "EXTRACTOR_FALLBACK_PROVIDER", None)
         monkeypatch.setattr(config, "EXTRACTOR_PROVIDER", "gemini")
+        # The primary's defaults follow the pin, as they would in production.
+        for module in (archive, config):
+            monkeypatch.setattr(module, "EXTRACTOR_MODEL_ID", config.GEMINI_EXTRACTOR_MODEL_ID)
+            monkeypatch.setattr(
+                module, "EXTRACTOR_THINKING_LEVEL", config.AUTO_METADATA_THINKING_LEVEL
+            )
     else:
         monkeypatch.setattr(archive, "EXTRACTOR_PROVIDER", "openai")
         monkeypatch.setattr(archive, "EXTRACTOR_FALLBACK_PROVIDER", "gemini")

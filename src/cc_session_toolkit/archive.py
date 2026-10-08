@@ -41,6 +41,7 @@ from cc_session_toolkit.config import (
     EXTRACTOR_THINKING_LEVEL,
     GEMINI_EXTRACTOR_MODEL_ID,
     MAX_SUBAGENT_SUMMARIES,
+    OPENAI_CACHE_WRITE_PRICE_PER_MTOK,
     OPENAI_CACHED_INPUT_PRICE_PER_MTOK,
     OPENAI_EXTRACTOR_MODEL_ID,
     OPENAI_INPUT_PRICE_PER_MTOK,
@@ -843,7 +844,7 @@ def _openai_key_names(hostname: str | None = None) -> list[str]:
     import socket
 
     names = [f"OPENAI_API_KEY_{OPENAI_KEY_ROLE}"]
-    suffix = os.environ.get("OPENAI_KEY_SUFFIX")
+    suffix = (os.environ.get("OPENAI_KEY_SUFFIX") or "").strip().upper()
     if not suffix:
         host = (hostname if hostname is not None else socket.gethostname()).lower()
         for fragment, candidate in OPENAI_KEY_HOST_SUFFIXES:
@@ -867,7 +868,9 @@ def _ensure_openai_api_key() -> str | None:
 
     names = _openai_key_names()
     for name in names:
-        value = os.environ.get(name)
+        # Stripped: a trailing CR/LF (a CRLF .env sourced into the shell)
+        # would otherwise make the HTTP header invalid.
+        value = (os.environ.get(name) or "").strip()
         if value:
             return value
 
@@ -895,20 +898,27 @@ def openai_cost_usd(
     input_tokens: int,
     output_tokens: int,
     cached_input_tokens: int = 0,
+    cache_write_tokens: int = 0,
 ) -> float:
     """
     List-price cost in USD of one standard-tier GPT-6 Luna request.
 
-    A prompt above ``OPENAI_LONG_PROMPT_THRESHOLD_TOKENS`` moves the whole
-    request to the long-prompt rates (2x input, 1.5x output). Output
-    tokens include reasoning tokens, as OpenAI bills them.
+    Input splits three ways: cache reads (``cached_input_tokens``), cache
+    writes (billed at 1.25x input; nearly all of an uncached Luna prompt),
+    and the rest at the plain input rate. A prompt above
+    ``OPENAI_LONG_PROMPT_THRESHOLD_TOKENS`` moves the whole request to the
+    long-prompt rates (2x every input rate, 1.5x output). Output tokens
+    include reasoning tokens, as OpenAI bills them.
     """
     long_prompt = input_tokens > OPENAI_LONG_PROMPT_THRESHOLD_TOKENS
     in_mult = OPENAI_LONG_PROMPT_INPUT_MULTIPLIER if long_prompt else 1.0
     out_mult = OPENAI_LONG_PROMPT_OUTPUT_MULTIPLIER if long_prompt else 1.0
     cached = min(max(cached_input_tokens, 0), input_tokens)
+    written = min(max(cache_write_tokens, 0), input_tokens - cached)
+    plain = input_tokens - cached - written
     return (
-        (input_tokens - cached) * OPENAI_INPUT_PRICE_PER_MTOK * in_mult
+        plain * OPENAI_INPUT_PRICE_PER_MTOK * in_mult
+        + written * OPENAI_CACHE_WRITE_PRICE_PER_MTOK * in_mult
         + cached * OPENAI_CACHED_INPUT_PRICE_PER_MTOK * in_mult
         + output_tokens * OPENAI_OUTPUT_PRICE_PER_MTOK * out_mult
     ) / 1_000_000
@@ -971,6 +981,15 @@ def _openai_post(
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:500]
         raise OpenAIRequestError(exc.code, detail) from exc
+    except ValueError as exc:
+        # http.client rejects an invalid header value with a message that
+        # quotes the header, i.e. the key. Never let that reach a log.
+        if "header" in str(exc).lower():
+            raise RuntimeError(
+                "OpenAI request rejected locally: invalid header value "
+                "(check the key for stray characters)"
+            ) from None
+        raise
 
 
 def _openai_count_tokens(text: str, *, api_key: str) -> int:
@@ -1063,7 +1082,9 @@ def _call_openai_once(
     usage = payload.get("usage") or {}
     in_tok = usage.get("input_tokens")
     out_tok = usage.get("output_tokens")
-    cached = (usage.get("input_tokens_details") or {}).get("cached_tokens") or 0
+    in_details = usage.get("input_tokens_details") or {}
+    cached = in_details.get("cached_tokens") or 0
+    cache_written = in_details.get("cache_write_tokens") or 0
     reasoning = (usage.get("output_tokens_details") or {}).get("reasoning_tokens") or 0
     if _EXTRACTOR_CALL_OBSERVER is not None:
         known = isinstance(in_tok, int) and isinstance(out_tok, int)
@@ -1072,10 +1093,12 @@ def _call_openai_once(
             "model": payload.get("model") or OPENAI_EXTRACTOR_MODEL_ID,
             "input_tokens_charged": in_tok,
             "cached_input_tokens": cached,
+            "cache_write_tokens": cache_written,
             "output_tokens": out_tok,
             "reasoning_tokens": reasoning,
             "cost_usd": (
-                round(openai_cost_usd(in_tok, out_tok, cached), 6) if known else None
+                round(openai_cost_usd(in_tok, out_tok, cached, cache_written), 6)
+                if known else None
             ),
             "cost_unknown_reason": None if known else "usage missing on response",
             "wall_seconds": wall_seconds,
@@ -1141,7 +1164,21 @@ def _call_openai_with_retry(
                 raise
         except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
             last_exc = exc
+            if _network_unreachable(exc):
+                # No DNS or connection refused (offline, in the field):
+                # waiting will not help, and a hook that sleeps for minutes
+                # leaves the session looking unarchived to the next hook.
+                raise
     raise RuntimeError(f"OpenAI failed after {len(waits)} attempts: {last_exc}")
+
+
+def _network_unreachable(exc: BaseException) -> bool:
+    """True for errors that mean the API host cannot be reached at all."""
+    import socket
+    import urllib.error
+
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    return isinstance(reason, (socket.gaierror, ConnectionRefusedError))
 
 
 def _extractor_providers() -> list[str]:
@@ -1208,9 +1245,9 @@ def _gemini_client_for_extraction(context: str) -> tuple[Any | None, str | None]
     """
     Build a Gemini client, or explain why not.
 
-    Returns ``(client, None)`` or ``(None, reason)``. The client serves the
-    free token counter that sizes every transcript, and the Gemini
-    provider itself.
+    Returns ``(client, None)`` or ``(None, reason)``. The client is the
+    Gemini provider, and Gemini's token counter when Gemini is primary
+    (see :func:`_token_counter_for_primary`).
     """
     try:
         from google import genai  # noqa: WPS433 — optional dependency
@@ -1238,9 +1275,10 @@ def generate_auto_metadata(
     default) with ``EXTRACTOR_FALLBACK_PROVIDER`` (Gemini) behind it; see
     :func:`_call_extractor`. The returned dict carries a private
     ``_extractor`` entry naming the model that answered, which callers pop
-    into the record's provenance fields. Gemini's free token counter sizes
-    the transcript for every provider; without it the chars-per-token
-    heuristic is used.
+    into the record's provenance fields. The transcript is sized with the
+    PRIMARY provider's token counter, so it reaches only the company that
+    summarises it (Google only if the Gemini fallback runs); without a
+    counter the chars-per-token heuristic is used.
 
     Architecture (2026-05-18 bake-off winner; refined 2026-05-22 + 2026-05-23):
     - Full distilled transcript via
@@ -1277,10 +1315,9 @@ def generate_auto_metadata(
         Dictionary with ``title``, ``purpose``, ``tags``, and
         ``three_ps`` keys, or *None* on failure.
     """
-    # Gemini serves the free token counter for every provider and is itself
-    # a provider (2026-10-08). When it is the PRIMARY provider, a missing
-    # client ends the attempt exactly as before; otherwise extraction goes
-    # on with the heuristic token counter and without a Gemini fallback.
+    # Gemini is a provider (2026-10-08). When it is the PRIMARY provider, a
+    # missing client ends the attempt exactly as before; otherwise
+    # extraction goes on without a Gemini fallback.
     gemini_required = EXTRACTOR_PROVIDER == "gemini"
     client: Any | None = None
     try:
@@ -1673,8 +1710,7 @@ def generate_subagent_summaries(
         subagents = subagents[:MAX_SUBAGENT_SUMMARIES]
 
     # As in generate_auto_metadata (2026-10-08): Gemini is required only
-    # when it is the primary provider; otherwise it serves the token counter
-    # when available and the heuristic stands in when not.
+    # when it is the primary provider; otherwise it is only the fallback.
     client, gemini_problem = _gemini_client_for_extraction("subagent summaries")
     if client is None:
         if EXTRACTOR_PROVIDER == "gemini":
@@ -2809,8 +2845,14 @@ def archive_session(
     to_summarise = [
         s for s in subagents if s.get("agent_id") not in prior_summaries
     ]
+    # Carried summaries keep their own label; entries written before
+    # 2026-10-08 have none, and take the prior record's, whose writer
+    # produced them in the same run.
     carried_summaries = [
-        prior_summaries[s["agent_id"]]
+        {
+            "extractor_model_id": (prior_metadata or {}).get("extractor_model_id"),
+            **prior_summaries[s["agent_id"]],
+        }
         for s in subagents
         if s.get("agent_id") in prior_summaries
     ]

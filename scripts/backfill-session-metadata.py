@@ -56,6 +56,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from cc_session_toolkit.archive import (  # noqa: E402
     _ensure_gemini_api_key,
+    _ensure_openai_api_key,
+    _extractor_providers,
+    _openai_key_names,
     _log_metadata_event,
     generate_auto_metadata,
     generate_subagent_summaries,
@@ -348,7 +351,10 @@ def _per_session_cost(input_tokens: int) -> float:
     if EXTRACTOR_PROVIDER == "openai":
         from cc_session_toolkit.archive import openai_cost_usd
 
-        return openai_cost_usd(input_tokens, expected_output_tokens)
+        # Luna writes nearly all of an uncached prompt to cache (1.25x).
+        return openai_cost_usd(
+            input_tokens, expected_output_tokens, cache_write_tokens=input_tokens
+        )
     return (
         (input_tokens / 1_000_000) * GEMINI_FLEX_INPUT_PRICE_PER_MTOK
         + (expected_output_tokens / 1_000_000)
@@ -503,7 +509,9 @@ def _estimate_total_cost(meta_paths: list[Path], sample_size: int) -> str:
     p50 = samples_sorted[len(samples_sorted) // 2]
     p90 = samples_sorted[int(len(samples_sorted) * 0.9)]
     sample_max = max(samples)
-    mean_cost = _per_session_cost(int(mean))
+    # Price each sample and average the costs: Luna's rates step up above
+    # 272K tokens, so the cost of the mean session is not the mean cost.
+    mean_cost = sum(_per_session_cost(s) for s in samples) / len(samples)
     p90_cost = _per_session_cost(p90)
     max_cost = _per_session_cost(sample_max)
     parent_total = mean_cost * len(meta_paths)
@@ -808,13 +816,30 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Ensure API key is available before starting.
-    if not _ensure_gemini_api_key():
+    # Ensure the PRIMARY provider's key is available before starting
+    # (2026-10-08). A missing OpenAI key would otherwise send the whole paid
+    # run to the Gemini fallback, at Gemini's price, while the dry run
+    # quoted Luna's. A missing fallback key only warns.
+    from cc_session_toolkit.config import EXTRACTOR_PROVIDER
+
+    providers = _extractor_providers()
+    print(f"Extractor providers, in order: {' then '.join(providers)}")
+    if EXTRACTOR_PROVIDER == "openai" and not _ensure_openai_api_key():
         print(
-            "Error: neither GEMINI_API_KEY nor GOOGLE_API_KEY found "
-            "in environment or ~/personal-assistant/.env"
+            "Error: no OpenAI key for the primary extractor; looked for "
+            f"{', '.join(_openai_key_names())} in the environment and "
+            "~/personal-assistant/.env"
         )
         sys.exit(1)
+    if not _ensure_gemini_api_key():
+        if EXTRACTOR_PROVIDER == "gemini":
+            print(
+                "Error: neither GEMINI_API_KEY nor GOOGLE_API_KEY found "
+                "in environment or ~/personal-assistant/.env"
+            )
+            sys.exit(1)
+        if "gemini" in providers:
+            print("Warning: no Gemini key; the Gemini fallback is unavailable.")
 
     if args.upgrade_to_v13:
         sessions = find_sessions_needing_v13_upgrade(args.archive_root)

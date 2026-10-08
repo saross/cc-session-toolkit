@@ -436,3 +436,219 @@ def test_long_prompt_cost_uses_the_higher_rates() -> None:
     long = archive.openai_cost_usd(272_001, 1000)
     assert short == pytest.approx((272_000 * 0.10 + 1000 * 0.50) / 1e6)
     assert long == pytest.approx((272_001 * 0.20 + 1000 * 0.75) / 1e6)
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups (2026-10-08)
+# ---------------------------------------------------------------------------
+
+# The real request function, saved before the autouse fixture stubs it.
+REAL_OPENAI_POST = archive._openai_post
+
+
+def test_cache_writes_are_billed_at_1_25x() -> None:
+    """Luna writes nearly all of an uncached prompt to cache (1.25x input)."""
+    cost = archive.openai_cost_usd(100_000, 1000, cache_write_tokens=90_000)
+    assert cost == pytest.approx((10_000 * 0.10 + 90_000 * 0.125 + 1000 * 0.50) / 1e6)
+    long = archive.openai_cost_usd(300_000, 1000, cached_input_tokens=10_000,
+                                   cache_write_tokens=280_000)
+    assert long == pytest.approx(
+        (10_000 * 0.20 + 280_000 * 0.25 + 10_000 * 0.02 + 1000 * 0.75) / 1e6
+    )
+
+
+def test_observer_prices_cache_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[dict[str, Any]] = []
+    monkeypatch.setattr(archive, "_EXTRACTOR_CALL_OBSERVER", seen.append)
+    body = _payload("{}")
+    body["usage"]["input_tokens_details"]["cache_write_tokens"] = 900
+    monkeypatch.setattr(archive, "_openai_post", FakePost(body))
+    archive._call_openai_once("u", "s", None, api_key="k")
+    assert seen[0]["cache_write_tokens"] == 900
+    assert seen[0]["cost_usd"] == pytest.approx(
+        archive.openai_cost_usd(1000, 200, 0, 900), abs=1e-6  # rounded to 6 dp
+    )
+
+
+class TestRequestErrors:
+    def test_http_error_becomes_openai_request_error(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import io
+        import urllib.error
+        import urllib.request
+
+        def _raise(*_a: Any, **_k: Any) -> Any:
+            raise urllib.error.HTTPError(
+                archive.OPENAI_RESPONSES_URL, 429, "Too Many Requests", {},
+                io.BytesIO(b'{"error": {"code": "rate_limit_exceeded"}}'),
+            )
+
+        monkeypatch.setattr(urllib.request, "urlopen", _raise)
+        with pytest.raises(archive.OpenAIRequestError) as info:
+            REAL_OPENAI_POST({"model": "m"}, "sk-test-secret", 5)
+        assert info.value.status == 429
+        assert "rate_limit_exceeded" in info.value.detail
+        assert "sk-test-secret" not in str(info.value)
+
+    def test_invalid_key_characters_never_reach_the_message(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import http.client
+
+        def _no_connect(self: Any) -> None:
+            raise AssertionError("must fail before connecting")
+
+        monkeypatch.setattr(http.client.HTTPSConnection, "connect", _no_connect)
+        with pytest.raises(RuntimeError) as info:
+            REAL_OPENAI_POST({"model": "m"}, "sk-test-secret\n", 5)
+        assert "sk-test-secret" not in str(info.value)
+        assert info.value.__cause__ is None and info.value.__suppress_context__
+
+
+class TestRetryLimits:
+    def test_persistent_server_error_stops_after_all_attempts(
+        self, monkeypatch: pytest.MonkeyPatch, no_sleep: None,
+    ) -> None:
+        attempts = len(archive.OPENAI_RETRY_WAITS_SECONDS) + 1
+        fake = FakePost(*[archive.OpenAIRequestError(503, "busy")] * attempts)
+        monkeypatch.setattr(archive, "_openai_post", fake)
+        with pytest.raises(RuntimeError, match="after"):
+            archive._call_openai_with_retry("u", "s", None, api_key="k")
+        assert len(fake.bodies) == attempts
+
+    def test_unreachable_host_fails_fast(
+        self, monkeypatch: pytest.MonkeyPatch, no_sleep: None,
+    ) -> None:
+        import socket
+        import urllib.error
+
+        fake = FakePost(urllib.error.URLError(socket.gaierror(-2, "Name or service not known")))
+        monkeypatch.setattr(archive, "_openai_post", fake)
+        with pytest.raises(urllib.error.URLError):
+            archive._call_openai_with_retry("u", "s", None, api_key="k")
+        assert len(fake.bodies) == 1
+
+    def test_timeout_is_retried(
+        self, monkeypatch: pytest.MonkeyPatch, no_sleep: None,
+    ) -> None:
+        fake = FakePost(TimeoutError("timed out"), _payload("{}"))
+        monkeypatch.setattr(archive, "_openai_post", fake)
+        assert archive._call_openai_with_retry("u", "s", None, api_key="k") == "{}"
+        assert len(fake.bodies) == 2
+
+
+class TestKeyOrder:
+    @pytest.fixture()
+    def env_file(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+        import os
+
+        for name in list(os.environ):
+            if name.startswith("OPENAI_"):
+                monkeypatch.delenv(name)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        (tmp_path / "personal-assistant").mkdir()
+        path = tmp_path / "personal-assistant" / ".env"
+        path.write_text("OPENAI_API_KEY_PA_AMDT=file-key\n", encoding="utf-8")
+        return path
+
+    def test_environment_wins_over_the_file(
+        self, env_file: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("OPENAI_KEY_SUFFIX", "AMDT")
+        monkeypatch.setenv("OPENAI_API_KEY_PA_AMDT", "env-key\r\n")
+        assert REAL_ENSURE_OPENAI_API_KEY() == "env-key"
+
+    def test_hostname_selects_the_suffix(
+        self, env_file: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import socket
+
+        monkeypatch.setattr(socket, "gethostname", lambda: "AMD-tower-ubuntu")
+        assert REAL_ENSURE_OPENAI_API_KEY() == "file-key"
+
+    def test_suffix_is_case_insensitive(
+        self, env_file: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("OPENAI_KEY_SUFFIX", "amdt")
+        assert REAL_ENSURE_OPENAI_API_KEY() == "file-key"
+
+
+@pytest.mark.openai_provider
+def test_subagent_summaries_send_google_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """With Luna primary the subagent path never calls Gemini either."""
+    import gzip
+    from unittest.mock import patch
+
+    pytest.importorskip("google.genai")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    dest = tmp_path / "entry"
+    (dest / "subagents").mkdir(parents=True)
+    with gzip.open(dest / "subagents" / "agent-a1.jsonl.gz", "wt", encoding="utf-8") as fh:
+        fh.write(json.dumps({"type": "user", "isSidechain": True, "agentId": "a1",
+                             "message": {"role": "user", "content": "Go " * 100}}) + "\n")
+        fh.write(json.dumps({"type": "assistant", "isSidechain": True, "agentId": "a1",
+                             "message": {"role": "assistant",
+                                         "content": [{"type": "text", "text": "Done " * 100}]}})
+                 + "\n")
+    fake = FakePost(_payload(json.dumps({"narrative": "It did the thing."})))
+    monkeypatch.setattr(archive, "_openai_post", fake)
+
+    with patch("google.genai.Client") as MockClient:
+        gemini = MockClient.return_value
+        summaries = archive.generate_subagent_summaries(
+            dest_dir=dest,
+            subagents=[{"agent_id": "a1", "archive_path": "subagents/agent-a1.jsonl.gz"}],
+            parent_session_id="p",
+        )
+
+    assert summaries == [{"agent_id": "a1", "narrative": "It did the thing.",
+                          "extractor_model_id": OPENAI_EXTRACTOR_MODEL_ID}]
+    gemini.models.count_tokens.assert_not_called()
+    gemini.models.generate_content.assert_not_called()
+
+
+def test_carried_subagent_summaries_take_the_prior_label(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Unlabelled summaries carried into a Luna-written record keep their writer."""
+    from tests.test_subagent_archive import _write_parent_jsonl, _write_subagent_jsonl
+
+    sid = "abc12345-1234-5678-9abc-def012345678"
+    proj = tmp_path / "-home-shawn-test-project"
+    proj.mkdir()
+    parent = proj / f"{sid}.jsonl"
+    _write_parent_jsonl(parent, sid, [{"tool_use_id": "toolu_01AAAA",
+                                       "subagent_type": "Explore", "prompt": "Audit it."}])
+    sub = proj / sid / "subagents"
+    sub.mkdir(parents=True)
+    _write_subagent_jsonl(sub / "agent-a1a1a1a1a1.jsonl", "a1a1a1a1a1", sid,
+                          first_prompt="Audit it.", parent_uuid="parent-user-0", extra_turns=2)
+
+    luna = {"model_id": OPENAI_EXTRACTOR_MODEL_ID, "thinking_level": OPENAI_REASONING_EFFORT}
+    monkeypatch.setattr(archive, "generate_auto_metadata",
+                        lambda *_a, **_k: dict(PARENT_RESULT, _extractor=luna))
+    monkeypatch.setattr(archive, "generate_subagent_summaries",
+                        lambda **_k: [{"agent_id": "a1a1a1a1a1", "narrative": "old"}])
+    root = tmp_path / "cc-archives"
+    root.mkdir()
+    first = archive.archive_session(parent, None, stats_only=True, archive_root=root,
+                                    project_name_override="proj", auto_metadata=True,
+                                    capture_type="session_end", session_id_override=sid)
+    dest = Path(first["_archive_directory"])
+    prior = json.loads((dest / "session.meta.json").read_text())
+    prior["extractor_model_id"] = "gemini-3.5-flash"  # the old writer
+    prior["subagent_summaries"] = [{"agent_id": "a1a1a1a1a1", "narrative": "old"}]
+
+    archive.archive_session(parent, None, stats_only=True, archive_root=root,
+                            project_name_override="proj", auto_metadata=True,
+                            capture_type="session_end", session_id_override=sid,
+                            existing_dest_dir=dest, prior_metadata=prior,
+                            regenerate_metadata=True)
+
+    after = json.loads((dest / "session.meta.json").read_text())
+    assert after["extractor_model_id"] == OPENAI_EXTRACTOR_MODEL_ID
+    assert after["subagent_summaries"] == [{"agent_id": "a1a1a1a1a1", "narrative": "old",
+                                            "extractor_model_id": "gemini-3.5-flash"}]

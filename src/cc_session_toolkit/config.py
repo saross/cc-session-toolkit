@@ -85,8 +85,9 @@ AUTO_METADATA_THINKING_LEVEL = "medium"
 # ``data/experiments/extractor-comparison-2026-10-08/report.md``): topic
 # coverage matched 3.8-medium (62 vs 61 of 64; side topics in long sessions
 # 20 vs 19 of 22), every one of its 44 quotes was verbatim (3.8: 33 of 35,
-# two with added punctuation), and at standard tier it cost about a third
-# of 3.8 Flex (US$0.29 vs US$0.81 for the 10 sessions) at a median 14 s
+# two with added punctuation), and at standard tier it cost under half of
+# 3.8 Flex (US$0.36 vs US$0.81 for the 10 sessions; the comparison logged
+# US$0.29 because it priced cache writes as plain input) at a median 14 s
 # against 33 s. Standard tier is never preempted, which removes the Flex
 # 503s that left 25 sessions with placeholder metadata.
 #
@@ -147,6 +148,12 @@ OPENAI_SESSION_TOKEN_BUDGET = 720_000
 # request. Output prices include reasoning tokens.
 OPENAI_INPUT_PRICE_PER_MTOK = 0.10
 OPENAI_CACHED_INPUT_PRICE_PER_MTOK = 0.01
+# Cache writes are billed at 1.25x the uncached input rate (same page).
+# Luna writes nearly all of an uncached prompt to cache: in the comparison,
+# 330,332 of one session's 339,922 input tokens (review of this branch,
+# 2026-10-08), so this rate, not the plain input rate, is the one that
+# usually applies.
+OPENAI_CACHE_WRITE_PRICE_PER_MTOK = 0.125
 OPENAI_OUTPUT_PRICE_PER_MTOK = 0.50
 OPENAI_LONG_PROMPT_THRESHOLD_TOKENS = 272_000
 OPENAI_LONG_PROMPT_INPUT_MULTIPLIER = 2.0

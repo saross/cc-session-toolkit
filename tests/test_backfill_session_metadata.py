@@ -558,12 +558,36 @@ class TestOpenAIEstimates:
         from cc_session_toolkit.archive import openai_cost_usd
 
         backfill = _load_backfill_module()
-        assert backfill._per_session_cost(100_000) == pytest.approx(
-            openai_cost_usd(100_000, 1500)
-        )
-        assert backfill._per_session_cost(400_000) == pytest.approx(
-            openai_cost_usd(400_000, 1500)
-        )
+        # Luna writes nearly all of an uncached prompt to cache (1.25x).
+        for tokens in (100_000, 400_000):
+            assert backfill._per_session_cost(tokens) == pytest.approx(
+                openai_cost_usd(tokens, 1500, cache_write_tokens=tokens)
+            )
+
+    def test_mean_cost_prices_each_sample(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Luna's 272K price step: the cost of the mean is not the mean cost."""
+        backfill = _load_backfill_module()
+        samples = [50_000, 492_000]
+        monkeypatch.setattr(backfill, "_sample_distilled_token_counts",
+                            lambda paths, n: samples)
+        monkeypatch.setattr(backfill, "_sample_subagent_counts", lambda paths: [0, 0])
+        text = backfill._estimate_total_cost([Path("a"), Path("b")], 2)
+        expected = sum(backfill._per_session_cost(t) for t in samples)
+        assert f"parent total (mean × 2): ~${expected:.2f}" in text
+
+    def test_missing_openai_key_stops_the_run(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """A missing primary key must not silently send the run to Gemini."""
+        import sys as _sys
+
+        backfill = _load_backfill_module()
+        monkeypatch.setattr(backfill, "_ensure_openai_api_key", lambda: None)
+        monkeypatch.setattr(_sys, "argv", ["backfill", "--dry-run",
+                                           "--archive-root", str(tmp_path)])
+        with pytest.raises(SystemExit) as info:
+            backfill.main()
+        assert info.value.code == 1
 
     def test_subagent_estimate_uses_the_luna_constant(self) -> None:
         backfill = _load_backfill_module()
