@@ -2488,6 +2488,7 @@ def archive_session(
     existing_dest_dir: Path | None = None,
     prior_metadata: dict[str, Any] | None = None,
     regenerate_metadata: bool = True,
+    on_record_written: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any] | None:
     """
     Archive a single session with v1.1 schema.
@@ -2535,6 +2536,11 @@ def archive_session(
             regenerated, and kept (marked stale) if regeneration fails.
         regenerate_metadata: In supersede mode, whether to call the model.
             Ignored when *prior_metadata* is *None*.
+        on_record_written: Called with a copy of the metadata (including
+            ``_archive_directory``) as soon as the record first exists on
+            disk, BEFORE any subagent summaries are generated, so a caller
+            can catalogue the session even if this process is killed during
+            the slow summaries. Errors in it are logged, never raised.
 
     Returns:
         Session metadata dictionary, or *None* if skipped.
@@ -2925,6 +2931,64 @@ def archive_session(
         for s in subagents
         if s.get("agent_id") in prior_summaries
     ]
+    def _write_record(summaries: list[dict[str, str]]) -> dict[str, Any]:
+        """Build the record with *summaries* and write it atomically."""
+        record = create_session_metadata(
+            session_id=session_id,
+            session_path=session_path,
+            stats=stats,
+            project_root=project_root,
+            auto_generated=auto_generated,
+            thinking_block_stats=thinking_block_stats,
+            tool_output_stats=tool_output_stats,
+            artifacts=artifacts,
+            relationship_hints=relationship_hints,
+            compression_info=compression_info,
+            defaults=defaults,
+            project_name_override=project_name_override,
+            capture_type=capture_type,
+            subagents=subagents,
+            subagent_summaries=summaries,
+            extractor_model_id=extractor_model_for_record,
+            extractor_source_bytes=extractor_source_bytes,
+            supersedes=supersedes,
+            extractor_thinking_level=extractor_thinking_level,
+        )
+        if carried_forward:
+            # Carried-forward metadata keeps its own label, including none:
+            # create_session_metadata's default would otherwise attribute a
+            # block written before labels existed to today's model.
+            record["extractor_model_id"] = prior_metadata.get("extractor_model_id")
+
+        # Atomic write (2026-10-08): superseding overwrites an existing record,
+        # and a crash mid-write must not leave it empty or partial.
+        metadata_path = dest_dir / "session.meta.json"
+        tmp_meta = dest_dir / "session.meta.json.tmp"
+        tmp_meta.write_text(json.dumps(record, indent=2), encoding="utf-8")
+        os.replace(tmp_meta, metadata_path)
+        print(f"  Metadata: {metadata_path}")
+        return record
+
+    # Record first (2026-10-08): summarising subagents is the slow step
+    # (one model call each), and a hook killed during it used to leave the
+    # transcript archived with NO record. On 2026-08-21 a zbook hook stopped
+    # after the first of 18 summaries, about 2 minutes in, and the session
+    # counted as unarchived until it was repaired by hand. Write the record
+    # with the parent metadata now, tell the caller, then add the summaries.
+    if auto_metadata and to_summarise:
+        provisional = _write_record(carried_summaries)
+        if on_record_written is not None:
+            try:
+                on_record_written(
+                    {**provisional, "_archive_directory": str(dest_dir)}
+                )
+            except Exception as exc:  # noqa: BLE001 — never fail the archive
+                _log_metadata_event(
+                    f"on_record_written failed for session_id={session_id}: "
+                    f"{type(exc).__name__}: {exc}",
+                    level="WARNING",
+                )
+
     if auto_metadata and to_summarise:
         try:
             subagent_summaries = carried_summaries + generate_subagent_summaries(
@@ -2959,41 +3023,7 @@ def archive_session(
     if not subagent_summaries and carried_summaries:
         subagent_summaries = carried_summaries
 
-    metadata = create_session_metadata(
-        session_id=session_id,
-        session_path=session_path,
-        stats=stats,
-        project_root=project_root,
-        auto_generated=auto_generated,
-        thinking_block_stats=thinking_block_stats,
-        tool_output_stats=tool_output_stats,
-        artifacts=artifacts,
-        relationship_hints=relationship_hints,
-        compression_info=compression_info,
-        defaults=defaults,
-        project_name_override=project_name_override,
-        capture_type=capture_type,
-        subagents=subagents,
-        subagent_summaries=subagent_summaries,
-        extractor_model_id=extractor_model_for_record,
-        extractor_source_bytes=extractor_source_bytes,
-        supersedes=supersedes,
-        extractor_thinking_level=extractor_thinking_level,
-    )
-    if carried_forward:
-        # Carried-forward metadata keeps its own label, including none:
-        # create_session_metadata's default would otherwise attribute a
-        # block written before labels existed to today's model.
-        metadata["extractor_model_id"] = prior_metadata.get("extractor_model_id")
-
-    # Atomic write (2026-10-08): superseding overwrites an existing record,
-    # and a crash mid-write must not leave it empty or partial.
-    metadata_path = dest_dir / "session.meta.json"
-    tmp_meta = dest_dir / "session.meta.json.tmp"
-    tmp_meta.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    os.replace(tmp_meta, metadata_path)
-    print(f"  Metadata: {metadata_path}")
-
+    metadata = _write_record(subagent_summaries)
     # Set transient key AFTER writing to disk so it does not pollute
     # session.meta.json.  Consumed by update_catalogue() via pop().
     metadata["_archive_directory"] = str(dest_dir)

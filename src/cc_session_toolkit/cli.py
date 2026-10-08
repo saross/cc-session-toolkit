@@ -173,6 +173,9 @@ def _cmd_archive_from_hook(args: argparse.Namespace) -> None:
             existing_dest_dir=plan.dest_dir,
             prior_metadata=plan.prior_metadata,
             regenerate_metadata=plan.regenerate,
+            on_record_written=lambda meta: update_catalogue_entry(
+                session_id, meta, catalogue_file
+            ),
         )
         if result:
             update_catalogue_entry(session_id, result, catalogue_file)
@@ -192,6 +195,12 @@ def _cmd_archive_from_hook(args: argparse.Namespace) -> None:
         auto_metadata=args.auto_metadata,
         capture_type=capture_type,
         session_id_override=session_id,
+        # Catalogue as soon as the record exists, so a hook killed while
+        # summarising subagents still leaves the session findable; the
+        # final update below then finds the id present and skips it.
+        on_record_written=lambda meta: update_catalogue(
+            [meta], catalogue_file, archive_root, project_name
+        ),
     )
 
     if result:
