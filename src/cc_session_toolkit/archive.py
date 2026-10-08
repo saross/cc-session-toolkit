@@ -1816,10 +1816,17 @@ def create_session_metadata(
     # the model that produced auto-generated metadata. Defaults live in
     # ``cc_session_toolkit.config`` so they can be swept in lockstep.
     resolved_licence = licence if licence is not None else DEFAULT_LICENCE
-    resolved_extractor = (
-        extractor_model_id if extractor_model_id is not None
-        else EXTRACTOR_MODEL_ID
-    )
+    # A placeholder block was written by no model, so none is named. The
+    # fallback to EXTRACTOR_MODEL_ID used to apply here too, attributing
+    # every Flex give-up to the model that failed (and, on 2026-10-08, 24
+    # placeholders rewritten by a model-off repair run to gemini-3.8-flash).
+    if is_placeholder_metadata({"auto_generated": auto_generated}):
+        resolved_extractor = None
+    else:
+        resolved_extractor = (
+            extractor_model_id if extractor_model_id is not None
+            else EXTRACTOR_MODEL_ID
+        )
 
     metadata = {
         "schema_version": SCHEMA_VERSION,

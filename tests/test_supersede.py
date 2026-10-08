@@ -200,6 +200,22 @@ class TestHelpers:
         assert is_placeholder_metadata(meta)
         assert meta["extractor_source_bytes"] is None
 
+    def test_placeholder_names_no_extractor_model(
+        self, tmp_path: Path, fake_generator: dict[str, Any],
+    ) -> None:
+        """No model wrote a placeholder, so none is named.
+
+        The metadata writer used to fall back to ``EXTRACTOR_MODEL_ID``,
+        so a Flex give-up was attributed to the model that failed, and a
+        model-off repair run on 2026-10-08 labelled 24 placeholders
+        ``gemini-3.8-flash``.
+        """
+        fake_generator["result"] = None
+        live = tmp_path / f"{SID}.jsonl"
+        _write(live, 0, 10)
+        _, _, dest = _initial_archive(tmp_path, live)
+        assert _meta(dest)["extractor_model_id"] is None
+
 
 # ---------------------------------------------------------------------------
 # Planning
