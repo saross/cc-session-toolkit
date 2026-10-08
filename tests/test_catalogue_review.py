@@ -4,8 +4,13 @@ Tests for the catalogue fixes from Astra's review of PA #172 (2026-10-08).
 * P1: a rebuild holds ONE lock across baseline read, scan, check and
   write, so an incremental update made meanwhile is never overwritten.
 * P1: the lock fails closed; a strict scan refuses unreadable metadata;
-  an unreadable baseline stops the rebuild; entries may leave only when
-  their directory no longer holds metadata, and never en masse.
+  an unreadable baseline stops the rebuild.
+* Round three: the hooks' incremental update no longer rebuilds an
+  unreadable catalogue leniently; it refuses and keeps the file.
+* Round two (F2): absence is not evidence of removal. An entry may leave
+  only when an authorised cleanup names it (``allow_removed``) or it is a
+  redundant copy of a session still catalogued from a copy at least as
+  long; a minority of directories vanishing (a stale mount) is refused.
 * P2: the newest-first sort keeps each session's copies in preference
   order, so lookups find the most complete copy even when dates differ.
 """
@@ -29,6 +34,7 @@ from cc_session_toolkit.catalogue import (
     rebuild_and_write_catalogue,
     rebuild_catalogue,
     update_catalogue,
+    update_catalogue_entry,
 )
 
 
@@ -123,8 +129,11 @@ class TestStrictRebuild:
         cat = tmp_path / "CATALOG.json"
         rebuild_and_write_catalogue(tmp_path, cat)
         before = cat.read_text()
-        # Ten of twelve become unreadable: a count-ratio guard would pass this.
-        for i in range(10):
+        # Two of twelve become unreadable, leaving ten readable: above the
+        # old guard's half-the-baseline threshold, so a count-ratio check
+        # would have published the partial scan. (Ten of twelve would not
+        # test that: two readable is below the threshold.)
+        for i in range(2):
             (tmp_path / f"proj/s{i}" / "session.meta.json").write_text("{truncated")
         with pytest.raises(CatalogueScanError):
             rebuild_and_write_catalogue(tmp_path, cat)
@@ -151,27 +160,172 @@ class TestStrictRebuild:
 
 
 class TestIdentityCheck:
-    def test_dropping_an_entry_that_still_exists_is_refused(self, tmp_path: Path) -> None:
-        _entry(tmp_path, "proj/a", "A")
-        baseline = {"sessions": [{"id": "A", "directory": "proj/a"}]}
-        with pytest.raises(CatalogueRebuildRefused, match="still holds metadata"):
-            check_rebuild_keeps_entries(baseline, {"sessions": []}, tmp_path)
+    """Round two (F2): an entry leaves the index only with proof."""
 
-    def test_a_moved_directory_may_leave(self, tmp_path: Path) -> None:
-        _entry(tmp_path, "proj/kept", "K")
+    def test_a_disappearing_minority_is_refused(self, tmp_path: Path) -> None:
+        # 100 sessions catalogued; ten directories then vanish from both the
+        # scan and stat, as on a partially stale mount. The scan sees no
+        # read error, and 90 of 100 is above any half-the-baseline ratio.
+        for i in range(100):
+            _entry(tmp_path, f"proj/s{i:03d}", f"S{i}", recorded=1000)
+        cat = tmp_path / "CATALOG.json"
+        rebuild_and_write_catalogue(tmp_path, cat)
+        before = cat.read_text()
+        for i in range(10):
+            directory = tmp_path / f"proj/s{i:03d}"
+            (directory / "session.meta.json").unlink()
+            directory.rmdir()
+        with pytest.raises(CatalogueRebuildRefused, match="10 entries would be dropped"):
+            rebuild_and_write_catalogue(tmp_path, cat)
+        assert cat.read_text() == before
+
+    def test_an_entry_the_scan_did_not_return_is_refused(self) -> None:
+        baseline = {"sessions": [{"id": "A", "directory": "proj/a", "transcript_bytes": 5}]}
+        with pytest.raises(CatalogueRebuildRefused, match="not evidence"):
+            check_rebuild_keeps_entries(baseline, {"sessions": []})
+
+    def test_an_authorised_removal_is_named_explicitly(self, tmp_path: Path) -> None:
+        for rel, sid in (("proj/a", "A"), ("proj/b", "B"), ("proj/c", "C")):
+            _entry(tmp_path, rel, sid, recorded=10)
+        cat = tmp_path / "CATALOG.json"
+        rebuild_and_write_catalogue(tmp_path, cat)
+        (tmp_path / "proj/b/session.meta.json").unlink()
+        (tmp_path / "proj/b").rmdir()
+        # Naming a different directory does not excuse this one.
+        with pytest.raises(CatalogueRebuildRefused):
+            rebuild_and_write_catalogue(tmp_path, cat, allow_removed=["proj/c"])
+        rebuilt = rebuild_and_write_catalogue(tmp_path, cat, allow_removed=["proj/b"])
+        assert {s["id"] for s in rebuilt["sessions"]} == {"A", "C"}
+        assert {s["id"] for s in json.loads(cat.read_text())["sessions"]} == {"A", "C"}
+
+    def test_a_redundant_shorter_copy_may_leave(self) -> None:
+        baseline = {"sessions": [
+            {"id": "K", "directory": "proj/long", "transcript_bytes": 200},
+            {"id": "K", "directory": "proj/short", "transcript_bytes": 100},
+        ]}
+        rebuilt = {"sessions": [{"id": "K", "directory": "proj/long", "transcript_bytes": 200}]}
+        assert check_rebuild_keeps_entries(baseline, rebuilt) == ["proj/short"]
+
+    def test_the_longer_copy_may_not_leave(self) -> None:
+        # The surviving copy holds less than the one that vanished, so the
+        # session would stay findable but lose conversation.
+        baseline = {"sessions": [
+            {"id": "K", "directory": "proj/long", "transcript_bytes": 200},
+            {"id": "K", "directory": "proj/short", "transcript_bytes": 100},
+        ]}
+        rebuilt = {"sessions": [{"id": "K", "directory": "proj/short", "transcript_bytes": 100}]}
+        with pytest.raises(CatalogueRebuildRefused, match="proj/long"):
+            check_rebuild_keeps_entries(baseline, rebuilt)
+
+    def test_a_copy_without_a_recorded_length_is_not_provably_redundant(self) -> None:
+        # Catalogues written before ``transcript_bytes`` existed.
         baseline = {"sessions": [{"id": "K", "directory": "proj/kept"},
                                  {"id": "K", "directory": "proj/moved-away"}]}
-        rebuilt = {"sessions": [{"id": "K", "directory": "proj/kept"}]}
-        check_rebuild_keeps_entries(baseline, rebuilt, tmp_path)
+        rebuilt = {"sessions": [{"id": "K", "directory": "proj/kept", "transcript_bytes": 9}]}
+        with pytest.raises(CatalogueRebuildRefused, match="moved-away"):
+            check_rebuild_keeps_entries(baseline, rebuilt)
+        assert check_rebuild_keeps_entries(
+            baseline, rebuilt, allow_removed=["proj/moved-away"],
+        ) == ["proj/moved-away"]
 
-    def test_mass_removal_is_refused(self, tmp_path: Path) -> None:
-        baseline = {"sessions": [{"id": str(i), "directory": f"p/{i}"} for i in range(10)]}
-        rebuilt = {"sessions": [{"id": str(i), "directory": f"p/{i}"} for i in range(4)]}
-        for i in range(4):
-            _entry(tmp_path, f"p/{i}", str(i))
-        with pytest.raises(CatalogueRebuildRefused, match="stale or empty mount"):
-            check_rebuild_keeps_entries(baseline, rebuilt, tmp_path)
-        check_rebuild_keeps_entries(baseline, rebuilt, tmp_path, max_removed_fraction=0.7)
+    def test_entries_without_a_directory_match_by_id(self) -> None:
+        baseline = {"sessions": [{"id": "A"}, {"id": "B"}]}
+        rebuilt = {"sessions": [{"id": "A", "directory": "proj/a", "transcript_bytes": 1}]}
+        with pytest.raises(CatalogueRebuildRefused, match="session B"):
+            check_rebuild_keeps_entries(baseline, rebuilt)
+
+
+class TestIncrementalUpdateKeepsAnUnreadableCatalogue:
+    """Round three: no unattended lenient recovery on the hook path.
+
+    The old fallback rebuilt a corrupt catalogue with a LENIENT scan, which
+    skips unreadable metadata, and published the partial result as valid
+    JSON; the next scheduled rebuild then trusted it as its baseline.
+    """
+
+    CORRUPT = '{"sessions": ['
+
+    def _store(self, root: Path, *, bad_sibling: bool) -> Path:
+        _entry(root, "proj/2026-03-02_a", "A", recorded=10)
+        if bad_sibling:
+            (root / "proj/2026-03-03_bad").mkdir(parents=True)
+            (root / "proj/2026-03-03_bad/session.meta.json").write_text("{trunc")
+        cat = root / "CATALOG.json"
+        cat.write_text(self.CORRUPT)
+        return cat
+
+    @pytest.mark.parametrize("bad_sibling", [True, False])
+    def test_update_refuses_and_keeps_the_bytes(
+        self, tmp_path: Path, bad_sibling: bool,
+    ) -> None:
+        cat = self._store(tmp_path, bad_sibling=bad_sibling)
+        new = json.loads((_entry(tmp_path, "proj/2026-03-04_n", "N", recorded=5)
+                          / "session.meta.json").read_text())
+        new["_archive_directory"] = str(tmp_path / "proj/2026-03-04_n")
+        with pytest.raises(CatalogueRebuildRefused, match="unreadable"):
+            update_catalogue([new], cat, tmp_path, "proj")
+        assert cat.read_text() == self.CORRUPT
+        assert not list(tmp_path.glob("CATALOG.json.*.tmp"))
+
+    def test_a_wrong_shape_is_refused_too(self, tmp_path: Path) -> None:
+        cat = tmp_path / "CATALOG.json"
+        cat.write_text('{"sessions": "not-a-list"}')
+        with pytest.raises(CatalogueRebuildRefused, match="no sessions list"):
+            update_catalogue([], cat, tmp_path, "proj")
+        assert cat.read_text() == '{"sessions": "not-a-list"}'
+
+    def test_entry_update_refuses_and_keeps_the_bytes(self, tmp_path: Path) -> None:
+        cat = self._store(tmp_path, bad_sibling=True)
+        with pytest.raises(CatalogueRebuildRefused):
+            update_catalogue_entry("A", {"auto_generated": {"title": "t"}}, cat)
+        assert cat.read_text() == self.CORRUPT
+
+    def test_a_missing_catalogue_is_still_created(self, tmp_path: Path) -> None:
+        cat = tmp_path / "CATALOG.json"
+        meta = json.loads((_entry(tmp_path, "proj/2026-03-04_n", "N", recorded=5)
+                           / "session.meta.json").read_text())
+        update_catalogue([meta], cat, tmp_path, "proj")
+        assert [s["id"] for s in json.loads(cat.read_text())["sessions"]] == ["N"]
+
+
+class TestRecordedLength:
+    """``transcript_bytes`` is what the identity check proves redundancy with."""
+
+    def test_rebuild_records_each_copys_length(self, tmp_path: Path) -> None:
+        _entry(tmp_path, "proj/a", "A", recorded=321)
+        _entry(tmp_path, "proj/b", "B")
+        lengths = {s["id"]: s["transcript_bytes"]
+                   for s in rebuild_catalogue(tmp_path)["sessions"]}
+        assert lengths == {"A": 321, "B": 0}
+
+    def test_hook_append_records_the_length(self, tmp_path: Path) -> None:
+        cat = tmp_path / "CATALOG.json"
+        meta = json.loads(
+            (_entry(tmp_path, "proj/a", "A", recorded=77) / "session.meta.json").read_text())
+        meta["_archive_directory"] = str(tmp_path / "proj/a")
+        update_catalogue([meta], cat, tmp_path, "proj")
+        assert json.loads(cat.read_text())["sessions"][0]["transcript_bytes"] == 77
+
+    def test_a_supersede_updates_the_copy_it_wrote(self, tmp_path: Path) -> None:
+        cat = tmp_path / "CATALOG.json"
+        cat.write_text(json.dumps({"sessions": [
+            {"id": "K", "directory": "proj/first", "transcript_bytes": 500},
+            {"id": "K", "directory": "proj/second", "transcript_bytes": 100},
+        ]}))
+        meta = {"auto_generated": {"title": "t"}, "archive": {"jsonl_bytes_uncompressed": 300},
+                "_archive_directory": str(tmp_path / "proj/second")}
+        update_catalogue_entry("K", meta, cat)
+        lengths = {s["directory"]: s["transcript_bytes"]
+                   for s in json.loads(cat.read_text())["sessions"]}
+        assert lengths == {"proj/first": 500, "proj/second": 300}
+
+    def test_an_edit_without_a_length_keeps_the_known_one(self, tmp_path: Path) -> None:
+        cat = tmp_path / "CATALOG.json"
+        cat.write_text(json.dumps({"sessions": [
+            {"id": "K", "directory": "proj/a", "transcript_bytes": 500}]}))
+        update_catalogue_entry("K", {"auto_generated": {"title": "new"}}, cat)
+        entry = json.loads(cat.read_text())["sessions"][0]
+        assert (entry["title"], entry["transcript_bytes"]) == ("new", 500)
 
 
 @pytest.mark.parametrize("short_started", ["2026-05-01T00:00:00Z", None])

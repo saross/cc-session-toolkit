@@ -11,6 +11,7 @@ import json
 import sys
 import time
 from datetime import date, datetime
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -25,11 +26,13 @@ from cc_session_toolkit.archive import (
     plan_supersede,
 )
 from cc_session_toolkit.catalogue import (
+    CatalogueLockError,
+    CatalogueRebuildRefused,
+    CatalogueScanError,
     generate_catalogue_markdown,
-    rebuild_catalogue,
+    rebuild_and_write_catalogue,
     update_catalogue,
     update_catalogue_entry,
-    write_catalogue,
 )
 from cc_session_toolkit.config import DEFAULT_MIN_TURNS
 from cc_session_toolkit.extraction import extract_session_stats
@@ -67,6 +70,27 @@ def cmd_init(args: argparse.Namespace) -> None:
         project_name=args.project_name,
         update=args.update,
     )
+
+
+def _hook_catalogue_update(update: Callable[[], None], session_id: str, where: str) -> None:
+    """Run a hook's final catalogue update; on a refusal, say so and exit 1.
+
+    By this point the session is archived and its ``session.meta.json`` is
+    on disk, so a refused update loses no record. It must not pass
+    silently either (review of PA #172, round three): an unreadable
+    catalogue is now left as it is rather than rebuilt leniently, and a
+    lock that cannot be taken fails closed. The message goes to stderr and
+    the hook exits non-zero, so the failure is visible where the hook ran.
+    """
+    try:
+        update()
+    except (CatalogueRebuildRefused, CatalogueLockError) as exc:
+        print(
+            f"Warning: session {session_id} is archived ({where}) but NOT "
+            f"catalogued: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def _cmd_archive_from_hook(args: argparse.Namespace) -> None:
@@ -178,7 +202,10 @@ def _cmd_archive_from_hook(args: argparse.Namespace) -> None:
             ),
         )
         if result:
-            update_catalogue_entry(session_id, result, catalogue_file)
+            _hook_catalogue_update(
+                lambda: update_catalogue_entry(session_id, result, catalogue_file),
+                session_id, str(plan.dest_dir),
+            )
             print(f"Superseded: {session_id} → {plan.dest_dir}")
         return
 
@@ -204,8 +231,12 @@ def _cmd_archive_from_hook(args: argparse.Namespace) -> None:
     )
 
     if result:
-        update_catalogue(
-            [result], catalogue_file, archive_root, project_name
+        where = str(result.get("_archive_directory") or project_name)
+        _hook_catalogue_update(
+            lambda: update_catalogue(
+                [result], catalogue_file, archive_root, project_name
+            ),
+            session_id, where,
         )
         print(f"Archived: {session_id} → {project_name}")
 
@@ -806,9 +837,28 @@ def cmd_catalogue(args: argparse.Namespace) -> None:
 
     if args.rebuild:
         print("Rebuilding catalogue from archived sessions...")
-        catalogue = rebuild_catalogue(archive_dir)
-
-        write_catalogue(catalogue_file, catalogue)
+        # One locked transaction (review 2026-10-08, round two): a scan
+        # followed by a separate write could overwrite an entry a hook
+        # added in between, and a partial scan could be published. A
+        # refusal leaves the existing catalogue as it is.
+        allow_removed: list[str] = []
+        if args.allow_removed:
+            allow_removed = [
+                line.strip()
+                for line in Path(args.allow_removed).expanduser()
+                .read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
+        try:
+            catalogue = rebuild_and_write_catalogue(
+                archive_dir, catalogue_file, allow_removed=allow_removed,
+            )
+        except CatalogueLockError as exc:
+            print(f"Error: could not lock the catalogue: {exc}")
+            sys.exit(2)
+        except (CatalogueScanError, CatalogueRebuildRefused) as exc:
+            print(f"Refused, catalogue unchanged: {exc}")
+            sys.exit(1)
         print(f"Wrote: {catalogue_file}")
 
         if args.markdown:
@@ -1152,6 +1202,19 @@ def main() -> None:
             "this directory's project subtrees rather than the caller's "
             "per-project archive/cc-sessions/. Mirrors the same flag "
             "on `cc-session archive`."
+        ),
+    )
+    p_catalogue.add_argument(
+        "--allow-removed",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help=(
+            "With --rebuild: a file listing, one per line, the archive "
+            "directories (relative to the archive root) an authorised "
+            "cleanup removed. Without it a rebuild refuses to drop any "
+            "entry unless its session stays catalogued from a copy "
+            "recorded as no shorter."
         ),
     )
     p_catalogue.set_defaults(func=cmd_catalogue)
