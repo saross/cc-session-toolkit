@@ -8,13 +8,109 @@ rebuild, tag index, and relationship graph from
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
+import tempfile
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+try:  # POSIX only; elsewhere writes stay atomic but unlocked.
+    import fcntl
+except ImportError:  # pragma: no cover - not exercised on Linux
+    fcntl = None  # type: ignore[assignment]
+
 from cc_session_toolkit.config import SCHEMA_VERSION
 from cc_session_toolkit.naming import get_archive_directory
+
+
+# -------------------------------------------------------------------------
+# Safe writes (2026-10-08)
+# -------------------------------------------------------------------------
+#
+# Hooks used to rewrite CATALOG.json with a bare ``write_text`` and no lock.
+# Two sessions ending together could each read the old catalogue and write
+# it back with only their own entry (a lost update), and a hook killed
+# mid-write could leave truncated JSON. Every read-modify-write now holds
+# an exclusive lock, and every write goes through a temporary file and an
+# atomic rename.
+
+
+def _lock_path(catalogue_file: Path) -> Path:
+    """Return the catalogue's lock file.
+
+    A sibling file, not the catalogue itself, so the rename that replaces
+    the catalogue cannot pull the lock out from under a waiting writer. The
+    name matches personal-assistant's ``bulk-archive.py write_catalogue``,
+    so the two writers exclude each other.
+    """
+    return catalogue_file.with_name(catalogue_file.name + ".lock")
+
+
+@contextlib.contextmanager
+def catalogue_lock(catalogue_file: Path) -> Iterator[None]:
+    """Hold an exclusive lock on *catalogue_file* for a read-modify-write.
+
+    Not re-entrant: never nest two of these on the same catalogue in one
+    process, because a second ``flock`` on a new descriptor would wait for
+    the first. On a filesystem that refuses ``flock`` the body still runs,
+    unlocked, rather than failing the archive.
+    """
+    catalogue_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(_lock_path(catalogue_file), "a", encoding="utf-8") as handle:
+        locked = False
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                locked = True
+            except OSError:
+                locked = False
+        try:
+            yield
+        finally:
+            if locked:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    """Write *data* to *path* via a temporary file, fsync and rename.
+
+    Keeps the existing file's permission bits (``mkstemp`` creates 0600),
+    and removes the temporary file if anything fails, so a reader sees
+    either the old catalogue or the new one, never part of one.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        mode = path.stat().st_mode & 0o777
+    else:
+        umask = os.umask(0)
+        os.umask(umask)
+        mode = 0o666 & ~umask
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_name, mode)
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
+def write_catalogue(catalogue_file: Path, catalogue: dict[str, Any]) -> None:
+    """Replace *catalogue_file* with *catalogue*, locked and atomically.
+
+    The writer for full rebuilds. Incremental updates take the same lock
+    around their whole read-modify-write instead.
+    """
+    with catalogue_lock(catalogue_file):
+        _write_json_atomic(catalogue_file, catalogue)
 
 
 # -------------------------------------------------------------------------
@@ -36,13 +132,34 @@ def update_catalogue(
         archive_dir: Base archive directory.
         project_name: Project name.
     """
+    with catalogue_lock(catalogue_file):
+        _update_catalogue_locked(
+            new_sessions, catalogue_file, archive_dir, project_name
+        )
+    print(f"\nCatalogue updated: {catalogue_file}")
+
+
+def _update_catalogue_locked(
+    new_sessions: list[dict[str, Any]],
+    catalogue_file: Path,
+    archive_dir: Path,
+    project_name: str,
+) -> None:
+    """Body of :func:`update_catalogue`; the caller holds the lock."""
     if catalogue_file.exists():
         try:
             catalogue = json.loads(
                 catalogue_file.read_text(encoding="utf-8")
             )
         except json.JSONDecodeError:
-            catalogue = {"schema_version": SCHEMA_VERSION, "sessions": []}
+            # Unreadable (e.g. truncated by a writer killed before writes
+            # became atomic). Rebuild from disk: the old fallback started
+            # an EMPTY catalogue, so every other session vanished from it.
+            print(
+                f"Warning: {catalogue_file} is unreadable; "
+                "rebuilding it from the archive directories"
+            )
+            catalogue = rebuild_catalogue(archive_dir)
     else:
         catalogue = {"schema_version": SCHEMA_VERSION, "sessions": []}
 
@@ -108,11 +225,7 @@ def update_catalogue(
         key=lambda s: s.get("started_at") or "", reverse=True
     )
 
-    catalogue_file.parent.mkdir(parents=True, exist_ok=True)
-    catalogue_file.write_text(
-        json.dumps(catalogue, indent=2), encoding="utf-8"
-    )
-    print(f"\nCatalogue updated: {catalogue_file}")
+    _write_json_atomic(catalogue_file, catalogue)
 
 
 def update_catalogue_entry(
@@ -128,11 +241,18 @@ def update_catalogue_entry(
         meta: Updated metadata dictionary.
         catalogue_file: Path to ``CATALOG.json``.
     """
-    if not catalogue_file.exists():
-        return
+    with catalogue_lock(catalogue_file):
+        if not catalogue_file.exists():
+            return
+        catalogue = json.loads(catalogue_file.read_text(encoding="utf-8"))
+        _apply_entry_update(catalogue, session_id, meta)
+        _write_json_atomic(catalogue_file, catalogue)
 
-    catalogue = json.loads(catalogue_file.read_text(encoding="utf-8"))
 
+def _apply_entry_update(
+    catalogue: dict[str, Any], session_id: str, meta: dict[str, Any],
+) -> None:
+    """Refresh one session's title, purpose and tags in *catalogue*."""
     for session in catalogue.get("sessions", []):
         entry_id = session.get("id", "")
         if entry_id and entry_id == session_id:
@@ -148,9 +268,6 @@ def update_catalogue_entry(
             break
 
     catalogue["generated_at"] = datetime.now().isoformat()
-    catalogue_file.write_text(
-        json.dumps(catalogue, indent=2), encoding="utf-8"
-    )
 
 
 # -------------------------------------------------------------------------
@@ -161,44 +278,55 @@ def _scan_sessions(archive_dir: Path) -> list[dict[str, Any]]:
     """
     Scan all archived sessions and collect metadata.
 
+    Finds every directory holding a ``session.meta.json`` at any depth,
+    skipping ``subagents/`` and the top-level ``queries/``. Until
+    2026-10-08 only ``<project>/<entry>`` was scanned, so ``_legacy/
+    <project>/<entry>`` (47 sessions on amd-tower) and other nested entries
+    were never catalogued, and the hooks could not find them.
+
+    The project of a ``<project>/<entry>`` directory is its top-level
+    directory, as before. A nested entry takes the project its metadata
+    names, else its top-level directory.
+
     Args:
         archive_dir: Base archive directory (``archive/cc-sessions/``).
 
     Returns:
         List of ``{metadata, path, project}`` dictionaries.
     """
-    sessions = []
+    sessions: list[dict[str, Any]] = []
 
     if not archive_dir.exists():
         return sessions
 
-    for project_dir in archive_dir.iterdir():
-        if not project_dir.is_dir():
+    for meta_file in sorted(archive_dir.rglob("session.meta.json")):
+        rel = meta_file.parent.relative_to(archive_dir)
+        if not rel.parts or "subagents" in rel.parts or rel.parts[0] == "queries":
             continue
-        if project_dir.name in ("queries",):
+        try:
+            metadata = json.loads(meta_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"Warning: Could not read {meta_file}: {exc}")
             continue
-
-        for session_dir in project_dir.iterdir():
-            if not session_dir.is_dir():
-                continue
-
-            meta_file = session_dir / "session.meta.json"
-            if not meta_file.exists():
-                continue
-
-            try:
-                metadata = json.loads(
-                    meta_file.read_text(encoding="utf-8")
-                )
-                sessions.append({
-                    "metadata": metadata,
-                    "path": session_dir,
-                    "project": project_dir.name,
-                })
-            except (json.JSONDecodeError, OSError) as exc:
-                print(f"Warning: Could not read {meta_file}: {exc}")
+        if len(rel.parts) <= 2:
+            project = rel.parts[0]
+        else:
+            project = (
+                (metadata.get("project") or {}).get("name") or rel.parts[0]
+            )
+        sessions.append({
+            "metadata": metadata,
+            "path": meta_file.parent,
+            "project": project,
+        })
 
     return sessions
+
+
+def _recorded_bytes(meta: dict[str, Any]) -> int:
+    """The transcript length a record claims, or 0 when it records none."""
+    value = (meta.get("archive") or {}).get("jsonl_bytes_uncompressed")
+    return value if isinstance(value, int) else 0
 
 
 def rebuild_catalogue(archive_dir: Path) -> dict[str, Any]:
@@ -226,23 +354,40 @@ def rebuild_catalogue(archive_dir: Path) -> dict[str, Any]:
         "relationship_graph": {},
     }
 
+    # One session can live in several directories (a renamed title, a
+    # re-capture, the old nested layout). Lookups such as
+    # archive.find_archive_directory take the FIRST entry for an id, so
+    # the copies are ordered deliberately: the most complete (most
+    # recorded transcript bytes) first, then the shallowest, then by path.
+    # The final date sort below is stable, so this order survives it.
+    sessions.sort(key=lambda d: (
+        -_recorded_bytes(d["metadata"]),
+        len(d["path"].relative_to(archive_dir).parts),
+        str(d["path"].relative_to(archive_dir)),
+    ))
+
+    seen_ids: set[str] = set()
     for session_data in sessions:
         meta = session_data["metadata"]
         project = session_data["project"]
         rel_path = session_data["path"].relative_to(archive_dir)
         session_id = meta.get("session", {}).get("id", "unknown")
+        # Rollups, the tag index and the relationship graph count each
+        # session once, from its preferred copy; every copy stays listed.
+        first_copy = session_id not in seen_ids
+        seen_ids.add(session_id)
 
         # Project rollup
-        if project not in catalogue["projects"]:
-            catalogue["projects"][project] = {
+        if first_copy:
+            rollup = catalogue["projects"].setdefault(project, {
                 "name": project,
                 "session_count": 0,
                 "total_duration_minutes": 0,
-            }
-        catalogue["projects"][project]["session_count"] += 1
-        catalogue["projects"][project]["total_duration_minutes"] += (
-            meta.get("session", {}).get("duration_minutes", 0)
-        )
+            })
+            rollup["session_count"] += 1
+            rollup["total_duration_minutes"] += (
+                meta.get("session", {}).get("duration_minutes", 0)
+            )
 
         # Extract v1.1 fields
         relationships = meta.get("relationships", {})
@@ -296,6 +441,8 @@ def rebuild_catalogue(archive_dir: Path) -> dict[str, Any]:
             ),
         }
         catalogue["sessions"].append(session_entry)
+        if not first_copy:
+            continue
 
         # Tag index
         for tag in session_entry["tags"]:
@@ -314,11 +461,13 @@ def rebuild_catalogue(archive_dir: Path) -> dict[str, Any]:
                 "continuedBy"
             ].append(session_id)
 
-    # Sort
+    # Sort by date, newest first. Stable, so each session's copies keep
+    # the preference order set above.
     catalogue["sessions"].sort(
         key=lambda s: s.get("started_at") or "", reverse=True
     )
     catalogue["tag_index"] = dict(sorted(catalogue["tag_index"].items()))
+    catalogue["unique_sessions"] = len(seen_ids)
 
     return catalogue
 
