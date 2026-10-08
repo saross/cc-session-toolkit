@@ -9,11 +9,14 @@ Merges features from both diverged versions:
 
 from __future__ import annotations
 
+import copy
 import gzip
 import hashlib
 import json
+import os
 import shutil
 import subprocess
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -21,6 +24,7 @@ from typing import Any
 from cc_session_toolkit.config import (
     AUTO_METADATA_FLEX_RETRY_WAITS_SECONDS,
     AUTO_METADATA_MAX_OUTPUT_TOKENS,
+    AUTO_METADATA_REGEN_GROWTH_FRACTION,
     CODE_STATE_SIDECAR_DIR,
     DEFAULT_LICENCE,
     DEFAULT_MIN_DURATION_MINUTES,
@@ -169,6 +173,185 @@ def is_already_archived(
         *True* if the session is already in the catalogue.
     """
     return session_id in get_archived_session_ids(catalogue_file)
+
+
+# -------------------------------------------------------------------------
+# Superseding an existing archive (added 2026-10-08)
+# -------------------------------------------------------------------------
+#
+# Until 2026-10-08 the hook dedup let the first archive of a session win,
+# so a session that compacted was frozen at its first PreCompact and a
+# resumed session at its first SessionEnd. The helpers below decide when
+# a later capture should replace the archived one, and with what metadata.
+
+#: ``auto_generated.purpose`` values written when no model metadata exists.
+PLACEHOLDER_PURPOSES: frozenset[str] = frozenset({
+    "Auto-metadata unavailable",
+    "Metadata generation requires interactive CC session",
+})
+
+
+def is_placeholder_metadata(meta: dict[str, Any]) -> bool:
+    """Return *True* when a meta record carries no model-generated metadata."""
+    purpose = (meta.get("auto_generated") or {}).get("purpose", "")
+    return purpose in PLACEHOLDER_PURPOSES
+
+
+def archived_transcript_bytes(dest_dir: Path) -> int | None:
+    """
+    Return the exact uncompressed length of an archived transcript.
+
+    Decompresses ``session.jsonl.gz`` and counts the bytes, rather than
+    trusting the recorded ``jsonl_bytes_uncompressed``: before 2026-10-08
+    that field came from a ``stat()`` taken before compression began, so
+    for a transcript still being written it could understate what was
+    archived. Falls back to the size of a raw ``session.jsonl``.
+
+    Returns:
+        Byte count, or *None* if no transcript is present.
+    """
+    gz_path = dest_dir / "session.jsonl.gz"
+    if gz_path.is_file():
+        total = 0
+        with gzip.open(gz_path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                total += len(chunk)
+        return total
+    raw_path = dest_dir / "session.jsonl"
+    if raw_path.is_file():
+        return raw_path.stat().st_size
+    return None
+
+
+def find_archive_directory(
+    session_id: str,
+    catalogue_file: Path,
+    archive_root: Path,
+) -> Path | None:
+    """
+    Resolve a catalogued session's archive directory.
+
+    Uses the catalogue's recorded ``directory`` rather than recomputing a
+    name: directory names derive from the title and project at first
+    archive time, and recomputing them later (a new title, or a different
+    working directory) would fork the session into a second directory.
+
+    Returns:
+        The directory if the catalogue records one that holds a
+        ``session.meta.json``; otherwise *None*.
+    """
+    if not catalogue_file.is_file():
+        return None
+    try:
+        catalogue = json.loads(catalogue_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    for entry in catalogue.get("sessions", []):
+        if entry.get("id") != session_id:
+            continue
+        rel = entry.get("directory")
+        if not rel:
+            return None
+        candidate = Path(rel)
+        if not candidate.is_absolute():
+            candidate = archive_root / candidate
+        if (candidate / "session.meta.json").is_file():
+            return candidate
+        return None
+    return None
+
+
+@dataclass(frozen=True)
+class SupersedePlan:
+    """What a re-archive of an already-catalogued session should do."""
+
+    #: Existing archive directory, reused in place.
+    dest_dir: Path
+    #: The current ``session.meta.json`` contents.
+    prior_metadata: dict[str, Any]
+    #: Whether to call the model for fresh metadata.
+    regenerate: bool
+    #: One-line human-readable reason, for logs and console output.
+    reason: str
+
+
+def plan_supersede(
+    session_id: str,
+    transcript_path: Path,
+    catalogue_file: Path,
+    archive_root: Path,
+    *,
+    regenerate_on_growth: bool,
+) -> SupersedePlan | None:
+    """
+    Decide whether an already-archived session should be re-archived.
+
+    Rules:
+
+    * The live transcript is longer than the archived one → refresh the
+      transcript. An archive is never replaced by a shorter transcript.
+    * The archived metadata is a placeholder → re-archive and regenerate,
+      whether or not the transcript grew (persistent retry of a failed
+      extraction).
+    * Regenerate on growth only when *regenerate_on_growth* (the caller
+      passes *True* at ``SessionEnd`` and for explicit repair runs, *False*
+      at ``PreCompact``) and the transcript has grown by at least
+      ``AUTO_METADATA_REGEN_GROWTH_FRACTION`` beyond the bytes the
+      metadata was generated from. Otherwise carry the metadata forward.
+
+    Args:
+        session_id: Session identifier.
+        transcript_path: Live transcript JSONL.
+        catalogue_file: Global ``CATALOG.json``.
+        archive_root: Global archive root.
+        regenerate_on_growth: Allow regeneration triggered by growth.
+
+    Returns:
+        A :class:`SupersedePlan`, or *None* when nothing should be done
+        (no recorded directory, no growth and real metadata, or a live
+        transcript shorter than the archive).
+    """
+    dest_dir = find_archive_directory(session_id, catalogue_file, archive_root)
+    if dest_dir is None:
+        return None
+    try:
+        prior = json.loads(
+            (dest_dir / "session.meta.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    archived = archived_transcript_bytes(dest_dir)
+    live = transcript_path.stat().st_size
+    if archived is not None and live < archived:
+        # Never shrink an archive. A shorter live copy means something
+        # other than normal append-only growth happened; leave it alone.
+        return None
+    grown = archived is None or live > archived
+    placeholder = is_placeholder_metadata(prior)
+
+    if not grown and not placeholder:
+        return None
+
+    if placeholder:
+        return SupersedePlan(
+            dest_dir, prior, True,
+            "placeholder metadata; retrying extraction",
+        )
+
+    # Bytes the current metadata describes. Records written before
+    # 2026-10-08 lack the field; treat them as covering the archive.
+    source = prior.get("extractor_source_bytes") or archived or 0
+    growth = (live - source) / source if source else 1.0
+    regenerate = regenerate_on_growth and (
+        growth >= AUTO_METADATA_REGEN_GROWTH_FRACTION
+    )
+    verb = "regenerating metadata" if regenerate else "carrying metadata forward"
+    return SupersedePlan(
+        dest_dir, prior, regenerate,
+        f"transcript grew {archived or 0:,} → {live:,} bytes "
+        f"({growth:+.0%} beyond the metadata); {verb}",
+    )
 
 
 def _ensure_gemini_api_key() -> str | None:
@@ -1348,6 +1531,8 @@ def create_session_metadata(
     licence: str | None = None,
     extractor_model_id: str | None = None,
     code_state: dict[str, Any] | None = None,
+    extractor_source_bytes: int | None = None,
+    supersedes: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Create the complete ``session.meta.json`` structure (v1.3 schema).
@@ -1389,6 +1574,12 @@ def create_session_metadata(
             title, purpose, tags).  Defaults to
             :data:`cc_session_toolkit.config.EXTRACTOR_MODEL_ID`.
             Surfaced for RO-Crate attribution (provenance audit Gap 3).
+        extractor_source_bytes: Uncompressed transcript bytes the
+            ``auto_generated`` block was produced from (*None* for a
+            placeholder). Smaller than the archived transcript means the
+            metadata is stale (added 2026-10-08).
+        supersedes: Provenance of the capture this archive replaced,
+            stored at ``archive.supersedes`` (added 2026-10-08).
         code_state: Pre-computed code-state dict
             ``{commit_at_start, commit_at_end, dirty_at_end}``.  When
             *None*, :func:`capture_code_state` is invoked against
@@ -1505,7 +1696,11 @@ def create_session_metadata(
         archive["jsonl_bytes_uncompressed"] = compression_info.get(
             "uncompressed_bytes", session_path.stat().st_size
         )
-        archive["jsonl_sha256_uncompressed"] = sha256_hash.hexdigest()
+        # Hash of the bytes actually archived, not of the live file now:
+        # a transcript still being written may have grown since the copy.
+        archive["jsonl_sha256_uncompressed"] = compression_info.get(
+            "uncompressed_sha256", sha256_hash.hexdigest()
+        )
         if "compressed_sha256" in compression_info:
             archive["jsonl_sha256"] = compression_info["compressed_sha256"]
 
@@ -1571,6 +1766,9 @@ def create_session_metadata(
         "code_state": code_state,
         "licence": resolved_licence,
         "extractor_model_id": resolved_extractor,
+        # Bytes the auto_generated block describes (2026-10-08). Lets a
+        # reader or the backfill tell current metadata from stale.
+        "extractor_source_bytes": extractor_source_bytes,
         "archive": archive,
         "subagents": subagents_list,
         # v1.3 (2026-05-24): lightweight per-subagent narrative
@@ -1583,6 +1781,8 @@ def create_session_metadata(
 
     if capture_type:
         metadata["archive"]["capture_type"] = capture_type
+    if supersedes:
+        metadata["archive"]["supersedes"] = supersedes
 
     if relationship_hints_info.get("detection_notes"):
         metadata["_relationship_hints"] = relationship_hints_info
@@ -1607,6 +1807,9 @@ def archive_session(
     auto_metadata: bool = False,
     capture_type: str | None = None,
     session_id_override: str | None = None,
+    existing_dest_dir: Path | None = None,
+    prior_metadata: dict[str, Any] | None = None,
+    regenerate_metadata: bool = True,
 ) -> dict[str, Any] | None:
     """
     Archive a single session with v1.1 schema.
@@ -1645,6 +1848,15 @@ def archive_session(
             ``"pre_compact"``, or *None* for manual archiving.
         session_id_override: Explicit session ID (overrides
             filename-based detection).
+        existing_dest_dir: Supersede mode (2026-10-08). Re-archive into
+            this existing directory instead of computing a new name, so a
+            grown session replaces its earlier capture rather than forking.
+            Normally taken from :func:`plan_supersede`.
+        prior_metadata: The record being superseded. Its model metadata
+            and subagent summaries are carried forward when not
+            regenerated, and kept (marked stale) if regeneration fails.
+        regenerate_metadata: In supersede mode, whether to call the model.
+            Ignored when *prior_metadata* is *None*.
 
     Returns:
         Session metadata dictionary, or *None* if skipped.
@@ -1680,8 +1892,22 @@ def archive_session(
     # session ID).
     auto_generated = None
     effective_title = title
+    # Provenance of the metadata block (2026-10-08): which model wrote it
+    # and how many transcript bytes it describes. Fresh output records the
+    # current model and the bytes archived below; carried-forward output
+    # keeps the values of the record it came from.
+    extractor_model_for_record: str | None = None
+    extractor_source_bytes: int | None = None
+    carried_forward = False
+    prior_is_real = (
+        prior_metadata is not None
+        and not is_placeholder_metadata(prior_metadata)
+    )
 
-    if auto_metadata:
+    if prior_is_real and not regenerate_metadata:
+        auto_generated = copy.deepcopy(prior_metadata["auto_generated"])
+        carried_forward = True
+    elif auto_metadata:
         print(f"  Generating auto-metadata via {EXTRACTOR_MODEL_ID}...")
         auto_generated = generate_auto_metadata(session_path, stats)
         if auto_generated:
@@ -1691,6 +1917,26 @@ def archive_session(
             elif auto_generated.get("title"):
                 # Use the auto-generated title for directory naming.
                 effective_title = auto_generated["title"]
+        elif prior_is_real:
+            # Never downgrade real metadata to a placeholder because a
+            # retry failed (e.g. a Flex 503 give-up). Keep the prior block;
+            # its smaller extractor_source_bytes marks it stale, so the
+            # backfill can refresh it later.
+            auto_generated = copy.deepcopy(prior_metadata["auto_generated"])
+            carried_forward = True
+            _log_metadata_event(
+                f"Regeneration failed for session_id={session_id}; "
+                "kept prior metadata (now stale)",
+                level="WARNING",
+            )
+
+    if carried_forward:
+        extractor_model_for_record = prior_metadata.get("extractor_model_id")
+        extractor_source_bytes = prior_metadata.get(
+            "extractor_source_bytes"
+        ) or ((prior_metadata.get("archive") or {}).get(
+            "jsonl_bytes_uncompressed"
+        ))
 
     if not auto_generated and not stats_only:
         # Interactive mode: print prompt for CC to fill in
@@ -1728,13 +1974,17 @@ def archive_session(
             "key_exchanges": [],
         }
 
-    dest_dir = get_archive_directory(
-        session_id=session_id,
-        stats=stats,
-        archive_dir=archive_base,
-        project_name=project_name,
-        title=effective_title,
-    )
+    if existing_dest_dir is not None:
+        # Supersede mode: keep the directory the session already has.
+        dest_dir = existing_dest_dir
+    else:
+        dest_dir = get_archive_directory(
+            session_id=session_id,
+            stats=stats,
+            archive_dir=archive_base,
+            project_name=project_name,
+            title=effective_title,
+        )
 
     print(f"\nSession: {session_id}")
     print(f"  Source: {session_path}")
@@ -1791,6 +2041,28 @@ def archive_session(
         for note in relationship_hints["detection_notes"][:3]:
             print(f"      - {note}")
 
+    # Supersede provenance (2026-10-08): describe the capture about to be
+    # replaced, before anything is overwritten. Replication uses it to
+    # propagate the longer transcript, since the transcript passes are
+    # otherwise append-only (``rsync --ignore-existing``).
+    supersedes: dict[str, Any] | None = None
+    if existing_dest_dir is not None and prior_metadata is not None:
+        prior_archive = prior_metadata.get("archive") or {}
+        supersedes = {
+            "previous_bytes_uncompressed": prior_archive.get(
+                "jsonl_bytes_uncompressed"
+            ),
+            "previous_sha256": prior_archive.get("jsonl_sha256"),
+            "previous_capture_type": prior_archive.get("capture_type"),
+            "previous_archived_at": prior_archive.get("archived_at"),
+            "superseded_at": datetime.now().isoformat(),
+        }
+        earlier = prior_archive.get("supersedes")
+        if earlier:
+            supersedes["supersede_count"] = earlier.get("supersede_count", 1) + 1
+        else:
+            supersedes["supersede_count"] = 1
+
     # Create archive directory
     dest_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1807,23 +2079,36 @@ def archive_session(
         # archive — the sha256 recorded below was computed over the
         # compressed bytes as written, so it certified whatever landed
         # on disk, corrupt or not.
+        #
+        # 2026-10-08: write to a sibling temp file and replace only after
+        # verification. Writing straight to ``dest_jsonl`` truncated any
+        # existing archive first, and a failed round-trip then deleted it;
+        # harmless for a new archive, data loss when superseding one.
+        # ``archived_bytes`` counts what was actually read, because the
+        # live transcript may still be growing while it is copied.
+        tmp_jsonl = dest_dir / "session.jsonl.gz.tmp"
         source_hash = hashlib.sha256()
+        archived_bytes = 0
         with open(session_path, "rb") as f_in:
-            with gzip.open(dest_jsonl, "wb") as f_out:
+            with gzip.open(tmp_jsonl, "wb") as f_out:
                 for chunk in iter(lambda: f_in.read(65536), b""):
                     source_hash.update(chunk)
+                    archived_bytes += len(chunk)
                     f_out.write(chunk)
 
         roundtrip_hash = hashlib.sha256()
-        with gzip.open(dest_jsonl, "rb") as fh:
+        with gzip.open(tmp_jsonl, "rb") as fh:
             for chunk in iter(lambda: fh.read(65536), b""):
                 roundtrip_hash.update(chunk)
         if roundtrip_hash.hexdigest() != source_hash.hexdigest():
-            dest_jsonl.unlink(missing_ok=True)
+            tmp_jsonl.unlink(missing_ok=True)
             raise RuntimeError(
                 f"gzip round-trip verification FAILED for {session_path} "
-                f"— corrupt write removed; source untouched"
+                f"— corrupt write removed; source and any existing "
+                f"archive untouched"
             )
+        os.replace(tmp_jsonl, dest_jsonl)
+        uncompressed_size = archived_bytes
 
         compressed_hash = hashlib.sha256()
         with open(dest_jsonl, "rb") as fh:
@@ -1871,7 +2156,15 @@ def archive_session(
     else:
         dest_jsonl = dest_dir / "session.jsonl"
         shutil.copy2(session_path, dest_jsonl)
+        uncompressed_size = dest_jsonl.stat().st_size
         print(f"  Copied to: {dest_jsonl}")
+
+    # Fresh model output describes the transcript just archived.
+    if auto_generated is not None and not carried_forward and not (
+        is_placeholder_metadata({"auto_generated": auto_generated})
+    ):
+        extractor_source_bytes = uncompressed_size
+        extractor_model_for_record = EXTRACTOR_MODEL_ID
 
     # Archive any sub-agent transcripts alongside the parent (v1.2).
     # Keeps parent + sub-agents co-located as one atomic archive unit.
@@ -1915,11 +2208,27 @@ def archive_session(
     # is acceptable (per-subagent failures are logged but omitted from
     # the list rather than crashing the archive).
     subagent_summaries: list[dict[str, str]] = []
-    if auto_metadata and subagents:
+    # Supersede mode (2026-10-08): a finished subagent's transcript does
+    # not change, so keep its existing summary and pay only for subagents
+    # that are new since the earlier capture.
+    prior_summaries: dict[str, dict[str, str]] = {}
+    if prior_metadata is not None:
+        for entry in prior_metadata.get("subagent_summaries") or []:
+            if entry.get("agent_id"):
+                prior_summaries[entry["agent_id"]] = entry
+    to_summarise = [
+        s for s in subagents if s.get("agent_id") not in prior_summaries
+    ]
+    carried_summaries = [
+        prior_summaries[s["agent_id"]]
+        for s in subagents
+        if s.get("agent_id") in prior_summaries
+    ]
+    if auto_metadata and to_summarise:
         try:
-            subagent_summaries = generate_subagent_summaries(
+            subagent_summaries = carried_summaries + generate_subagent_summaries(
                 dest_dir=dest_dir,
-                subagents=subagents,
+                subagents=to_summarise,
                 parent_session_id=session_id,
             )
             if subagent_summaries:
@@ -1946,6 +2255,9 @@ def archive_session(
                 level="WARNING",
             )
 
+    if not subagent_summaries and carried_summaries:
+        subagent_summaries = carried_summaries
+
     metadata = create_session_metadata(
         session_id=session_id,
         session_path=session_path,
@@ -1962,12 +2274,17 @@ def archive_session(
         capture_type=capture_type,
         subagents=subagents,
         subagent_summaries=subagent_summaries,
+        extractor_model_id=extractor_model_for_record,
+        extractor_source_bytes=extractor_source_bytes,
+        supersedes=supersedes,
     )
 
+    # Atomic write (2026-10-08): superseding overwrites an existing record,
+    # and a crash mid-write must not leave it empty or partial.
     metadata_path = dest_dir / "session.meta.json"
-    metadata_path.write_text(
-        json.dumps(metadata, indent=2), encoding="utf-8"
-    )
+    tmp_meta = dest_dir / "session.meta.json.tmp"
+    tmp_meta.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    os.replace(tmp_meta, metadata_path)
     print(f"  Metadata: {metadata_path}")
 
     # Set transient key AFTER writing to disk so it does not pollute

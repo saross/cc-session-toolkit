@@ -75,6 +75,18 @@ AUTO_METADATA_MAX_OUTPUT_TOKENS = 8192
 # cheap insurance for the production-cadence higher-volume path.
 AUTO_METADATA_FLEX_RETRY_WAITS_SECONDS = (30, 60, 120)
 
+# Re-archive (supersede) policy, added 2026-10-08. When a session is
+# archived again after its transcript has grown (a later PreCompact, the
+# SessionEnd after a PreCompact, or a resumed session's next end), the
+# transcript is always refreshed, because that is local and free. The
+# model metadata is regenerated only at SessionEnd, and only when the
+# transcript has grown by at least this fraction since the bytes the
+# metadata was generated from (``extractor_source_bytes``). Smaller
+# growth carries the existing metadata forward: a few trailing hook
+# records do not justify a Gemini call. Placeholder metadata is always
+# retried regardless of growth.
+AUTO_METADATA_REGEN_GROWTH_FRACTION = 0.10
+
 # Gemini Flex list price (USD per million tokens) — see
 # https://ai.google.dev/gemini-api/docs/pricing#flex. Verified
 # 2026-05-22 for Gemini 3.5 Flash (3× the 3 Flash Preview Flex rate);
