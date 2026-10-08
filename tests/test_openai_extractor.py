@@ -690,3 +690,50 @@ class TestSparingCounts:
         text = "y" * 4000
         assert count_fn(text) == count_fn(text) == 1000
         assert len(fake.count_bodies) == 1
+
+
+
+class TestOutputCapRetry:
+    """2026-10-08: one fresh attempt after an output-cap overrun."""
+
+    @staticmethod
+    def _overrun() -> dict[str, Any]:
+        return _payload('{"title": "loop', status="incomplete",
+                        incomplete_details={"reason": "max_output_tokens"})
+
+    def test_overrun_then_success_stays_with_luna(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fake = FakePost(self._overrun(), _payload("{}"))
+        monkeypatch.setattr(archive, "_openai_post", fake)
+        assert archive._call_openai_with_retry("u", "s", None, api_key="k") == "{}"
+        assert len(fake.bodies) == 2
+
+    def test_second_overrun_goes_to_the_fallback(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fake = FakePost(self._overrun(), self._overrun())
+        monkeypatch.setattr(archive, "_openai_post", fake)
+        with pytest.raises(archive.OpenAIOutputCapError):
+            archive._call_openai_with_retry("u", "s", None, api_key="k")
+        assert len(fake.bodies) == 2
+
+    def test_other_incomplete_reasons_are_not_retried(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fake = FakePost(_payload("{}", status="incomplete",
+                                 incomplete_details={"reason": "content_filter"}))
+        monkeypatch.setattr(archive, "_openai_post", fake)
+        with pytest.raises(RuntimeError) as info:
+            archive._call_openai_with_retry("u", "s", None, api_key="k")
+        assert not isinstance(info.value, archive.OpenAIOutputCapError)
+        assert len(fake.bodies) == 1
+
+    @pytest.mark.openai_provider
+    def test_dispatcher_falls_back_after_two_overruns(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(archive, "_openai_post", FakePost(self._overrun(), self._overrun()))
+        monkeypatch.setattr(archive, "_call_gemini_with_retry", lambda *a, **k: "{}")
+        _raw, model, _level = archive._call_extractor("u", "s", None, gemini_client=object())
+        assert model == GEMINI_EXTRACTOR_MODEL_ID

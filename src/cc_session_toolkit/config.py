@@ -123,6 +123,14 @@ OPENAI_KEY_HOST_SUFFIXES: tuple[tuple[str, str], ...] = (
 # rate limits and transient server errors; a 429 for exhausted quota and
 # any 4xx other than 429 are not retried. The timeout is per attempt.
 OPENAI_RETRY_WAITS_SECONDS = (10, 30, 60)
+
+# Retries after Luna hits the output cap (2026-10-08; Shawn asked for one).
+# In the repair sweep 3 of 51 parents ran past 16,384 output tokens and fell
+# back to Gemini; a diagnostic rerun of one finished normally (2,472
+# tokens), so the overrun is a random runaway and a fresh attempt usually
+# succeeds. One retry keeps those transcripts with OpenAI. A wasted
+# overrun costs about a cent. The cap itself is unchanged.
+OPENAI_OUTPUT_CAP_RETRIES = 1
 OPENAI_REQUEST_TIMEOUT_SECONDS = 300
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 

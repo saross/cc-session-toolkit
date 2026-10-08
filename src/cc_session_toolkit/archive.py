@@ -51,6 +51,7 @@ from cc_session_toolkit.config import (
     OPENAI_LONG_PROMPT_INPUT_MULTIPLIER,
     OPENAI_LONG_PROMPT_OUTPUT_MULTIPLIER,
     OPENAI_LONG_PROMPT_THRESHOLD_TOKENS,
+    OPENAI_OUTPUT_CAP_RETRIES,
     OPENAI_OUTPUT_PRICE_PER_MTOK,
     OPENAI_REASONING_EFFORT,
     OPENAI_REMOTE_COUNT_THRESHOLD,
@@ -833,6 +834,12 @@ class OpenAIRequestError(RuntimeError):
         self.detail = detail
 
 
+class OpenAIOutputCapError(RuntimeError):
+    """Luna stopped at the output cap (``max_output_tokens``) without
+    finishing; retried once (``OPENAI_OUTPUT_CAP_RETRIES``) before the
+    fallback provider is tried."""
+
+
 def _openai_key_names(hostname: str | None = None) -> list[str]:
     """Return the ``.env`` names the role-scoped OpenAI key may use, in order.
 
@@ -1140,6 +1147,12 @@ def _call_openai_once(
             f"partial_len={len(text)}): head={text[:2000]!r} tail={text[-2000:]!r}",
             level="WARNING",
         )
+    details = payload.get("incomplete_details") or {}
+    if status == "incomplete" and details.get("reason") == "max_output_tokens":
+        raise OpenAIOutputCapError(
+            f"OpenAI returned no usable text (status={status!r}, "
+            f"incomplete_details={details!r})"
+        )
     if status not in (None, "completed") or not text:
         raise RuntimeError(
             f"OpenAI returned no usable text (status={status!r}, "
@@ -1149,6 +1162,40 @@ def _call_openai_once(
 
 
 def _call_openai_with_retry(
+    user_message: str,
+    system_prompt: str,
+    response_schema: dict[str, Any] | None,
+    *,
+    api_key: str,
+) -> str:
+    """
+    Call GPT-6 Luna with both retry policies.
+
+    Transient failures (rate limits, server and network errors) are retried
+    with waits by :func:`_call_openai_with_transient_retry`. A run that stops
+    at the output cap is retried at once, ``OPENAI_OUTPUT_CAP_RETRIES``
+    times, because the overrun is random rather than caused by the input;
+    after that :class:`OpenAIOutputCapError` reaches the dispatcher, which
+    tries the fallback provider.
+    """
+    cap_retries_left = OPENAI_OUTPUT_CAP_RETRIES
+    while True:
+        try:
+            return _call_openai_with_transient_retry(
+                user_message, system_prompt, response_schema, api_key=api_key
+            )
+        except OpenAIOutputCapError as exc:
+            if cap_retries_left <= 0:
+                raise
+            cap_retries_left -= 1
+            _log_metadata_event(
+                f"OpenAI hit the output cap ({exc}); retrying once before "
+                f"the fallback provider",
+                level="WARNING",
+            )
+
+
+def _call_openai_with_transient_retry(
     user_message: str,
     system_prompt: str,
     response_schema: dict[str, Any] | None,
