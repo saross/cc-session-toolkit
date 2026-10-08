@@ -261,6 +261,41 @@ def find_archive_directory(
     return None
 
 
+#: Record types that carry conversation. Claude Code also appends
+#: bookkeeping records (e.g. ``bridge-session``) after SessionEnd fires;
+#: growth made only of those is not content and does not justify a
+#: re-archive.
+CONTENT_RECORD_TYPES: frozenset[str] = frozenset({"user", "assistant"})
+
+
+def growth_has_content(transcript_path: Path, offset: int) -> bool:
+    """
+    Return *True* if the transcript beyond *offset* holds a conversation record.
+
+    Archives are copies of an append-only file, so the bytes past the
+    archived length are exactly what the archive is missing. A line counts
+    as content when its ``type`` (or, for older shapes, ``message.role``)
+    is in :data:`CONTENT_RECORD_TYPES`. Unparseable lines count as content,
+    so a malformed tail errs towards re-archiving rather than skipping.
+    """
+    with open(transcript_path, "rb") as fh:
+        fh.seek(offset)
+        for raw in fh:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                return True
+            kind = record.get("type") or (
+                (record.get("message") or {}).get("role")
+            )
+            if kind in CONTENT_RECORD_TYPES:
+                return True
+    return False
+
+
 @dataclass(frozen=True)
 class SupersedePlan:
     """What a re-archive of an already-catalogued session should do."""
@@ -328,6 +363,10 @@ def plan_supersede(
         # other than normal append-only growth happened; leave it alone.
         return None
     grown = archived is None or live > archived
+    if grown and archived is not None and not growth_has_content(
+        transcript_path, archived
+    ):
+        grown = False  # only bookkeeping records were appended
     placeholder = is_placeholder_metadata(prior)
 
     if not grown and not placeholder:

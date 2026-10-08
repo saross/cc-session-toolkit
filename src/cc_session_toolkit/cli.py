@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -423,10 +424,18 @@ def _refresh_grown_archives(
             p for p in live_sessions if get_session_id(p) == args.session_id
         ]
 
+    # Leave sessions active within the idle window to their own hooks: a
+    # session still open would otherwise be re-archived (and possibly
+    # re-summarised) mid-flight, then again at its own SessionEnd.
+    idle_cutoff = time.time() - args.min_idle_hours * 3600
     plans = []
+    n_active = 0
     for live in live_sessions:
         sid = get_session_id(live)
         if sid not in archived_ids:
+            continue
+        if live.stat().st_mtime > idle_cutoff:
+            n_active += 1
             continue
         plan = plan_supersede(
             sid, live, catalogue_file, archive_root,
@@ -439,7 +448,8 @@ def _refresh_grown_archives(
     print(
         f"Refresh plan: {len(plans)} archive(s) to update, "
         f"{n_regen} with a model call "
-        f"(auto-metadata {'on' if args.auto_metadata else 'OFF'})."
+        f"(auto-metadata {'on' if args.auto_metadata else 'OFF'}); "
+        f"{n_active} active within {args.min_idle_hours:g}h left to their hooks."
     )
     for sid, _, plan in plans:
         rel = plan.dest_dir.relative_to(archive_root)
@@ -1053,6 +1063,15 @@ def main() -> None:
             "copy, or whose metadata is a placeholder. Archives are updated "
             "in place. Combine with --dry-run to list the plan without "
             "writing or calling any model."
+        ),
+    )
+    p_archive.add_argument(
+        "--min-idle-hours",
+        type=float,
+        default=24.0,
+        help=(
+            "With --refresh-grown: skip live transcripts modified within "
+            "this many hours (default 24); their own hooks refresh them."
         ),
     )
     p_archive.set_defaults(func=cmd_archive)

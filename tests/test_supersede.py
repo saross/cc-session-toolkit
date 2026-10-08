@@ -29,6 +29,7 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -507,6 +508,8 @@ class TestRefreshGrownSweep:
         _write(live, 0, 10)
         root, _, dest = _initial_archive(tmp_path, live)
         _write(live, 10, 10, append=True)
+        old = live.stat().st_mtime - 48 * 3600
+        os.utime(live, (old, old))
         return root, live, dest
 
     def test_dry_run_writes_nothing_and_calls_no_model(
@@ -543,3 +546,55 @@ class TestRefreshGrownSweep:
         assert archived_transcript_bytes(dest) == live.stat().st_size
         assert _meta(dest)["archive"]["supersedes"]["supersede_count"] == 1
         assert [p.name for p in (root / PROJECT).iterdir()] == [dest.name]
+
+
+    def test_active_sessions_are_left_to_their_hooks(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+        fake_generator: dict[str, Any],
+    ) -> None:
+        root, live, _ = self._setup(tmp_path, monkeypatch)
+        os.utime(live, None)  # touched now: still active
+
+        self._run(monkeypatch, ["archive", "--archive-root", str(root),
+                                "--refresh-grown", "--dry-run"])
+
+        out = capsys.readouterr().out
+        assert "Refresh plan: 0 archive(s)" in out
+        assert "1 active within 24h" in out
+
+class TestBookkeepingTail:
+    """Claude Code appends records such as ``bridge-session`` after
+    SessionEnd fires. Growth made only of such records is not content and
+    must not trigger a re-archive (found 2026-10-08: many archives were
+    exactly 146 bytes short for this reason)."""
+
+    def test_bookkeeping_only_growth_is_skipped(
+        self, tmp_path: Path, fake_generator: dict[str, Any],
+    ) -> None:
+        live = tmp_path / f"{SID}.jsonl"
+        _write(live, 0, 10)
+        root, cat, _ = _initial_archive(tmp_path, live)
+        with open(live, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "type": "bridge-session", "sessionId": SID,
+                "bridgeSessionId": "cse_x", "lastSequenceNum": 0,
+            }) + "\n")
+        assert plan_supersede(SID, live, cat, root, regenerate_on_growth=True) is None
+
+    def test_content_growth_after_bookkeeping_is_planned(
+        self, tmp_path: Path, fake_generator: dict[str, Any],
+    ) -> None:
+        live = tmp_path / f"{SID}.jsonl"
+        _write(live, 0, 10)
+        root, cat, _ = _initial_archive(tmp_path, live)
+        with open(live, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "bridge-session"}) + "\n")
+            fh.write(json.dumps({
+                "type": "user", "timestamp": START.isoformat(),
+                "message": {"role": "user", "content": "resumed"},
+            }) + "\n")
+        assert plan_supersede(SID, live, cat, root, regenerate_on_growth=True) is not None
+
