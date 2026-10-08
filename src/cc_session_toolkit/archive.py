@@ -1118,6 +1118,16 @@ def _call_openai_once(
     )
     if refusals:
         raise RuntimeError(f"OpenAI refused: {refusals[0]!r}")
+    if status == "incomplete" and text:
+        # Keep the ends of the partial output (2026-10-08): 3 of 51 sessions
+        # in the repair sweep hit the output cap, and nothing showed whether
+        # the model was quoting long pasted text or looping.
+        _log_metadata_event(
+            f"OpenAI incomplete response "
+            f"({payload.get('incomplete_details')!r}; output_tokens={out_tok}; "
+            f"partial_len={len(text)}): head={text[:2000]!r} tail={text[-2000:]!r}",
+            level="WARNING",
+        )
     if status not in (None, "completed") or not text:
         raise RuntimeError(
             f"OpenAI returned no usable text (status={status!r}, "

@@ -652,3 +652,20 @@ def test_carried_subagent_summaries_take_the_prior_label(
     assert after["extractor_model_id"] == OPENAI_EXTRACTOR_MODEL_ID
     assert after["subagent_summaries"] == [{"agent_id": "a1a1a1a1a1", "narrative": "old",
                                             "extractor_model_id": "gemini-3.5-flash"}]
+
+
+def test_incomplete_response_logs_its_ends(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The ends of a truncated output reach the log, for diagnosis."""
+    import os
+
+    partial = '{"title": "T", "key_exchanges": [' + "x" * 5000 + "TAILMARK"
+    monkeypatch.setattr(archive, "_openai_post", FakePost(_payload(
+        partial, status="incomplete", incomplete_details={"reason": "max_output_tokens"},
+    )))
+    with pytest.raises(RuntimeError):
+        archive._call_openai_once("u", "s", None, api_key="k")
+    log = Path(os.environ["CC_SESSION_LOG_DIR"]) / "auto-metadata.log"
+    text = log.read_text(encoding="utf-8")
+    assert "OpenAI incomplete response" in text and "TAILMARK" in text
