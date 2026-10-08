@@ -467,3 +467,26 @@ class TestSummariseCostRecords:
         assert s["total_cost_usd"] == pytest.approx(0.15)
         assert s["by_phase"]["parent"]["unknown_cost_calls"] == 1
         assert s["by_phase"]["parent"]["total_cost_usd"] == pytest.approx(0.10)
+
+
+class TestUpdateMetadataProvenance:
+    """2026-10-08: a backfilled record must name the model that wrote it."""
+
+    def test_records_model_and_source_bytes(self, tmp_path: Path) -> None:
+        backfill = _load_backfill_module()
+        meta_path = tmp_path / "session.meta.json"
+        meta_path.write_text(json.dumps({
+            "auto_generated": {"purpose": "Auto-metadata unavailable"},
+            "extractor_model_id": "some-older-model",
+        }))
+        backfill.update_metadata(
+            meta_path,
+            {"title": "T", "purpose": "P", "tags": [], "three_ps": {}},
+            [],
+            source_bytes=12345,
+        )
+        data = json.loads(meta_path.read_text())
+        from cc_session_toolkit.config import EXTRACTOR_MODEL_ID
+
+        assert data["extractor_model_id"] == EXTRACTOR_MODEL_ID
+        assert data["extractor_source_bytes"] == 12345

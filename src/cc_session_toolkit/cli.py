@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from cc_session_toolkit.archive import (
     get_session_id,
     is_already_archived,
     is_trivial_session,
+    plan_supersede,
 )
 from cc_session_toolkit.catalogue import (
     generate_catalogue_markdown,
@@ -128,10 +130,10 @@ def _cmd_archive_from_hook(args: argparse.Namespace) -> None:
         )
         return
 
-    # Deduplication check
-    if is_already_archived(session_id, catalogue_file):
-        print(f"Skipping already-archived session: {session_id}")
-        return
+    # Determine capture type
+    capture_type = (
+        "pre_compact" if args.pre_compact else "session_end"
+    )
 
     # Detect project root for artifact extraction (may not exist)
     try:
@@ -139,10 +141,42 @@ def _cmd_archive_from_hook(args: argparse.Namespace) -> None:
     except FileNotFoundError:
         project_root = None
 
-    # Determine capture type
-    capture_type = (
-        "pre_compact" if args.pre_compact else "session_end"
-    )
+    # Deduplication, revised 2026-10-08. "First one to archive wins" froze
+    # every session that compacted at its first PreCompact, and every
+    # resumed session at its first SessionEnd. An already-archived session
+    # is now re-archived in place when its transcript has grown or its
+    # metadata is a placeholder; otherwise it is skipped as before.
+    if is_already_archived(session_id, catalogue_file):
+        plan = plan_supersede(
+            session_id,
+            transcript_path,
+            catalogue_file,
+            archive_root,
+            regenerate_on_growth=(capture_type == "session_end"),
+        )
+        if plan is None:
+            print(f"Skipping already-archived session: {session_id}")
+            return
+        print(f"Superseding archived session {session_id}: {plan.reason}")
+        result = archive_session(
+            transcript_path,
+            project_root,
+            use_gzip=args.gzip,
+            stats_only=True,
+            archive_root=archive_root,
+            # Keep the project the session was first archived under.
+            project_name_override=plan.dest_dir.parent.name,
+            auto_metadata=args.auto_metadata,
+            capture_type=capture_type,
+            session_id_override=session_id,
+            existing_dest_dir=plan.dest_dir,
+            prior_metadata=plan.prior_metadata,
+            regenerate_metadata=plan.regenerate,
+        )
+        if result:
+            update_catalogue_entry(session_id, result, catalogue_file)
+            print(f"Superseded: {session_id} → {plan.dest_dir}")
+        return
 
     # Archive the session
     # Always stats_only=True in hook mode — suppress interactive prompt.
@@ -238,6 +272,11 @@ def _cmd_archive_global(args: argparse.Namespace) -> None:
     if not cc_projects_dir.is_dir():
         print(f"Error: {cc_projects_dir} not found")
         sys.exit(1)
+
+    if getattr(args, "refresh_grown", False):
+        _refresh_grown_archives(args, archive_root, catalogue_file,
+                                archived_ids, cc_projects_dir)
+        return
 
     # Exclude flat ``agent-*.jsonl`` files (subagent transcripts that
     # CC sometimes drops alongside main-thread JSONLs). The toolkit
@@ -352,6 +391,99 @@ def _cmd_archive_global(args: argparse.Namespace) -> None:
             update_catalogue(
                 results, catalogue_file, archive_root, project_name
             )
+
+    print("\nDone!")
+
+
+def _refresh_grown_archives(
+    args: argparse.Namespace,
+    archive_root: Path,
+    catalogue_file: Path,
+    archived_ids: set[str],
+    cc_projects_dir: Path,
+) -> None:
+    """
+    Repair archives frozen by the pre-2026-10-08 first-capture-wins dedup.
+
+    Walks this machine's live transcripts, and for each one already in the
+    catalogue applies :func:`plan_supersede` with growth-triggered
+    regeneration allowed (the session is assumed finished; a still-open
+    session is simply refreshed again by its next hook). Run it on every
+    machine: each machine holds only its own live transcripts.
+
+    With ``--dry-run`` it prints the plan and the number of model calls
+    that a real run would make, then stops. No files are written and no
+    API is called.
+    """
+    live_sessions = sorted(
+        p for p in cc_projects_dir.glob("*/*.jsonl")
+        if not p.name.startswith("agent-")
+    )
+    if args.session_id:
+        live_sessions = [
+            p for p in live_sessions if get_session_id(p) == args.session_id
+        ]
+
+    # Leave sessions active within the idle window to their own hooks: a
+    # session still open would otherwise be re-archived (and possibly
+    # re-summarised) mid-flight, then again at its own SessionEnd.
+    idle_cutoff = time.time() - args.min_idle_hours * 3600
+    plans = []
+    n_active = 0
+    for live in live_sessions:
+        sid = get_session_id(live)
+        if sid not in archived_ids:
+            continue
+        if live.stat().st_mtime > idle_cutoff:
+            n_active += 1
+            continue
+        plan = plan_supersede(
+            sid, live, catalogue_file, archive_root,
+            regenerate_on_growth=True,
+        )
+        if plan is not None:
+            plans.append((sid, live, plan))
+
+    n_regen = sum(1 for _, _, p in plans if p.regenerate)
+    print(
+        f"Refresh plan: {len(plans)} archive(s) to update, "
+        f"{n_regen} with a model call "
+        f"(auto-metadata {'on' if args.auto_metadata else 'OFF'}); "
+        f"{n_active} active within {args.min_idle_hours:g}h left to their hooks."
+    )
+    for sid, _, plan in plans:
+        rel = plan.dest_dir.relative_to(archive_root)
+        print(f"  {rel}: {plan.reason}")
+    if args.dry_run or not plans:
+        return
+
+    for i, (sid, live, plan) in enumerate(plans, 1):
+        print(f"\n[{i}/{len(plans)}] {sid}")
+        cwd = _extract_cwd_from_jsonl(live)
+        try:
+            project_root = find_project_root(start=cwd)
+        except FileNotFoundError:
+            project_root = None
+        try:
+            result = archive_session(
+                live,
+                project_root,
+                use_gzip=True,
+                stats_only=True,
+                archive_root=archive_root,
+                project_name_override=plan.dest_dir.parent.name,
+                auto_metadata=args.auto_metadata,
+                capture_type=None,
+                session_id_override=sid,
+                existing_dest_dir=plan.dest_dir,
+                prior_metadata=plan.prior_metadata,
+                regenerate_metadata=plan.regenerate,
+            )
+        except Exception as exc:  # noqa: BLE001 — one failure must not stop the sweep
+            print(f"  [error] {type(exc).__name__}: {exc}")
+            continue
+        if result:
+            update_catalogue_entry(sid, result, catalogue_file)
 
     print("\nDone!")
 
@@ -921,6 +1053,26 @@ def main() -> None:
         "--pre-compact",
         action="store_true",
         help="Tag as pre-compaction snapshot (used with --from-hook).",
+    )
+    p_archive.add_argument(
+        "--refresh-grown",
+        action="store_true",
+        help=(
+            "Global mode only: re-archive already-catalogued sessions whose "
+            "live transcript on this machine has grown past the archived "
+            "copy, or whose metadata is a placeholder. Archives are updated "
+            "in place. Combine with --dry-run to list the plan without "
+            "writing or calling any model."
+        ),
+    )
+    p_archive.add_argument(
+        "--min-idle-hours",
+        type=float,
+        default=24.0,
+        help=(
+            "With --refresh-grown: skip live transcripts modified within "
+            "this many hours (default 24); their own hooks refresh them."
+        ),
     )
     p_archive.set_defaults(func=cmd_archive)
 
