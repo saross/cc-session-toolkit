@@ -375,6 +375,81 @@ class TestArchiveSessionSupersede:
         # Stale marker: metadata covers fewer bytes than the archive holds.
         assert after["extractor_source_bytes"] < archived_transcript_bytes(dest)
 
+    def test_model_off_never_downgrades_real_metadata(
+        self, tmp_path: Path, fake_generator: dict[str, Any],
+    ) -> None:
+        """A repair run with auto-metadata off keeps real metadata.
+
+        Material growth plans a regeneration, but with no model to call
+        the prior block must be carried forward (marked stale by
+        ``extractor_source_bytes``), never replaced by a placeholder.
+        """
+        live = tmp_path / f"{SID}.jsonl"
+        _write(live, 0, 10)
+        root, cat, dest = _initial_archive(tmp_path, live)
+        before = _meta(dest)
+        calls_before = fake_generator["calls"]
+        _write(live, 10, 10, append=True)
+        plan = plan_supersede(SID, live, cat, root, regenerate_on_growth=True)
+        assert plan is not None and plan.regenerate is True
+
+        archive_session(
+            live, None, stats_only=True, archive_root=root,
+            project_name_override=PROJECT, auto_metadata=False,
+            capture_type=None, session_id_override=SID,
+            existing_dest_dir=plan.dest_dir, prior_metadata=plan.prior_metadata,
+            regenerate_metadata=plan.regenerate,
+        )
+
+        after = _meta(dest)
+        assert fake_generator["calls"] == calls_before
+        assert not is_placeholder_metadata(after)
+        assert after["auto_generated"] == before["auto_generated"]
+        assert after["extractor_model_id"] == before["extractor_model_id"]
+        assert archived_transcript_bytes(dest) == live.stat().st_size
+        assert after["extractor_source_bytes"] < archived_transcript_bytes(dest)
+
+    def test_stale_metadata_is_regenerated_later(
+        self, tmp_path: Path, fake_generator: dict[str, Any],
+    ) -> None:
+        """Metadata carried forward over a refreshed transcript is not final.
+
+        Once the transcript is complete the session no longer looks grown,
+        so without a staleness rule metadata that describes only the first
+        part would never be regenerated: after a repair run with the model
+        off, or a ``PreCompact`` refresh followed by a ``SessionEnd`` with
+        nothing new.
+        """
+        live = tmp_path / f"{SID}.jsonl"
+        _write(live, 0, 10)
+        root, cat, dest = _initial_archive(tmp_path, live)
+        _write(live, 10, 10, append=True)
+        self._supersede(live, cat, root, regen_on_growth=False)  # carry forward
+        assert archived_transcript_bytes(dest) == live.stat().st_size
+
+        # PreCompact still never pays for a call...
+        assert plan_supersede(
+            SID, live, cat, root, regenerate_on_growth=False
+        ) is None
+        # ...but SessionEnd or a repair run regenerates the stale block.
+        plan = plan_supersede(SID, live, cat, root, regenerate_on_growth=True)
+        assert plan is not None and plan.regenerate is True
+        assert "stale" in plan.reason
+
+    def test_legacy_record_without_source_bytes_is_not_stale(
+        self, tmp_path: Path, fake_generator: dict[str, Any],
+    ) -> None:
+        """Records written before 2026-10-08 lack the field: not stale."""
+        live = tmp_path / f"{SID}.jsonl"
+        _write(live, 0, 10)
+        root, cat, dest = _initial_archive(tmp_path, live)
+        meta = _meta(dest)
+        meta.pop("extractor_source_bytes", None)
+        (dest / "session.meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        assert plan_supersede(
+            SID, live, cat, root, regenerate_on_growth=True
+        ) is None
+
     def test_failed_write_leaves_previous_archive_intact(
         self,
         tmp_path: Path,

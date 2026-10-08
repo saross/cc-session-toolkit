@@ -334,6 +334,13 @@ def plan_supersede(
       at ``PreCompact``) and the transcript has grown by at least
       ``AUTO_METADATA_REGEN_GROWTH_FRACTION`` beyond the bytes the
       metadata was generated from. Otherwise carry the metadata forward.
+    * An archive that is complete but whose metadata describes at least
+      that fraction less (``extractor_source_bytes``) is STALE: regenerate
+      it under the same *regenerate_on_growth* condition. Without this, a
+      transcript refreshed with its metadata carried forward (at
+      ``PreCompact``, by a repair run with the model off, or after a
+      failed regeneration) would never look grown again, and its metadata
+      would describe only the first part for good.
 
     Args:
         session_id: Session identifier.
@@ -368,12 +375,7 @@ def plan_supersede(
         transcript_path, archived
     ):
         grown = False  # only bookkeeping records were appended
-    placeholder = is_placeholder_metadata(prior)
-
-    if not grown and not placeholder:
-        return None
-
-    if placeholder:
+    if is_placeholder_metadata(prior):
         return SupersedePlan(
             dest_dir, prior, True,
             "placeholder metadata; retrying extraction",
@@ -382,6 +384,19 @@ def plan_supersede(
     # Bytes the current metadata describes. Records written before
     # 2026-10-08 lack the field; treat them as covering the archive.
     source = prior.get("extractor_source_bytes") or archived or 0
+
+    if not grown:
+        covered = archived or 0
+        stale = bool(source) and regenerate_on_growth and (
+            (covered - source) / source >= AUTO_METADATA_REGEN_GROWTH_FRACTION
+        )
+        if not stale:
+            return None
+        return SupersedePlan(
+            dest_dir, prior, True,
+            f"metadata stale (describes {source:,} of {covered:,} archived "
+            f"bytes); regenerating metadata",
+        )
     growth = (live - source) / source if source else 1.0
     regenerate = regenerate_on_growth and (
         growth >= AUTO_METADATA_REGEN_GROWTH_FRACTION
@@ -1991,7 +2006,12 @@ def archive_session(
         and not is_placeholder_metadata(prior_metadata)
     )
 
-    if prior_is_real and not regenerate_metadata:
+    # Carry real metadata forward when no regeneration is planned, and also
+    # when one is planned but no model may be called (auto-metadata off, as
+    # in a transcript-only repair run): replacing real metadata with a
+    # placeholder would lose it. The smaller extractor_source_bytes kept
+    # below marks it stale, so a later run with the model on regenerates it.
+    if prior_is_real and (not regenerate_metadata or not auto_metadata):
         auto_generated = copy.deepcopy(prior_metadata["auto_generated"])
         carried_forward = True
     elif auto_metadata:
