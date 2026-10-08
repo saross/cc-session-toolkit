@@ -29,6 +29,7 @@ from cc_session_toolkit.catalogue import (
     rebuild_catalogue,
     update_catalogue,
     update_catalogue_entry,
+    write_catalogue,
 )
 from cc_session_toolkit.config import DEFAULT_MIN_TURNS
 from cc_session_toolkit.extraction import extract_session_stats
@@ -798,10 +799,7 @@ def cmd_catalogue(args: argparse.Namespace) -> None:
         print("Rebuilding catalogue from archived sessions...")
         catalogue = rebuild_catalogue(archive_dir)
 
-        catalogue_file.parent.mkdir(parents=True, exist_ok=True)
-        catalogue_file.write_text(
-            json.dumps(catalogue, indent=2), encoding="utf-8"
-        )
+        write_catalogue(catalogue_file, catalogue)
         print(f"Wrote: {catalogue_file}")
 
         if args.markdown:
