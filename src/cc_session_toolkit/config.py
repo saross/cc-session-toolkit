@@ -141,6 +141,15 @@ OPENAI_INPUT_TOKENS_URL = "https://api.openai.com/v1/responses/input_tokens"
 # fits Gemini if the fallback runs.
 OPENAI_SESSION_TOKEN_BUDGET = 720_000
 
+# Count remotely only when the local chars/4 estimate reaches this share of
+# the budget (2026-10-08). OpenAI documents no price for counting; if it is
+# billed as input, counting every transcript twice could have more than
+# doubled the repair's cost. Most transcripts sit far below the budget, so
+# the estimate serves them; 0.5 leaves a 2x margin for the heuristic's
+# undercount on code-heavy text, and Luna's 1,050,000-token context another
+# 1.46x above the budget. Identical text is never counted twice.
+OPENAI_REMOTE_COUNT_THRESHOLD = 0.5
+
 # GPT-6 Luna list prices, standard tier (USD per million tokens), verified
 # 2026-10-08 (PA ``extractor-comparison-2026-10-08/pricing/
 # openai-model-gpt-6-luna-2026-10-08.txt``, line 9). A request whose prompt

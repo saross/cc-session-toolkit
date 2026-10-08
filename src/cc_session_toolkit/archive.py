@@ -53,6 +53,7 @@ from cc_session_toolkit.config import (
     OPENAI_LONG_PROMPT_THRESHOLD_TOKENS,
     OPENAI_OUTPUT_PRICE_PER_MTOK,
     OPENAI_REASONING_EFFORT,
+    OPENAI_REMOTE_COUNT_THRESHOLD,
     OPENAI_REQUEST_TIMEOUT_SECONDS,
     OPENAI_RESPONSES_URL,
     OPENAI_RETRY_WAITS_SECONDS,
@@ -1024,8 +1025,19 @@ def _token_counter_for_primary(
         if not api_key:
             return None, OPENAI_SESSION_TOKEN_BUDGET
 
+        from cc_session_toolkit.transcript_text import estimate_tokens
+
+        counted: dict[str, int] = {}
+
         def _count_openai(text: str) -> int:
-            return _openai_count_tokens(text, api_key=api_key)
+            """Exact Luna count near the budget; the free estimate below it."""
+            estimate = estimate_tokens(text)
+            if estimate < OPENAI_REMOTE_COUNT_THRESHOLD * OPENAI_SESSION_TOKEN_BUDGET:
+                return estimate
+            key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if key not in counted:
+                counted[key] = _openai_count_tokens(text, api_key=api_key)
+            return counted[key]
 
         return _count_openai, OPENAI_SESSION_TOKEN_BUDGET
     if gemini_client is not None:

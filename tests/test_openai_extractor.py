@@ -351,8 +351,8 @@ class TestTokenCounting:
             result = archive.generate_auto_metadata(session, {"session_id": "s"})
 
         assert result is not None and result["title"] == PARENT_RESULT["title"]
-        assert fake.count_bodies, "Luna's counter should size the transcript"
-        assert all(b["model"] == OPENAI_EXTRACTOR_MODEL_ID for b in fake.count_bodies)
+        # A short transcript is sized by the free local estimate.
+        assert fake.count_bodies == []
         gemini.models.count_tokens.assert_not_called()
         gemini.models.generate_content.assert_not_called()
 
@@ -669,3 +669,24 @@ def test_incomplete_response_logs_its_ends(
     log = Path(os.environ["CC_SESSION_LOG_DIR"]) / "auto-metadata.log"
     text = log.read_text(encoding="utf-8")
     assert "OpenAI incomplete response" in text and "TAILMARK" in text
+
+
+@pytest.mark.openai_provider
+class TestSparingCounts:
+    """2026-10-08: count remotely only near the budget, and never twice."""
+
+    def test_short_text_uses_the_local_estimate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = FakePost()
+        monkeypatch.setattr(archive, "_openai_post", fake)
+        count_fn, _budget = archive._token_counter_for_primary(None)
+        assert count_fn("x" * 4000) == 1000
+        assert fake.count_bodies == []
+
+    def test_long_text_is_counted_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = FakePost()
+        monkeypatch.setattr(archive, "_openai_post", fake)
+        monkeypatch.setattr(archive, "OPENAI_REMOTE_COUNT_THRESHOLD", 0.0)
+        count_fn, _budget = archive._token_counter_for_primary(None)
+        text = "y" * 4000
+        assert count_fn(text) == count_fn(text) == 1000
+        assert len(fake.count_bodies) == 1
