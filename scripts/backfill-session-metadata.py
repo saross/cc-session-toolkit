@@ -228,6 +228,7 @@ def update_metadata(
     meta_path: Path,
     auto_generated: dict,
     subagent_summaries: list[dict[str, str]] | None = None,
+    source_bytes: int | None = None,
 ) -> None:
     """Update ``auto_generated`` + top-level ``three_ps`` +
     ``subagent_summaries`` fields in ``session.meta.json`` and bump
@@ -281,6 +282,16 @@ def update_metadata(
     # the constant rather than a hardcoded literal so the next schema
     # bump auto-propagates here.
     data["schema_version"] = SCHEMA_VERSION
+    # Provenance (2026-10-08): the record now holds this model's output,
+    # generated from ``source_bytes`` of transcript. Before this, a
+    # backfilled record kept whatever extractor_model_id it had, so a
+    # model switch would have misattributed every backfilled summary.
+    # Read at call time, like _instrumented_call_gemini_once, so a
+    # patched config is honoured.
+    from cc_session_toolkit.config import EXTRACTOR_MODEL_ID
+
+    data["extractor_model_id"] = EXTRACTOR_MODEL_ID
+    data["extractor_source_bytes"] = source_bytes
 
     # Atomic overwrite: write to a sibling ``.json.tmp`` first, then
     # ``os.replace`` it over the canonical path. The plain
@@ -710,6 +721,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            "Process at most N sessions, newest first (added 2026-10-08 "
+            "for the scheduled daily retry, so one run's spend is "
+            "bounded). Sessions left over are picked up by later runs."
+        ),
+    )
+    parser.add_argument(
         "--cost-log",
         type=Path,
         default=None,
@@ -747,6 +768,12 @@ def main() -> None:
         return
 
     print(f"Found {len(sessions)} session(s) needing {mode_label}.")
+    if args.limit is not None and len(sessions) > args.limit:
+        # Newest first: recent sessions matter most for continuity.
+        sessions = sorted(
+            sessions, key=lambda p: p.parent.name, reverse=True
+        )[: args.limit]
+        print(f"Limiting this run to the newest {len(sessions)}.")
     if args.dry_run:
         for meta_path in sessions:
             rel = meta_path.parent.relative_to(args.archive_root)
@@ -875,7 +902,10 @@ def main() -> None:
                 # preserving).
                 if args.upgrade_to_v13:
                     backup_pre_v13_meta(meta_path)
-                update_metadata(meta_path, result, subagent_summaries)
+                update_metadata(
+                    meta_path, result, subagent_summaries,
+                    source_bytes=tmp_path.stat().st_size,
+                )
                 title = result.get("title", "?")
                 n_phases = len((result.get("phases") or []))
                 n_decisions = len((result.get("decisions") or []))
