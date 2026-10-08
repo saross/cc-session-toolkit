@@ -2105,6 +2105,47 @@ class TestCliCatalogueGlobal:
         # And the catalogue file must NOT have been created
         assert not (bogus / "CATALOG.json").exists()
 
+    def test_catalogue_rebuild_refuses_a_lost_entry(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """
+        ``catalogue --rebuild`` is the transactional rebuild (review
+        2026-10-08, round two): a session whose directory has gone is
+        refused, the catalogue is left as it is, and only an explicit
+        ``--allow-removed`` list lets the entry go.
+        """
+        archive_root = tmp_path / "global-archive"
+        for name, sid in (("2026-03-15T10-00_aaaaaaaa", "A"),
+                          ("2026-03-16T10-00_bbbbbbbb", "B")):
+            entry = archive_root / "demo-project" / name
+            entry.mkdir(parents=True)
+            (entry / "session.meta.json").write_text(json.dumps({
+                "session": {"id": sid, "started_at": "2026-03-15T10:00:00Z"},
+                "archive": {"jsonl_bytes_uncompressed": 10},
+            }))
+        monkeypatch.chdir(tmp_path)
+        argv = ["catalogue", "--rebuild", "--archive-root", str(archive_root)]
+        assert self._run_cli(argv, monkeypatch) == 0
+        catalogue_file = archive_root / "CATALOG.json"
+        before = catalogue_file.read_text()
+
+        gone = archive_root / "demo-project" / "2026-03-16T10-00_bbbbbbbb"
+        (gone / "session.meta.json").unlink()
+        gone.rmdir()
+        capsys.readouterr()
+        assert self._run_cli(argv, monkeypatch) == 1
+        assert "Refused, catalogue unchanged" in capsys.readouterr().out
+        assert catalogue_file.read_text() == before
+
+        allow = tmp_path / "removed.txt"
+        allow.write_text("# authorised cleanup\ndemo-project/2026-03-16T10-00_bbbbbbbb\n")
+        assert self._run_cli([*argv, "--allow-removed", str(allow)], monkeypatch) == 0
+        ids = {s["id"] for s in json.loads(catalogue_file.read_text())["sessions"]}
+        assert ids == {"A"}
+
 
 class TestExtractCwdFromJsonl:
     """Robustness of :func:`_extract_cwd_from_jsonl`."""
