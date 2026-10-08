@@ -349,15 +349,54 @@ class TestInstrumentedCallGeminiOnce:
         )
         assert len(backfill._CALL_RECORDS) == 1
         rec = backfill._CALL_RECORDS[0]
-        # At $0.75/MTok input + $4.50/MTok output:
-        # cost = 1.0 * 0.75 + 0.1 * 4.50 = 0.75 + 0.45 = 1.20
-        assert rec["cost_usd"] == pytest.approx(1.20, abs=1e-6)
+        # Flex list prices from config (re-pinned 2026-10-08 for 3.8 Flash,
+        # rather than hard-coding a price that changes with the model).
+        from cc_session_toolkit.config import (
+            GEMINI_FLEX_INPUT_PRICE_PER_MTOK as IN_P,
+            GEMINI_FLEX_OUTPUT_PRICE_PER_MTOK as OUT_P,
+        )
+        assert rec["cost_usd"] == pytest.approx(1.0 * IN_P + 0.1 * OUT_P, abs=1e-6)
         assert rec["cost_unknown_reason"] is None
         assert rec["input_tokens_charged"] == 1_000_000
         assert rec["output_tokens"] == 100_000
         assert rec["target"] == "test-target"
         assert rec["phase"] == "parent"
         assert rec["had_response_schema"] is False
+
+    def test_thinking_tokens_are_billed_as_output(
+        self, backfill: ModuleType
+    ) -> None:
+        """2026-10-08: 3.8 bills thinking tokens at the output rate."""
+        usage = _MockUsageMetadata(
+            prompt_token_count=0, candidates_token_count=100_000,
+        )
+        usage.thoughts_token_count = 100_000
+        client = _MockClient(_MockGeminiResponse(usage_metadata=usage))
+        backfill._instrumented_call_gemini_once(client, "user msg", "system msg")
+        from cc_session_toolkit.config import GEMINI_FLEX_OUTPUT_PRICE_PER_MTOK
+        rec = backfill._CALL_RECORDS[-1]
+        assert rec["output_tokens"] == 200_000
+        assert rec["cost_usd"] == pytest.approx(
+            0.2 * GEMINI_FLEX_OUTPUT_PRICE_PER_MTOK, abs=1e-6
+        )
+
+    def test_standard_tier_uses_standard_prices(
+        self, backfill: ModuleType
+    ) -> None:
+        client = _MockClient(_MockGeminiResponse(
+            usage_metadata=_MockUsageMetadata(
+                prompt_token_count=1_000_000, candidates_token_count=0,
+            ),
+        ))
+        backfill._instrumented_call_gemini_once(
+            client, "user msg", "system msg", service_tier=None
+        )
+        from cc_session_toolkit.config import GEMINI_STANDARD_INPUT_PRICE_PER_MTOK
+        rec = backfill._CALL_RECORDS[-1]
+        assert rec["service_tier"] == "standard"
+        assert rec["cost_usd"] == pytest.approx(
+            GEMINI_STANDARD_INPUT_PRICE_PER_MTOK, abs=1e-6
+        )
 
     def test_missing_usage_metadata_yields_unknown_cost(
         self, backfill: ModuleType

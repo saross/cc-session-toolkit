@@ -288,9 +288,13 @@ def update_metadata(
     # model switch would have misattributed every backfilled summary.
     # Read at call time, like _instrumented_call_gemini_once, so a
     # patched config is honoured.
-    from cc_session_toolkit.config import EXTRACTOR_MODEL_ID
+    from cc_session_toolkit.config import (
+        AUTO_METADATA_THINKING_LEVEL,
+        EXTRACTOR_MODEL_ID,
+    )
 
     data["extractor_model_id"] = EXTRACTOR_MODEL_ID
+    data["extractor_thinking_level"] = AUTO_METADATA_THINKING_LEVEL
     data["extractor_source_bytes"] = source_bytes
 
     # Atomic overwrite: write to a sibling ``.json.tmp`` first, then
@@ -520,28 +524,34 @@ def _instrumented_call_gemini_once(
     user_message: str,
     system_prompt: str,
     response_schema: dict[str, Any] | None = None,
+    service_tier: str | None = "flex",
 ) -> str:
     """Wrapper around production ``_call_gemini_once`` that captures cost.
 
-    Mirrors the production helper's behaviour exactly (config keys,
-    ``thinking_budget=0``, optional ``response_schema``, RuntimeError on
-    ``response.text is None``) while additionally recording per-call
-    usage tokens + cost into ``_CALL_RECORDS``.
+    Builds its request with the production ``_build_gemini_config``
+    (2026-10-08: previously a hand-kept copy of the config, which would
+    have drifted at the 3.8 switch), and mirrors the RuntimeError on
+    ``response.text is None``, while additionally recording per-call
+    usage tokens + cost into ``_CALL_RECORDS``. Cost counts thinking
+    tokens as output (Gemini bills them so) and uses the standard-tier
+    price for the standard-tier fallback.
     """
+    from cc_session_toolkit.archive import _build_gemini_config
     from cc_session_toolkit.config import (
-        AUTO_METADATA_MAX_OUTPUT_TOKENS,
         EXTRACTOR_MODEL_ID,
+        GEMINI_STANDARD_INPUT_PRICE_PER_MTOK,
+        GEMINI_STANDARD_OUTPUT_PRICE_PER_MTOK,
     )
 
-    config: dict[str, Any] = {
-        "service_tier": "flex",
-        "max_output_tokens": AUTO_METADATA_MAX_OUTPUT_TOKENS,
-        "system_instruction": system_prompt,
-        "thinking_config": {"thinking_budget": 0},
-        "response_mime_type": "application/json",
-    }
-    if response_schema is not None:
-        config["response_schema"] = response_schema
+    config = _build_gemini_config(
+        system_prompt, response_schema, service_tier=service_tier
+    )
+    if service_tier == "flex":
+        in_price = GEMINI_FLEX_INPUT_PRICE_PER_MTOK
+        out_price = GEMINI_FLEX_OUTPUT_PRICE_PER_MTOK
+    else:
+        in_price = GEMINI_STANDARD_INPUT_PRICE_PER_MTOK
+        out_price = GEMINI_STANDARD_OUTPUT_PRICE_PER_MTOK
 
     t0 = time.time()
     response = client.models.generate_content(
@@ -562,18 +572,20 @@ def _instrumented_call_gemini_once(
     else:
         in_tok = getattr(um, "prompt_token_count", None)
         out_tok = getattr(um, "candidates_token_count", None)
+        # Thinking tokens are billed at the output rate (2026-10-08).
+        thoughts = getattr(um, "thoughts_token_count", None)
+        if not isinstance(thoughts, int):
+            thoughts = 0
+        if out_tok is not None:
+            out_tok += thoughts
         if in_tok is None or out_tok is None:
             cost_usd = None
             cost_unknown_reason = (
                 "usage_metadata present but token counts missing"
             )
         else:
-            cost_in = (
-                in_tok / 1_000_000 * GEMINI_FLEX_INPUT_PRICE_PER_MTOK
-            )
-            cost_out = (
-                out_tok / 1_000_000 * GEMINI_FLEX_OUTPUT_PRICE_PER_MTOK
-            )
+            cost_in = in_tok / 1_000_000 * in_price
+            cost_out = out_tok / 1_000_000 * out_price
             cost_usd = round(cost_in + cost_out, 6)
             cost_unknown_reason = None
 
@@ -587,6 +599,7 @@ def _instrumented_call_gemini_once(
         "cost_unknown_reason": cost_unknown_reason,
         "wall_seconds": wall_seconds,
         "had_response_schema": response_schema is not None,
+        "service_tier": service_tier or "standard",
     })
 
     raw = response.text

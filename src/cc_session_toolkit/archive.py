@@ -25,6 +25,7 @@ from cc_session_toolkit.config import (
     AUTO_METADATA_FLEX_RETRY_WAITS_SECONDS,
     AUTO_METADATA_MAX_OUTPUT_TOKENS,
     AUTO_METADATA_REGEN_GROWTH_FRACTION,
+    AUTO_METADATA_THINKING_LEVEL,
     CODE_STATE_SIDECAR_DIR,
     DEFAULT_LICENCE,
     DEFAULT_MIN_DURATION_MINUTES,
@@ -610,21 +611,55 @@ def _parse_metadata_response_json(raw_text: str) -> dict[str, Any]:
     return obj
 
 
+def _build_gemini_config(
+    system_prompt: str,
+    response_schema: dict[str, Any] | None = None,
+    *,
+    service_tier: str | None = "flex",
+) -> dict[str, Any]:
+    """
+    Build the ``generate_content`` config for an extractor call.
+
+    One builder for every caller (production and the backfill's
+    cost-instrumented wrapper), so the two cannot drift apart.
+
+    Thinking (2026-10-08): ``thinking_level`` replaces the old
+    ``thinking_budget=0``, which Google deprecated on 2026-10-07; sending
+    both returns 400. The output cap counts thinking tokens, hence the
+    16,384 cap in config. *service_tier* ``"flex"`` selects the discounted
+    tier; *None* omits the key, i.e. standard tier (the fallback).
+    """
+    config: dict[str, Any] = {
+        "max_output_tokens": AUTO_METADATA_MAX_OUTPUT_TOKENS,
+        "system_instruction": system_prompt,
+        "thinking_config": {"thinking_level": AUTO_METADATA_THINKING_LEVEL},
+        # 2026-05-24: enforce JSON output mode so Gemini cannot wrap
+        # its response in markdown fences or trailing prose. The
+        # 2026-05-24 bake-off observed that v3 prompts without this
+        # mode produced occasional parse failures even with the
+        # robust JSON parser; the mode eliminates the failure class
+        # at source.
+        "response_mime_type": "application/json",
+    }
+    if service_tier is not None:
+        config["service_tier"] = service_tier
+    if response_schema is not None:
+        config["response_schema"] = response_schema
+    return config
+
+
 def _call_gemini_once(
     client: Any,
     user_message: str,
     system_prompt: str,
     response_schema: dict[str, Any] | None = None,
+    service_tier: str | None = "flex",
 ) -> str:
     """
-    Single Flex-tier Gemini call. Raises on any error; returns raw text.
+    Single Gemini call. Raises on any error; returns raw text.
 
-    ``thinking_budget=0`` is mandatory (architectural decision
-    2026-05-18, carried forward to the 2026-05-22 Gemini 3.5 Flash
-    migration): Gemini's Flash family is a reasoning model and without
-    this flag thinking tokens consume the output budget before any JSON
-    is emitted. ``service_tier="flex"`` selects the discounted tier;
-    list price ~3× Gemini 3 Flash Preview but JSON-defect-free.
+    Configuration comes from :func:`_build_gemini_config`; *service_tier*
+    is ``"flex"`` (discounted, preemptible) or *None* for standard tier.
 
     ``response.text`` can be ``None`` when the model is blocked by a
     safety filter, when ``finish_reason`` is ``MAX_TOKENS`` with no
@@ -638,28 +673,14 @@ def _call_gemini_once(
 
     When ``response_schema`` is supplied (an OpenAPI-style dict), Gemini
     validates its output against the schema before emitting and rejects
-    malformed JSON at source. Used on the subagent path (single-field
-    ``{"narrative": str}``) to close the residual ~4 % stochastic-JSON
-    failure rate observed on the 2026-05-24 backfill (b089991e/ab92875b).
-    Not enabled on the parent path: the v3 parent schema's optional
-    arrays (phases/decisions/key_exchanges) would need a richer schema
-    spec — deferred as a separate design decision.
+    malformed JSON at source. Both the subagent path (single-field
+    ``{"narrative": str}``) and the parent path (``PARENT_METADATA_SCHEMA``,
+    passed by :func:`generate_auto_metadata`) use it. (Corrected
+    2026-10-08: this docstring said the parent path did not.)
     """
-    config: dict[str, Any] = {
-        "service_tier": "flex",
-        "max_output_tokens": AUTO_METADATA_MAX_OUTPUT_TOKENS,
-        "system_instruction": system_prompt,
-        "thinking_config": {"thinking_budget": 0},
-        # 2026-05-24: enforce JSON output mode so Gemini cannot wrap
-        # its response in markdown fences or trailing prose. The
-        # 2026-05-24 bake-off observed that v3 prompts without this
-        # mode produced occasional parse failures even with the
-        # robust JSON parser; the mode eliminates the failure class
-        # at source.
-        "response_mime_type": "application/json",
-    }
-    if response_schema is not None:
-        config["response_schema"] = response_schema
+    config = _build_gemini_config(
+        system_prompt, response_schema, service_tier=service_tier
+    )
     response = client.models.generate_content(
         model=EXTRACTOR_MODEL_ID,
         contents=user_message,
@@ -688,12 +709,18 @@ def _call_gemini_with_retry(
     response_schema: dict[str, Any] | None = None,
 ) -> str:
     """
-    Call Gemini Flex with exponential-backoff retries on HTTP 503.
+    Call Gemini Flex with backoff retries on HTTP 503, then standard tier.
 
     Flex preemption surfaces as HTTP 503 "Service Unavailable" (see
     Google's Flex documentation). We retry on 503 specifically; other
     errors propagate. The schedule is configurable via
     ``AUTO_METADATA_FLEX_RETRY_WAITS_SECONDS``.
+
+    Standard-tier fallback (2026-10-08): when every Flex attempt is
+    preempted, make ONE standard-tier attempt before giving up. Flex
+    give-ups had left 25 archived sessions with placeholder metadata, and
+    at the 3.8 introductory prices one standard call costs no more than a
+    3.5 Flex call did. A 503 at standard tier still gives up.
 
     ``response_schema`` is forwarded verbatim to :func:`_call_gemini_once`
     on every attempt.
@@ -730,9 +757,22 @@ def _call_gemini_with_retry(
             if not is_503:
                 raise
             # Else: retry on next loop iteration.
-    raise RuntimeError(
-        f"Gemini Flex preempted {len(waits)} times; last error: {last_exc}"
+    _log_metadata_event(
+        f"Gemini Flex preempted {len(waits)} times; falling back to one "
+        f"standard-tier attempt",
+        level="WARNING",
     )
+    try:
+        return _call_gemini_once(
+            client, user_message, system_prompt, response_schema,
+            service_tier=None,
+        )
+    except Exception as exc:  # noqa: BLE001 — reported below
+        raise RuntimeError(
+            f"Gemini Flex preempted {len(waits)} times and the standard-tier "
+            f"fallback failed; last Flex error: {last_exc}; standard-tier "
+            f"error: {exc}"
+        ) from exc
 
 
 def generate_auto_metadata(
@@ -751,12 +791,15 @@ def generate_auto_metadata(
     - Production prompt loaded from package data at
       ``cc_session_toolkit/prompts/auto_metadata.md`` (override via
       ``CC_AUTO_METADATA_PROMPT_PATH`` env var).
-    - Gemini 3.5 Flash (Flex tier) via ``google.genai`` with
-      ``thinking_budget=0`` and 503-retry backoff.
+    - Gemini 3.8 Flash (Flex tier, thinking level ``medium``) via
+      ``google.genai``, with 503-retry backoff and one standard-tier
+      fallback (2026-10-08; previously 3.5 Flash with ``thinking_budget=0``).
 
-    Budget: ~$0.08 per session at Gemini 3.5 Flash Flex (3× the 2026-05-18
-    Gemini 3 Flash Preview Flex price; accepted on 2026-05-22 for zero
-    JSON defects + better named-entity preservation).
+    Budget (2026-10-08 comparison, 10 sessions): mean ~$0.08 per session
+    at the introductory 3.8 Flex price, doubling from 2027-01-01. Long
+    sessions cost more: the 20 placeholder sessions averaged ~271k input
+    tokens. Run the backfill's ``--dry-run`` for a grounded estimate
+    rather than relying on this figure.
 
     Falls back to *None* on any of: ``google-genai`` not installed, no
     API key available, transcript extraction failure, persistent 503,
@@ -1572,6 +1615,7 @@ def create_session_metadata(
     code_state: dict[str, Any] | None = None,
     extractor_source_bytes: int | None = None,
     supersedes: dict[str, Any] | None = None,
+    extractor_thinking_level: str | None = None,
 ) -> dict[str, Any]:
     """
     Create the complete ``session.meta.json`` structure (v1.3 schema).
@@ -1619,6 +1663,8 @@ def create_session_metadata(
             metadata is stale (added 2026-10-08).
         supersedes: Provenance of the capture this archive replaced,
             stored at ``archive.supersedes`` (added 2026-10-08).
+        extractor_thinking_level: Thinking level the extractor ran at
+            (*None* for a placeholder, or a record from before 2026-10-08).
         code_state: Pre-computed code-state dict
             ``{commit_at_start, commit_at_end, dirty_at_end}``.  When
             *None*, :func:`capture_code_state` is invoked against
@@ -1808,6 +1854,7 @@ def create_session_metadata(
         # Bytes the auto_generated block describes (2026-10-08). Lets a
         # reader or the backfill tell current metadata from stale.
         "extractor_source_bytes": extractor_source_bytes,
+        "extractor_thinking_level": extractor_thinking_level,
         "archive": archive,
         "subagents": subagents_list,
         # v1.3 (2026-05-24): lightweight per-subagent narrative
@@ -1937,6 +1984,7 @@ def archive_session(
     # keeps the values of the record it came from.
     extractor_model_for_record: str | None = None
     extractor_source_bytes: int | None = None
+    extractor_thinking_level: str | None = None
     carried_forward = False
     prior_is_real = (
         prior_metadata is not None
@@ -1971,6 +2019,7 @@ def archive_session(
 
     if carried_forward:
         extractor_model_for_record = prior_metadata.get("extractor_model_id")
+        extractor_thinking_level = prior_metadata.get("extractor_thinking_level")
         extractor_source_bytes = prior_metadata.get(
             "extractor_source_bytes"
         ) or ((prior_metadata.get("archive") or {}).get(
@@ -2204,6 +2253,7 @@ def archive_session(
     ):
         extractor_source_bytes = uncompressed_size
         extractor_model_for_record = EXTRACTOR_MODEL_ID
+        extractor_thinking_level = AUTO_METADATA_THINKING_LEVEL
 
     # Archive any sub-agent transcripts alongside the parent (v1.2).
     # Keeps parent + sub-agents co-located as one atomic archive unit.
@@ -2316,6 +2366,7 @@ def archive_session(
         extractor_model_id=extractor_model_for_record,
         extractor_source_bytes=extractor_source_bytes,
         supersedes=supersedes,
+        extractor_thinking_level=extractor_thinking_level,
     )
 
     # Atomic write (2026-10-08): superseding overwrites an existing record,

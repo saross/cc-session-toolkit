@@ -51,7 +51,25 @@ SCHEMA_VERSION = "1.3"
 # ``hooks/extraction-hook.py`` carries an independent ``HAIKU_MODEL``
 # constant for memory extraction; the two are deliberately
 # loose-coupled because they may move on different cadences.
-EXTRACTOR_MODEL_ID = "gemini-3.5-flash"
+#
+# 2026-10-08: migrated to ``gemini-3.8-flash`` at thinking level
+# ``medium`` after a 10-session comparison (PA
+# ``data/experiments/extractor-comparison-2026-10-08/report.md``). 3.8
+# matched or beat 3.5 on schema validity, verbatim quotes, and invented
+# specifics (none for either), and covered more side topics in long
+# sessions (19 vs 12 of 22), the known weakness. It cost ~52% of 3.5 at
+# the introductory 3.8 Flex price, ~103% once that price doubles on
+# 2027-01-01. Google's 2026-10-07 notice also deprecates
+# ``thinking_budget`` (upcoming models reject it with 400).
+EXTRACTOR_MODEL_ID = "gemini-3.8-flash"
+
+# Thinking level for the extractor (2026-10-08). ``medium`` is the
+# documented default for 3.8 Flash; it is set explicitly so the record
+# states it. ``low`` produced no thinking tokens and weaker side-topic
+# coverage; ``high`` exceeded an 8,192-token cap on 2 of 3 sessions.
+# ``minimal`` is rejected by 3.8. Sending ``thinking_budget`` together
+# with ``thinking_level`` returns 400, so only the level is sent.
+AUTO_METADATA_THINKING_LEVEL = "medium"
 
 # ---------------------------------------------------------------------------
 # Auto-metadata extraction tuning
@@ -66,14 +84,29 @@ EXTRACTOR_MODEL_ID = "gemini-3.5-flash"
 # applies to the subagent-narrative call path — subagent outputs are
 # much smaller (~60–200 words) so the cap is non-binding there, and a
 # separate constant would be dead code per the 2026-05-24 audit.
-AUTO_METADATA_MAX_OUTPUT_TOKENS = 8192
+#
+# 2026-10-08: raised 8192 → 16384 because the cap counts thinking tokens.
+# At thinking level medium, one comparison session used 6,316 of 8,192
+# (77%), and a truncated response yields unparseable JSON, i.e. no
+# metadata at all.
+AUTO_METADATA_MAX_OUTPUT_TOKENS = 16384
 
 # Wait pattern for Flex preemption (HTTP 503) retries. Per Google's
 # Flex documentation, preemption surfaces as HTTP 503 "Service
 # Unavailable". The bake-off used (30, 60, 120) and observed zero
 # preemptions across 10 sessions, but the schedule stays in place as
 # cheap insurance for the production-cadence higher-volume path.
-AUTO_METADATA_FLEX_RETRY_WAITS_SECONDS = (30, 60, 120)
+#
+# 2026-10-08: lengthened, with one standard-tier attempt after the last
+# Flex failure (see ``archive._call_gemini_with_retry``). Production log:
+# Flex give-ups rose to 36% of main-session extractions in October; on
+# the comparison day 3.8 Flex returned 503 on 32 of 59 calls and 3 of 27
+# jobs needed more than 4 attempts. The comparison suggested waits up
+# to (30, 60, 120, 240, 300, 300); the schedule stops at 240 s because
+# the hooks run async with a 120 s timeout and the longest extraction
+# the log shows surviving is ~7 minutes. The standard-tier fallback
+# covers the rest.
+AUTO_METADATA_FLEX_RETRY_WAITS_SECONDS = (30, 60, 120, 240)
 
 # Re-archive (supersede) policy, added 2026-10-08. When a session is
 # archived again after its transcript has grown (a later PreCompact, the
@@ -87,13 +120,20 @@ AUTO_METADATA_FLEX_RETRY_WAITS_SECONDS = (30, 60, 120)
 # retried regardless of growth.
 AUTO_METADATA_REGEN_GROWTH_FRACTION = 0.10
 
-# Gemini Flex list price (USD per million tokens) — see
-# https://ai.google.dev/gemini-api/docs/pricing#flex. Verified
-# 2026-05-22 for Gemini 3.5 Flash (3× the 3 Flash Preview Flex rate);
-# tracks ``EXTRACTOR_MODEL_ID`` and must be re-verified whenever it
-# changes. Surfaced for cost estimation in backfill / batch code.
-GEMINI_FLEX_INPUT_PRICE_PER_MTOK = 0.75
-GEMINI_FLEX_OUTPUT_PRICE_PER_MTOK = 4.50
+# Gemini list prices (USD per million tokens) — see
+# https://ai.google.dev/gemini-api/docs/pricing. Track
+# ``EXTRACTOR_MODEL_ID`` and must be re-verified whenever it changes.
+# Surfaced for cost estimation in backfill / batch code.
+#
+# Gemini 3.8 Flash, verified 2026-10-08 (PA experiment
+# ``extractor-comparison-2026-10-08/pricing/gemini-pricing-2026-10-08.txt``).
+# Output prices include thinking tokens. ⚠ These are INTRODUCTORY prices
+# through 2026-12-31; from 2027-01-01 they double (Flex 0.75 / 3.75,
+# standard 1.50 / 7.50). Update them then.
+GEMINI_FLEX_INPUT_PRICE_PER_MTOK = 0.375
+GEMINI_FLEX_OUTPUT_PRICE_PER_MTOK = 1.875
+GEMINI_STANDARD_INPUT_PRICE_PER_MTOK = 0.75
+GEMINI_STANDARD_OUTPUT_PRICE_PER_MTOK = 3.75
 
 # ---------------------------------------------------------------------------
 # Subagent summary fan-out cap
