@@ -602,3 +602,18 @@ class TestOpenAIEstimates:
             "target": "proj/entry", "phase": "parent",
             "provider": "openai", "cost_usd": 0.01,
         }]
+
+
+def test_finds_both_placeholder_texts(tmp_path: Path) -> None:
+    """A model-off repair writes the 'interactive' placeholder; select it too."""
+    backfill = _load_backfill_module()
+    for name, purpose in (("a", "Auto-metadata unavailable"),
+                          ("b", "Metadata generation requires interactive CC session"),
+                          ("c", "A real purpose")):
+        entry = tmp_path / "proj" / name
+        entry.mkdir(parents=True)
+        (entry / "session.meta.json").write_text(
+            json.dumps({"auto_generated": {"purpose": purpose}}), encoding="utf-8"
+        )
+    found = backfill.find_sessions_needing_backfill(tmp_path)
+    assert sorted(p.parent.name for p in found) == ["a", "b"]

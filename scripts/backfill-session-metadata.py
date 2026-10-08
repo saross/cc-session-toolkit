@@ -59,6 +59,7 @@ from cc_session_toolkit.archive import (  # noqa: E402
     _ensure_openai_api_key,
     _extractor_providers,
     _openai_key_names,
+    is_placeholder_metadata,
     _log_metadata_event,
     generate_auto_metadata,
     generate_subagent_summaries,
@@ -104,8 +105,11 @@ def find_sessions_needing_backfill(
         # near-empty content). Audit follow-up 2026-05-28.
         if data.get("auto_metadata_skip_permanent"):
             continue
-        auto_gen = data.get("auto_generated", {})
-        if auto_gen.get("purpose") == "Auto-metadata unavailable":
+        # Both placeholder texts (2026-10-08): the archiver writes
+        # "Metadata generation requires interactive CC session" when it runs
+        # with auto-metadata off, as a transcript-only repair does, and a
+        # match on "Auto-metadata unavailable" alone missed those.
+        if is_placeholder_metadata(data):
             results.append(meta_path)
     return results
 
