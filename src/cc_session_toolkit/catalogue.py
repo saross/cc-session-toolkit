@@ -12,6 +12,7 @@ import contextlib
 import json
 import os
 import tempfile
+import time
 from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
@@ -49,28 +50,66 @@ def _lock_path(catalogue_file: Path) -> Path:
     return catalogue_file.with_name(catalogue_file.name + ".lock")
 
 
+class CatalogueLockError(RuntimeError):
+    """The catalogue lock could not be taken (refused, or timed out)."""
+
+
+class CatalogueScanError(RuntimeError):
+    """A strict rebuild met unreadable metadata, so its scan is incomplete."""
+
+
+class CatalogueRebuildRefused(RuntimeError):
+    """A rebuild would drop entries it cannot account for; nothing written."""
+
+
+def _acquire_lock(handle: Any, timeout: float | None) -> None:
+    """Take an exclusive ``flock`` on *handle*, waiting at most *timeout* s."""
+    if timeout is None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except OSError as exc:
+            raise CatalogueLockError(f"cannot lock the catalogue: {exc}") from exc
+        return
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise CatalogueLockError(
+                    f"catalogue lock still held after {timeout:g} s"
+                ) from None
+            time.sleep(0.1)
+        except OSError as exc:
+            raise CatalogueLockError(f"cannot lock the catalogue: {exc}") from exc
+
+
 @contextlib.contextmanager
-def catalogue_lock(catalogue_file: Path) -> Iterator[None]:
+def catalogue_lock(
+    catalogue_file: Path, *, timeout: float | None = None,
+) -> Iterator[None]:
     """Hold an exclusive lock on *catalogue_file* for a read-modify-write.
+
+    Fails closed (review 2026-10-08): if the lock cannot be taken, raises
+    :class:`CatalogueLockError` and the body never runs. The first version
+    ran the body unlocked, which reopened the lost-update race the lock
+    exists to close. A hook that fails here has already written its
+    metadata, so the next rebuild still catalogues it. *timeout* bounds the
+    wait (the daily sync's rebuild must not hang on a stalled mount).
 
     Not re-entrant: never nest two of these on the same catalogue in one
     process, because a second ``flock`` on a new descriptor would wait for
-    the first. On a filesystem that refuses ``flock`` the body still runs,
-    unlocked, rather than failing the archive.
+    the first. Over SSHFS the lock excludes writers on this machine only.
     """
     catalogue_file.parent.mkdir(parents=True, exist_ok=True)
     with open(_lock_path(catalogue_file), "a", encoding="utf-8") as handle:
-        locked = False
         if fcntl is not None:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-                locked = True
-            except OSError:
-                locked = False
+            _acquire_lock(handle, timeout)
         try:
             yield
         finally:
-            if locked:
+            if fcntl is not None:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
@@ -106,11 +145,132 @@ def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
 def write_catalogue(catalogue_file: Path, catalogue: dict[str, Any]) -> None:
     """Replace *catalogue_file* with *catalogue*, locked and atomically.
 
-    The writer for full rebuilds. Incremental updates take the same lock
-    around their whole read-modify-write instead.
+    Locks only the publication, so a scan done before calling it can miss
+    an entry a hook adds meanwhile. For rebuilds use
+    :func:`rebuild_and_write_catalogue`, which holds one lock across the
+    whole transaction.
     """
     with catalogue_lock(catalogue_file):
         _write_json_atomic(catalogue_file, catalogue)
+
+
+def _read_baseline(catalogue_file: Path) -> dict[str, Any] | None:
+    """Return the existing catalogue, *None* if there is none.
+
+    An existing file that cannot be read or parsed raises: an uncertain
+    baseline must stop a rebuild rather than disable its checks.
+    """
+    if not catalogue_file.exists():
+        return None
+    try:
+        data = json.loads(catalogue_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CatalogueRebuildRefused(
+            f"existing catalogue unreadable ({exc}); kept as it is"
+        ) from exc
+    if not isinstance(data, dict) or not isinstance(data.get("sessions"), list):
+        raise CatalogueRebuildRefused(
+            "existing catalogue has no sessions list; kept as it is"
+        )
+    return data
+
+
+def check_rebuild_keeps_entries(
+    baseline: dict[str, Any] | None,
+    rebuilt: dict[str, Any],
+    archive_dir: Path,
+    *,
+    max_removed_fraction: float = 0.5,
+) -> None:
+    """
+    Refuse a rebuild that loses entries it cannot account for.
+
+    The store is append-only, so an entry may leave the catalogue only when
+    its directory no longer holds a ``session.meta.json`` (moved or
+    removed on purpose). Raises :class:`CatalogueRebuildRefused` when:
+
+    * an entry whose directory still holds metadata would be dropped, or
+    * more than *max_removed_fraction* of the baseline's entries were
+      removed, which looks like a stale or empty mount rather than intent.
+
+    Entries without a recorded directory (older catalogues) are matched
+    by session id.
+    """
+    if baseline is None:
+        return
+    new_keys = {(s.get("id"), s.get("directory")) for s in rebuilt.get("sessions", [])}
+    new_ids = {s.get("id") for s in rebuilt.get("sessions", [])}
+    old = baseline.get("sessions", [])
+    lost: list[str] = []
+    removed = 0
+    for entry in old:
+        directory = entry.get("directory")
+        if not directory:
+            if entry.get("id") not in new_ids:
+                removed += 1
+            continue
+        if (entry.get("id"), directory) in new_keys:
+            continue
+        if (archive_dir / directory / "session.meta.json").is_file():
+            lost.append(directory)
+        else:
+            removed += 1
+    if lost:
+        raise CatalogueRebuildRefused(
+            f"{len(lost)} entr{'y' if len(lost) == 1 else 'ies'} whose directory "
+            f"still holds metadata would be dropped (e.g. {lost[0]})"
+        )
+    if old and removed > max_removed_fraction * len(old):
+        raise CatalogueRebuildRefused(
+            f"{removed} of {len(old)} entries would be removed (more than "
+            f"{max_removed_fraction:.0%}): a stale or empty mount? Pass a "
+            f"higher max_removed_fraction to accept an intentional removal"
+        )
+
+
+def rebuild_and_write_catalogue(
+    archive_dir: Path,
+    catalogue_file: Path | None = None,
+    *,
+    lock_timeout: float | None = None,
+    max_removed_fraction: float = 0.5,
+) -> dict[str, Any]:
+    """
+    Rebuild the catalogue from disk and publish it in ONE locked transaction.
+
+    Review 2026-10-08 (P1): a rebuild that scanned before taking the lock
+    could miss an entry a hook added meanwhile, then overwrite the hook's
+    update. Here the baseline read, the strict scan, the identity check and
+    the atomic write all happen under one lock. Raises
+    (:class:`CatalogueLockError`, :class:`CatalogueScanError`,
+    :class:`CatalogueRebuildRefused`) and leaves the existing file untouched
+    on any doubt.
+    """
+    catalogue_file = catalogue_file or archive_dir / "CATALOG.json"
+    with catalogue_lock(catalogue_file, timeout=lock_timeout):
+        baseline = _read_baseline(catalogue_file)
+        rebuilt = rebuild_catalogue(archive_dir, strict=True)
+        check_rebuild_keeps_entries(
+            baseline, rebuilt, archive_dir,
+            max_removed_fraction=max_removed_fraction,
+        )
+        _write_json_atomic(catalogue_file, rebuilt)
+    return rebuilt
+
+
+def _sort_newest_first(sessions: list[dict[str, Any]]) -> None:
+    """Sort entries newest first by each session's PREFERRED copy's date.
+
+    The list arrives with each session's copies in preference order. A
+    plain date sort let a shorter copy with a later date overtake the
+    preferred one (review 2026-10-08, P2), and lookups take the first
+    match. Copies of one session share a key here, and Python's sort is
+    stable (also with ``reverse=True``), so their order survives.
+    """
+    preferred_date: dict[Any, str] = {}
+    for entry in sessions:
+        preferred_date.setdefault(entry.get("id"), entry.get("started_at") or "")
+    sessions.sort(key=lambda e: preferred_date.get(e.get("id"), ""), reverse=True)
 
 
 # -------------------------------------------------------------------------
@@ -220,10 +380,8 @@ def _update_catalogue_locked(
     catalogue["project"] = project_name
     catalogue["total_sessions"] = len(catalogue["sessions"])
 
-    # Sort by date (None values last)
-    catalogue["sessions"].sort(
-        key=lambda s: s.get("started_at") or "", reverse=True
-    )
+    # Newest first, keeping each session's copies in their existing order.
+    _sort_newest_first(catalogue["sessions"])
 
     _write_json_atomic(catalogue_file, catalogue)
 
@@ -274,7 +432,9 @@ def _apply_entry_update(
 # Full catalogue rebuild (from generate_session_catalog.py)
 # -------------------------------------------------------------------------
 
-def _scan_sessions(archive_dir: Path) -> list[dict[str, Any]]:
+def _scan_sessions(
+    archive_dir: Path, *, strict: bool = False,
+) -> list[dict[str, Any]]:
     """
     Scan all archived sessions and collect metadata.
 
@@ -290,11 +450,15 @@ def _scan_sessions(archive_dir: Path) -> list[dict[str, Any]]:
 
     Args:
         archive_dir: Base archive directory (``archive/cc-sessions/``).
+        strict: Raise :class:`CatalogueScanError` if any metadata file is
+            unreadable, instead of warning and skipping it, so that an
+            incomplete scan can never be published as a full rebuild.
 
     Returns:
         List of ``{metadata, path, project}`` dictionaries.
     """
     sessions: list[dict[str, Any]] = []
+    unreadable: list[str] = []
 
     if not archive_dir.exists():
         return sessions
@@ -307,6 +471,7 @@ def _scan_sessions(archive_dir: Path) -> list[dict[str, Any]]:
             metadata = json.loads(meta_file.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:
             print(f"Warning: Could not read {meta_file}: {exc}")
+            unreadable.append(str(rel))
             continue
         if len(rel.parts) <= 2:
             project = rel.parts[0]
@@ -320,6 +485,10 @@ def _scan_sessions(archive_dir: Path) -> list[dict[str, Any]]:
             "project": project,
         })
 
+    if strict and unreadable:
+        raise CatalogueScanError(
+            f"{len(unreadable)} unreadable metadata file(s), e.g. {unreadable[0]}"
+        )
     return sessions
 
 
@@ -329,7 +498,9 @@ def _recorded_bytes(meta: dict[str, Any]) -> int:
     return value if isinstance(value, int) else 0
 
 
-def rebuild_catalogue(archive_dir: Path) -> dict[str, Any]:
+def rebuild_catalogue(
+    archive_dir: Path, *, strict: bool = False,
+) -> dict[str, Any]:
     """
     Full catalogue rebuild from archived session metadata files.
 
@@ -338,11 +509,13 @@ def rebuild_catalogue(archive_dir: Path) -> dict[str, Any]:
 
     Args:
         archive_dir: Base archive directory (``archive/cc-sessions/``).
+        strict: Raise if any metadata file is unreadable (see
+            :func:`_scan_sessions`).
 
     Returns:
         Complete catalogue dictionary (schema v1.1).
     """
-    sessions = _scan_sessions(archive_dir)
+    sessions = _scan_sessions(archive_dir, strict=strict)
 
     catalogue: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -359,7 +532,8 @@ def rebuild_catalogue(archive_dir: Path) -> dict[str, Any]:
     # archive.find_archive_directory take the FIRST entry for an id, so
     # the copies are ordered deliberately: the most complete (most
     # recorded transcript bytes) first, then the shallowest, then by path.
-    # The final date sort below is stable, so this order survives it.
+    # The final sort keys each copy on its session's preferred date, so this
+    # order survives it.
     sessions.sort(key=lambda d: (
         -_recorded_bytes(d["metadata"]),
         len(d["path"].relative_to(archive_dir).parts),
@@ -461,11 +635,8 @@ def rebuild_catalogue(archive_dir: Path) -> dict[str, Any]:
                 "continuedBy"
             ].append(session_id)
 
-    # Sort by date, newest first. Stable, so each session's copies keep
-    # the preference order set above.
-    catalogue["sessions"].sort(
-        key=lambda s: s.get("started_at") or "", reverse=True
-    )
+    # Newest first by each session's preferred copy; copies keep their order.
+    _sort_newest_first(catalogue["sessions"])
     catalogue["tag_index"] = dict(sorted(catalogue["tag_index"].items()))
     catalogue["unique_sessions"] = len(seen_ids)
 
