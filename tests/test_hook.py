@@ -21,6 +21,7 @@ from cc_session_toolkit.archive import (
 )
 from cc_session_toolkit.config import (
     AUTO_METADATA_MAX_OUTPUT_TOKENS,
+    AUTO_METADATA_THINKING_LEVEL,
     DEFAULT_ARCHIVE_ROOT,
     DEFAULT_MIN_DURATION_MINUTES,
     DEFAULT_MIN_TURNS,
@@ -463,7 +464,7 @@ class TestAutoMetadataGeminiIntegration:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Verify the Gemini call uses thinking_budget=0, Flex tier, and the production model."""
+        """Verify the Gemini call uses the thinking level, Flex tier, and the production model."""
         monkeypatch.setenv("GEMINI_API_KEY", "test-key")
         session = _build_session_jsonl(tmp_path, ["A substantive message"])
         with patch("google.genai.Client") as MockClient:
@@ -477,7 +478,11 @@ class TestAutoMetadataGeminiIntegration:
         assert call_args.kwargs["model"] == EXTRACTOR_MODEL_ID
         cfg = call_args.kwargs["config"]
         assert cfg["service_tier"] == "flex"
-        assert cfg["thinking_config"] == {"thinking_budget": 0}
+        # 2026-10-08: thinking_level replaces the deprecated thinking_budget;
+        # sending both returns 400, so the budget must be absent.
+        assert cfg["thinking_config"] == {
+            "thinking_level": AUTO_METADATA_THINKING_LEVEL
+        }
         assert cfg["max_output_tokens"] == AUTO_METADATA_MAX_OUTPUT_TOKENS
         # System prompt carries the role + contracts; user message carries
         # the delimited transcript.
@@ -507,12 +512,39 @@ class TestAutoMetadataGeminiIntegration:
             )
             result = generate_auto_metadata(session, self._STATS)
             # Initial attempt plus three retries (one per wait in the
-            # patched ``(0, 0, 0)`` tuple) — total 4 calls before
-            # collapsing to None. Without this assertion a bug that
-            # broke out of the retry loop after a single attempt would
-            # still produce a None result and the test would still pass.
-            assert mock_client.models.generate_content.call_count == 4
+            # patched ``(0, 0, 0)`` tuple), then ONE standard-tier
+            # fallback (2026-10-08) — total 5 calls before collapsing to
+            # None. Without this assertion a bug that broke out of the
+            # retry loop after a single attempt would still produce a
+            # None result and the test would still pass.
+            calls = mock_client.models.generate_content.call_args_list
+            assert len(calls) == 5
+            assert all(c.kwargs["config"]["service_tier"] == "flex"
+                       for c in calls[:4])
+            assert "service_tier" not in calls[4].kwargs["config"]
         assert result is None
+
+    def test_standard_tier_fallback_recovers(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Flex exhausted, then the standard-tier attempt succeeds."""
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        monkeypatch.setattr(
+            "cc_session_toolkit.archive.AUTO_METADATA_FLEX_RETRY_WAITS_SECONDS",
+            (0,),
+        )
+        session = _build_session_jsonl(tmp_path, ["Substantive message"])
+        ok = self._mock_gemini_response({"title": "Recovered", "tags": []})
+        preempted = RuntimeError("503 Service Unavailable: preempted")
+        with patch("google.genai.Client") as MockClient:
+            mock_client = MockClient.return_value
+            mock_client.models.generate_content.side_effect = [
+                preempted, preempted, ok,
+            ]
+            result = generate_auto_metadata(session, self._STATS)
+        assert result is not None and result["title"] == "Recovered"
 
     def test_503_retry_recovers(
         self,
