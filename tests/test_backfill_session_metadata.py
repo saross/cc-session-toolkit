@@ -529,3 +529,76 @@ class TestUpdateMetadataProvenance:
 
         assert data["extractor_model_id"] == EXTRACTOR_MODEL_ID
         assert data["extractor_source_bytes"] == 12345
+
+    def test_records_the_model_that_answered(self, tmp_path: Path) -> None:
+        """A result written by the fallback provider is labelled with it."""
+        backfill = _load_backfill_module()
+        meta_path = tmp_path / "session.meta.json"
+        meta_path.write_text(json.dumps({
+            "auto_generated": {"purpose": "Auto-metadata unavailable"},
+        }))
+        backfill.update_metadata(
+            meta_path,
+            {"title": "T", "purpose": "P", "tags": [], "three_ps": {},
+             "_extractor": {"model_id": "gemini-3.8-flash", "thinking_level": "medium"}},
+            [],
+            source_bytes=10,
+        )
+        data = json.loads(meta_path.read_text())
+        assert data["extractor_model_id"] == "gemini-3.8-flash"
+        assert data["extractor_thinking_level"] == "medium"
+        assert "_extractor" not in data["auto_generated"]
+
+
+@pytest.mark.openai_provider
+class TestOpenAIEstimates:
+    """2026-10-08: dry-run estimates follow the primary provider's prices."""
+
+    def test_parent_estimate_uses_luna_prices(self) -> None:
+        from cc_session_toolkit.archive import openai_cost_usd
+
+        backfill = _load_backfill_module()
+        # Luna writes nearly all of an uncached prompt to cache (1.25x).
+        for tokens in (100_000, 400_000):
+            assert backfill._per_session_cost(tokens) == pytest.approx(
+                openai_cost_usd(tokens, 1500, cache_write_tokens=tokens)
+            )
+
+    def test_mean_cost_prices_each_sample(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Luna's 272K price step: the cost of the mean is not the mean cost."""
+        backfill = _load_backfill_module()
+        samples = [50_000, 492_000]
+        monkeypatch.setattr(backfill, "_sample_distilled_token_counts",
+                            lambda paths, n: samples)
+        monkeypatch.setattr(backfill, "_sample_subagent_counts", lambda paths: [0, 0])
+        text = backfill._estimate_total_cost([Path("a"), Path("b")], 2)
+        expected = sum(backfill._per_session_cost(t) for t in samples)
+        assert f"parent total (mean × 2): ~${expected:.2f}" in text
+
+    def test_missing_openai_key_stops_the_run(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """A missing primary key must not silently send the run to Gemini."""
+        import sys as _sys
+
+        backfill = _load_backfill_module()
+        monkeypatch.setattr(backfill, "_ensure_openai_api_key", lambda: None)
+        monkeypatch.setattr(_sys, "argv", ["backfill", "--dry-run",
+                                           "--archive-root", str(tmp_path)])
+        with pytest.raises(SystemExit) as info:
+            backfill.main()
+        assert info.value.code == 1
+
+    def test_subagent_estimate_uses_the_luna_constant(self) -> None:
+        backfill = _load_backfill_module()
+        assert backfill._per_subagent_cost() == backfill.PER_SUBAGENT_COST_USD_OPENAI
+
+    def test_openai_calls_reach_the_cost_log(self) -> None:
+        backfill = _load_backfill_module()
+        backfill._CALL_RECORDS.clear()
+        backfill._CURRENT_CONTEXT.update(target="proj/entry", phase="parent")
+        backfill._record_openai_call({"provider": "openai", "cost_usd": 0.01})
+        assert backfill._CALL_RECORDS == [{
+            "target": "proj/entry", "phase": "parent",
+            "provider": "openai", "cost_usd": 0.01,
+        }]

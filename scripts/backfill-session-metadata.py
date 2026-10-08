@@ -5,7 +5,8 @@ existing v1.2-or-earlier metadata to the v1.3 schema.
 
 Default mode: finds all session.meta.json files with
 ``auto_generated.purpose == "Auto-metadata unavailable"``, decompresses
-the session JSONL, runs generate_auto_metadata via Gemini Flex
+the session JSONL, runs generate_auto_metadata via the configured extractor
+(GPT-6 Luna by default since 2026-10-08, Gemini as fallback)
 (production-switched 2026-05-18; see workstream F in
 ``personal-assistant/planning/continuity.md``), and updates the metadata
 in-place to the current schema (v1.3).
@@ -55,6 +56,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from cc_session_toolkit.archive import (  # noqa: E402
     _ensure_gemini_api_key,
+    _ensure_openai_api_key,
+    _extractor_providers,
+    _openai_key_names,
     _log_metadata_event,
     generate_auto_metadata,
     generate_subagent_summaries,
@@ -288,13 +292,19 @@ def update_metadata(
     # model switch would have misattributed every backfilled summary.
     # Read at call time, like _instrumented_call_gemini_once, so a
     # patched config is honoured.
+    # Since 2026-10-08 generate_auto_metadata names the model that
+    # answered (``_extractor``), which is the fallback provider's when the
+    # primary failed; the config's primary is only a default.
     from cc_session_toolkit.config import (
-        AUTO_METADATA_THINKING_LEVEL,
         EXTRACTOR_MODEL_ID,
+        EXTRACTOR_THINKING_LEVEL,
     )
 
-    data["extractor_model_id"] = EXTRACTOR_MODEL_ID
-    data["extractor_thinking_level"] = AUTO_METADATA_THINKING_LEVEL
+    used = auto_generated.get("_extractor") or {}
+    data["extractor_model_id"] = used.get("model_id") or EXTRACTOR_MODEL_ID
+    data["extractor_thinking_level"] = (
+        used.get("thinking_level") or EXTRACTOR_THINKING_LEVEL
+    )
     data["extractor_source_bytes"] = source_bytes
 
     # Atomic overwrite: write to a sibling ``.json.tmp`` first, then
@@ -312,7 +322,13 @@ def update_metadata(
 
 
 def _per_session_cost(input_tokens: int) -> float:
-    """Per-session API cost in USD for one Gemini Flex auto-metadata call.
+    """Per-session API cost in USD for one parent auto-metadata call.
+
+    Provider-aware (2026-10-08): GPT-6 Luna at standard-tier list price
+    (with its long-prompt rates above 272K tokens) when it is the primary
+    extractor, Gemini Flex otherwise. *input_tokens* are Gemini token
+    counts; Luna's tokeniser counts 0.85-0.92x as many, so the Luna figure
+    errs high.
 
     Input tokens drive the variable cost; output is bounded by an
     *expected* size (not the max-output-tokens ceiling) because the v3
@@ -330,6 +346,15 @@ def _per_session_cost(input_tokens: int) -> float:
     # multi-thread sessions ~1500-2000 output tokens. 1500 is a
     # reasonable expected upper bound for cost estimation.
     expected_output_tokens = 1500
+    from cc_session_toolkit.config import EXTRACTOR_PROVIDER
+
+    if EXTRACTOR_PROVIDER == "openai":
+        from cc_session_toolkit.archive import openai_cost_usd
+
+        # Luna writes nearly all of an uncached prompt to cache (1.25x).
+        return openai_cost_usd(
+            input_tokens, expected_output_tokens, cache_write_tokens=input_tokens
+        )
     return (
         (input_tokens / 1_000_000) * GEMINI_FLEX_INPUT_PRICE_PER_MTOK
         + (expected_output_tokens / 1_000_000)
@@ -347,13 +372,20 @@ def _per_session_cost(input_tokens: int) -> float:
 # Audit follow-up 2026-05-24.
 PER_SUBAGENT_COST_USD = 0.05
 
+# GPT-6 Luna equivalent (2026-10-08), from the 591 subagent calls in PA
+# ``data/logs/backfill-cost-log-20260528T020248Z.json``: mean 39,738 input
+# and 256 output tokens, which is a mean of $0.0042 at Luna prices (max
+# $0.079). $0.01 leaves headroom for the long tail.
+PER_SUBAGENT_COST_USD_OPENAI = 0.01
+
 
 def _per_subagent_cost() -> float:
-    """Estimated USD cost for summarising one subagent.
+    """Estimated USD cost for summarising one subagent, for the primary
+    provider (see the two constants above for their calibration)."""
+    from cc_session_toolkit.config import EXTRACTOR_PROVIDER
 
-    Returns the flat ``PER_SUBAGENT_COST_USD`` constant — see its
-    docstring for the calibration rationale.
-    """
+    if EXTRACTOR_PROVIDER == "openai":
+        return PER_SUBAGENT_COST_USD_OPENAI
     return PER_SUBAGENT_COST_USD
 
 
@@ -425,6 +457,14 @@ def _sample_distilled_token_counts(
     return token_counts
 
 
+def _provider_label() -> str:
+    """Name the primary extractor for estimate output."""
+    from cc_session_toolkit.config import EXTRACTOR_MODEL_ID, EXTRACTOR_PROVIDER
+
+    tier = "standard" if EXTRACTOR_PROVIDER == "openai" else "Flex"
+    return f"{EXTRACTOR_MODEL_ID}, {tier}"
+
+
 def _estimate_total_cost(meta_paths: list[Path], sample_size: int) -> str:
     """Build a human-readable cost estimate for the dry-run output.
 
@@ -455,12 +495,12 @@ def _estimate_total_cost(meta_paths: list[Path], sample_size: int) -> str:
         flat_parent_estimate = len(meta_paths) * 0.10
         flat_total = flat_parent_estimate + subagent_cost
         return (
-            f"Est. cost (Gemini Flex, flat $0.10/session, parent-only): "
+            f"Est. cost ({_provider_label()}, flat $0.10/session, parent-only): "
             f"~${flat_parent_estimate:.2f}\n"
             f"  (could not sample real sessions for a refined parent estimate)\n"
             f"  subagent calls: {total_subagents} across "
             f"{sessions_with_subagents} session(s) "
-            f"× ${PER_SUBAGENT_COST_USD:.2f} ~= ${subagent_cost:.2f}\n"
+            f"× ${_per_subagent_cost():.2f} ~= ${subagent_cost:.2f}\n"
             f"  total estimate (parent + subagent): "
             f"~${flat_total:.2f}"
         )
@@ -469,7 +509,9 @@ def _estimate_total_cost(meta_paths: list[Path], sample_size: int) -> str:
     p50 = samples_sorted[len(samples_sorted) // 2]
     p90 = samples_sorted[int(len(samples_sorted) * 0.9)]
     sample_max = max(samples)
-    mean_cost = _per_session_cost(int(mean))
+    # Price each sample and average the costs: Luna's rates step up above
+    # 272K tokens, so the cost of the mean session is not the mean cost.
+    mean_cost = sum(_per_session_cost(s) for s in samples) / len(samples)
     p90_cost = _per_session_cost(p90)
     max_cost = _per_session_cost(sample_max)
     parent_total = mean_cost * len(meta_paths)
@@ -478,7 +520,7 @@ def _estimate_total_cost(meta_paths: list[Path], sample_size: int) -> str:
     grand_total = parent_total + subagent_cost
     grand_worst = parent_worst + subagent_cost
     return (
-        f"Est. cost (Gemini Flex, sampled n={len(samples)} sessions):\n"
+        f"Est. cost ({_provider_label()}, sampled n={len(samples)} sessions):\n"
         f"  per-session input tokens — "
         f"mean: {int(mean):,}  median: {p50:,}  p90: {p90:,}  max: {sample_max:,}\n"
         f"  per-session parent cost — "
@@ -486,7 +528,7 @@ def _estimate_total_cost(meta_paths: list[Path], sample_size: int) -> str:
         f"  parent total (mean × {len(meta_paths)}): ~${parent_total:.2f}\n"
         f"  subagent calls: {total_subagents} across "
         f"{sessions_with_subagents} session(s) "
-        f"× ${PER_SUBAGENT_COST_USD:.2f} ~= ${subagent_cost:.2f}\n"
+        f"× ${_per_subagent_cost():.2f} ~= ${subagent_cost:.2f}\n"
         f"  total estimate (parent + subagent): ~${grand_total:.2f}\n"
         f"  worst-case envelope "
         f"(p90 parent + subagent): ~${grand_worst:.2f}"
@@ -538,7 +580,7 @@ def _instrumented_call_gemini_once(
     """
     from cc_session_toolkit.archive import _build_gemini_config
     from cc_session_toolkit.config import (
-        EXTRACTOR_MODEL_ID,
+        GEMINI_EXTRACTOR_MODEL_ID,
         GEMINI_STANDARD_INPUT_PRICE_PER_MTOK,
         GEMINI_STANDARD_OUTPUT_PRICE_PER_MTOK,
     )
@@ -555,7 +597,7 @@ def _instrumented_call_gemini_once(
 
     t0 = time.time()
     response = client.models.generate_content(
-        model=EXTRACTOR_MODEL_ID,
+        model=GEMINI_EXTRACTOR_MODEL_ID,
         contents=user_message,
         config=config,
     )
@@ -592,7 +634,8 @@ def _instrumented_call_gemini_once(
     _CALL_RECORDS.append({
         "target": _CURRENT_CONTEXT["target"],
         "phase": _CURRENT_CONTEXT["phase"],
-        "model": EXTRACTOR_MODEL_ID,
+        "provider": "gemini",
+        "model": GEMINI_EXTRACTOR_MODEL_ID,
         "input_tokens_charged": in_tok,
         "output_tokens": out_tok,
         "cost_usd": cost_usd,
@@ -615,6 +658,20 @@ def _instrumented_call_gemini_once(
             f"MAX_TOKENS with no parts, or no candidates."
         )
     return raw
+
+
+def _record_openai_call(record: dict[str, Any]) -> None:
+    """Observer for OpenAI calls (2026-10-08): tag and keep the record.
+
+    The OpenAI path reports its own usage (archive._EXTRACTOR_CALL_OBSERVER),
+    so no monkey-patching is needed for it; the Gemini wrapper above stays
+    as it was.
+    """
+    _CALL_RECORDS.append({
+        "target": _CURRENT_CONTEXT["target"],
+        "phase": _CURRENT_CONTEXT["phase"],
+        **record,
+    })
 
 
 def _summarise_cost_records(
@@ -697,7 +754,7 @@ def _write_cost_log(
 def main() -> None:
     """Run the backfill."""
     parser = argparse.ArgumentParser(
-        description="Backfill session auto-metadata via Gemini Flex.",
+        description="Backfill session auto-metadata via the configured extractor.",
     )
     parser.add_argument(
         "--dry-run",
@@ -759,13 +816,30 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Ensure API key is available before starting.
-    if not _ensure_gemini_api_key():
+    # Ensure the PRIMARY provider's key is available before starting
+    # (2026-10-08). A missing OpenAI key would otherwise send the whole paid
+    # run to the Gemini fallback, at Gemini's price, while the dry run
+    # quoted Luna's. A missing fallback key only warns.
+    from cc_session_toolkit.config import EXTRACTOR_PROVIDER
+
+    providers = _extractor_providers()
+    print(f"Extractor providers, in order: {' then '.join(providers)}")
+    if EXTRACTOR_PROVIDER == "openai" and not _ensure_openai_api_key():
         print(
-            "Error: neither GEMINI_API_KEY nor GOOGLE_API_KEY found "
-            "in environment or ~/personal-assistant/.env"
+            "Error: no OpenAI key for the primary extractor; looked for "
+            f"{', '.join(_openai_key_names())} in the environment and "
+            "~/personal-assistant/.env"
         )
         sys.exit(1)
+    if not _ensure_gemini_api_key():
+        if EXTRACTOR_PROVIDER == "gemini":
+            print(
+                "Error: neither GEMINI_API_KEY nor GOOGLE_API_KEY found "
+                "in environment or ~/personal-assistant/.env"
+            )
+            sys.exit(1)
+        if "gemini" in providers:
+            print("Warning: no Gemini key; the Gemini fallback is unavailable.")
 
     if args.upgrade_to_v13:
         sessions = find_sessions_needing_v13_upgrade(args.archive_root)
@@ -801,7 +875,7 @@ def main() -> None:
         else:
             flat = len(sessions) * 0.10
             print(
-                f"Est. cost (Gemini Flex, flat $0.10/session): ~${flat:.2f} "
+                f"Est. cost ({_provider_label()}, flat $0.10/session): ~${flat:.2f} "
                 f"(subagent calls not modelled — add ~$0.05 per subagent)"
             )
         return
@@ -819,6 +893,7 @@ def main() -> None:
     from cc_session_toolkit import archive as _archive_module
     original_call_gemini_once = _archive_module._call_gemini_once
     _archive_module._call_gemini_once = _instrumented_call_gemini_once
+    _archive_module._EXTRACTOR_CALL_OBSERVER = _record_openai_call
     run_started_at = datetime.now(timezone.utc).isoformat()
 
     try:
@@ -873,7 +948,7 @@ def main() -> None:
                 result = generate_auto_metadata(tmp_path, stats)
 
                 if result is None:
-                    print("FAIL (Gemini returned None)")
+                    print("FAIL (extractor returned None)")
                     failed += 1
                     continue
 
@@ -955,6 +1030,7 @@ def main() -> None:
         # Always restore the original helper, even on KeyboardInterrupt
         # mid-run, so an interactive re-run starts clean.
         _archive_module._call_gemini_once = original_call_gemini_once
+        _archive_module._EXTRACTOR_CALL_OBSERVER = None
         # Persist the cost log + print a brief summary regardless of
         # how the run exited — partial data is better than none.
         log_path = args.cost_log or _default_cost_log_path()

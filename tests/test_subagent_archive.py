@@ -29,7 +29,6 @@ from cc_session_toolkit.archive import (
 )
 from cc_session_toolkit.config import (
     DEFAULT_LICENCE,
-    EXTRACTOR_MODEL_ID,
     SCHEMA_VERSION,
 )
 from cc_session_toolkit.extraction import extract_session_stats
@@ -1120,7 +1119,10 @@ class TestSessionMetaProvenance:
             session_path=sample_session_jsonl,
             stats=stats,
         )
-        assert meta["extractor_model_id"] == EXTRACTOR_MODEL_ID
+        # Read at run time: the primary (and so the default) is pinned per test.
+        from cc_session_toolkit import archive as archive_module
+
+        assert meta["extractor_model_id"] == archive_module.EXTRACTOR_MODEL_ID
 
     def test_extractor_model_id_explicit_override(
         self, sample_session_jsonl: Path,

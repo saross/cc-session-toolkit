@@ -25,7 +25,7 @@ from cc_session_toolkit.config import (
     DEFAULT_ARCHIVE_ROOT,
     DEFAULT_MIN_DURATION_MINUTES,
     DEFAULT_MIN_TURNS,
-    EXTRACTOR_MODEL_ID,
+    GEMINI_EXTRACTOR_MODEL_ID,
 )
 from cc_session_toolkit.project import (
     detect_project_name_from_cwd,
@@ -475,7 +475,7 @@ class TestAutoMetadataGeminiIntegration:
             generate_auto_metadata(session, self._STATS)
             call_args = mock_client.models.generate_content.call_args
 
-        assert call_args.kwargs["model"] == EXTRACTOR_MODEL_ID
+        assert call_args.kwargs["model"] == GEMINI_EXTRACTOR_MODEL_ID
         cfg = call_args.kwargs["config"]
         assert cfg["service_tier"] == "flex"
         # 2026-10-08: thinking_level replaces the deprecated thinking_budget;
