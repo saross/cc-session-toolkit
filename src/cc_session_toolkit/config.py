@@ -125,6 +125,21 @@ OPENAI_RETRY_WAITS_SECONDS = (10, 30, 60)
 OPENAI_REQUEST_TIMEOUT_SECONDS = 300
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 
+# Token counting follows the primary provider (2026-10-08): counting sends
+# the distilled transcript to the counter's provider, so with Luna primary
+# the transcript is counted by OpenAI and Google sees it only if the Gemini
+# fallback runs. OpenAI's ``responses/input_tokens`` endpoint counts exactly
+# what Luna will receive; its docs state no price, and an OpenAI community
+# answer says it is free with a funded account.
+OPENAI_INPUT_TOKENS_URL = "https://api.openai.com/v1/responses/input_tokens"
+
+# Transcript budget when Luna counts (its own tokens). The Gemini-counted
+# budget is 850,000 (``transcript_text.SESSION_TOKEN_BUDGET``); Luna counts
+# 0.85-0.92x as many tokens for the same text, so 720,000 Luna tokens is
+# what Luna effectively received in the comparison, and the same text still
+# fits Gemini if the fallback runs.
+OPENAI_SESSION_TOKEN_BUDGET = 720_000
+
 # GPT-6 Luna list prices, standard tier (USD per million tokens), verified
 # 2026-10-08 (PA ``extractor-comparison-2026-10-08/pricing/
 # openai-model-gpt-6-luna-2026-10-08.txt``, line 9). A request whose prompt

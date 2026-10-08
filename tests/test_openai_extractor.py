@@ -70,13 +70,30 @@ def _payload(text: str, *, status: str = "completed", **extra: Any) -> dict[str,
 
 
 class FakePost:
-    """Stand-in for ``archive._openai_post`` that records each request."""
+    """Stand-in for ``archive._openai_post`` that records each request.
 
-    def __init__(self, *responses: Any) -> None:
+    Responses requests pop the queued *responses*; token-count requests are
+    answered with a chars/4 count (or raise *count_error* when given).
+    """
+
+    def __init__(self, *responses: Any, count_error: Exception | None = None) -> None:
         self.responses = list(responses)
         self.bodies: list[dict[str, Any]] = []
+        self.count_bodies: list[dict[str, Any]] = []
+        self.count_error = count_error
 
-    def __call__(self, body: dict[str, Any], api_key: str, timeout: float) -> dict[str, Any]:
+    def __call__(
+        self,
+        body: dict[str, Any],
+        api_key: str,
+        timeout: float,
+        url: str = archive.OPENAI_RESPONSES_URL,
+    ) -> dict[str, Any]:
+        if url == archive.OPENAI_INPUT_TOKENS_URL:
+            self.count_bodies.append(body)
+            if self.count_error is not None:
+                raise self.count_error
+            return {"object": "response.input_tokens", "input_tokens": len(body["input"]) // 4}
         self.bodies.append(body)
         item = self.responses.pop(0)
         if isinstance(item, Exception):
@@ -289,15 +306,7 @@ class TestDispatcher:
         monkeypatch.setattr(archive, "_openai_post", FakePost(
             _payload(json.dumps(PARENT_RESULT))
         ))
-        session = tmp_path / "s.jsonl"
-        session.write_text(
-            json.dumps({"type": "user", "message": {"role": "user", "content": "x" * 400}})
-            + "\n"
-            + json.dumps({"type": "assistant", "message": {
-                "role": "assistant", "content": [{"type": "text", "text": "y" * 400}],
-            }}) + "\n",
-            encoding="utf-8",
-        )
+        session = _write_session(tmp_path / "s.jsonl")
 
         result = archive.generate_auto_metadata(session, {"session_id": "s"})
 
@@ -307,6 +316,76 @@ class TestDispatcher:
             "model_id": OPENAI_EXTRACTOR_MODEL_ID,
             "thinking_level": OPENAI_REASONING_EFFORT,
         }
+
+
+def _write_session(path: Path) -> Path:
+    """A minimal two-turn transcript."""
+    path.write_text(
+        json.dumps({"type": "user", "message": {"role": "user", "content": "x" * 400}})
+        + "\n"
+        + json.dumps({"type": "assistant", "message": {
+            "role": "assistant", "content": [{"type": "text", "text": "y" * 400}],
+        }}) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.mark.openai_provider
+class TestTokenCounting:
+    """2026-10-08: the transcript is counted by the provider that reads it."""
+
+    def test_luna_primary_sends_google_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        from unittest.mock import patch
+
+        pytest.importorskip("google.genai")
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        fake = FakePost(_payload(json.dumps(PARENT_RESULT)))
+        monkeypatch.setattr(archive, "_openai_post", fake)
+        session = _write_session(tmp_path / "s.jsonl")
+
+        with patch("google.genai.Client") as MockClient:
+            gemini = MockClient.return_value
+            result = archive.generate_auto_metadata(session, {"session_id": "s"})
+
+        assert result is not None and result["title"] == PARENT_RESULT["title"]
+        assert fake.count_bodies, "Luna's counter should size the transcript"
+        assert all(b["model"] == OPENAI_EXTRACTOR_MODEL_ID for b in fake.count_bodies)
+        gemini.models.count_tokens.assert_not_called()
+        gemini.models.generate_content.assert_not_called()
+
+    def test_counter_failure_falls_back_to_the_heuristic(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        monkeypatch.setattr(archive, "_ensure_gemini_api_key", lambda: None)
+        monkeypatch.setattr(archive, "_openai_post", FakePost(
+            _payload(json.dumps(PARENT_RESULT)),
+            count_error=archive.OpenAIRequestError(500, "count failed"),
+        ))
+        session = _write_session(tmp_path / "s.jsonl")
+
+        result = archive.generate_auto_metadata(session, {"session_id": "s"})
+
+        assert result is not None and result["title"] == PARENT_RESULT["title"]
+
+    def test_luna_budget_applies(self) -> None:
+        count_fn, budget = archive._token_counter_for_primary(None)
+        assert count_fn is not None
+        assert budget == archive.OPENAI_SESSION_TOKEN_BUDGET
+
+
+def test_gemini_primary_counts_with_gemini() -> None:
+    """Gemini primary (the pinned test default) keeps Gemini's counter."""
+    from unittest.mock import MagicMock
+
+    client = MagicMock()
+    client.models.count_tokens.return_value.total_tokens = 42
+    count_fn, budget = archive._token_counter_for_primary(client)
+    assert budget is None
+    assert count_fn("text") == 42
+    assert client.models.count_tokens.call_args.kwargs["model"] == GEMINI_EXTRACTOR_MODEL_ID
 
 
 def test_archive_session_records_the_fallback_model(

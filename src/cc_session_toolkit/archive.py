@@ -44,6 +44,7 @@ from cc_session_toolkit.config import (
     OPENAI_CACHED_INPUT_PRICE_PER_MTOK,
     OPENAI_EXTRACTOR_MODEL_ID,
     OPENAI_INPUT_PRICE_PER_MTOK,
+    OPENAI_INPUT_TOKENS_URL,
     OPENAI_KEY_HOST_SUFFIXES,
     OPENAI_KEY_ROLE,
     OPENAI_LONG_PROMPT_INPUT_MULTIPLIER,
@@ -54,6 +55,7 @@ from cc_session_toolkit.config import (
     OPENAI_REQUEST_TIMEOUT_SECONDS,
     OPENAI_RESPONSES_URL,
     OPENAI_RETRY_WAITS_SECONDS,
+    OPENAI_SESSION_TOKEN_BUDGET,
     SCHEMA_VERSION,
     load_defaults,
 )
@@ -940,8 +942,13 @@ def _openai_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _openai_post(body: dict[str, Any], api_key: str, timeout: float) -> dict[str, Any]:
-    """POST one Responses API request and return the decoded JSON body.
+def _openai_post(
+    body: dict[str, Any],
+    api_key: str,
+    timeout: float,
+    url: str = OPENAI_RESPONSES_URL,
+) -> dict[str, Any]:
+    """POST one OpenAI API request and return the decoded JSON body.
 
     Kept as a separate function so tests replace it and never reach the
     network. HTTP errors become :class:`OpenAIRequestError`.
@@ -950,7 +957,7 @@ def _openai_post(body: dict[str, Any], api_key: str, timeout: float) -> dict[str
     import urllib.request
 
     request = urllib.request.Request(
-        OPENAI_RESPONSES_URL,
+        url,
         data=json.dumps(body).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {api_key}",
@@ -964,6 +971,53 @@ def _openai_post(body: dict[str, Any], api_key: str, timeout: float) -> dict[str
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:500]
         raise OpenAIRequestError(exc.code, detail) from exc
+
+
+def _openai_count_tokens(text: str, *, api_key: str) -> int:
+    """Count *text* in GPT-6 Luna tokens with OpenAI's input-token endpoint.
+
+    The count is exact for the model (``responses/input_tokens``). Raises
+    on any error; the distiller then keeps its heuristic first pass.
+    """
+    payload = _openai_post(
+        {"model": OPENAI_EXTRACTOR_MODEL_ID, "input": text},
+        api_key,
+        OPENAI_REQUEST_TIMEOUT_SECONDS,
+        url=OPENAI_INPUT_TOKENS_URL,
+    )
+    return int(payload["input_tokens"])
+
+
+def _token_counter_for_primary(
+    gemini_client: Any | None,
+) -> tuple[Callable[[str], int] | None, int | None]:
+    """
+    Return ``(count_tokens_fn, budget_tokens)`` for sizing a transcript.
+
+    Counting sends the text to the counter's provider, so the counter
+    follows the PRIMARY provider (2026-10-08): with Luna primary, OpenAI
+    counts and Google receives a transcript only if the Gemini fallback
+    runs. A *None* counter means the distiller's chars-per-token heuristic;
+    a *None* budget means its default (Gemini tokens).
+    """
+    if EXTRACTOR_PROVIDER == "openai":
+        api_key = _ensure_openai_api_key()
+        if not api_key:
+            return None, OPENAI_SESSION_TOKEN_BUDGET
+
+        def _count_openai(text: str) -> int:
+            return _openai_count_tokens(text, api_key=api_key)
+
+        return _count_openai, OPENAI_SESSION_TOKEN_BUDGET
+    if gemini_client is not None:
+        def _count_gemini(text: str) -> int:
+            """Gemini's count_tokens: free, no charge (Google's docs)."""
+            return gemini_client.models.count_tokens(
+                model=GEMINI_EXTRACTOR_MODEL_ID, contents=text
+            ).total_tokens
+
+        return _count_gemini, None
+    return None, None
 
 
 def _call_openai_once(
@@ -1290,19 +1344,12 @@ def generate_auto_metadata(
                     level="WARNING",
                 )
 
-    def _count_tokens(text: str) -> int:
-        """Call the Gemini API's count_tokens with the configured model.
-
-        Free per Google's docs; only network latency, no $$ cost. Used by
-        the session-budget truncation path to calibrate the
-        chars-per-token ratio for the actual content mix, replacing the
-        4-chars-per-token heuristic that systematically undercounted on
-        code-heavy / tool-output-heavy sessions (see 2026-05-23
-        calibration finding).
-        """
-        return client.models.count_tokens(
-            model=GEMINI_EXTRACTOR_MODEL_ID, contents=text
-        ).total_tokens
+    # The real tokeniser calibrates the session-budget truncation, replacing
+    # the 4-chars-per-token heuristic that systematically undercounted
+    # code-heavy / tool-output-heavy sessions (2026-05-23 calibration
+    # finding). It is the primary provider's (2026-10-08), so the transcript
+    # goes only to the company that summarises it.
+    count_tokens_fn, budget_tokens = _token_counter_for_primary(client)
 
     # Distil the full transcript with tokeniser-calibrated truncation.
     # The extractor strips framing, preserves tool calls + results, and
@@ -1316,7 +1363,8 @@ def generate_auto_metadata(
         )
         transcript_text = extract_transcript_text_for_gemini(
             session_path,
-            count_tokens_fn=_count_tokens if client is not None else None,
+            budget_tokens=budget_tokens,
+            count_tokens_fn=count_tokens_fn,
         )
     except (
         FileNotFoundError, OSError, EOFError, UnicodeDecodeError,
@@ -1344,9 +1392,9 @@ def generate_auto_metadata(
     # acceptable because the truncation step already brought the text
     # under budget.
     try:
-        if client is None:
-            raise RuntimeError("no Gemini client for the token counter")
-        content_tokens = int(_count_tokens(transcript_text))
+        if count_tokens_fn is None:
+            raise RuntimeError("no token counter available")
+        content_tokens = int(count_tokens_fn(transcript_text))
     except Exception as exc:  # noqa: BLE001 — any failure falls back to the heuristic
         # ``Exception`` already subsumes ``TypeError`` and ``ValueError``;
         # the broad catch is intentional because the heuristic fallback
@@ -1641,10 +1689,7 @@ def generate_subagent_summaries(
             level="WARNING",
         )
 
-    def _count_tokens(text: str) -> int:
-        return client.models.count_tokens(
-            model=GEMINI_EXTRACTOR_MODEL_ID, contents=text
-        ).total_tokens
+    count_tokens_fn, budget_tokens = _token_counter_for_primary(client)
 
     system_prompt = _load_auto_metadata_subagent_prompt()
     summaries: list[dict[str, str]] = []
@@ -1668,7 +1713,8 @@ def generate_subagent_summaries(
             )
             distilled = extract_transcript_text_for_gemini(
                 sa_path,
-                count_tokens_fn=_count_tokens if client is not None else None,
+                budget_tokens=budget_tokens,
+                count_tokens_fn=count_tokens_fn,
             )
         except Exception as exc:  # noqa: BLE001 — graceful degradation
             _log_metadata_event(
@@ -1682,9 +1728,9 @@ def generate_subagent_summaries(
             continue
 
         try:
-            if client is None:
-                raise RuntimeError("no Gemini client for the token counter")
-            distilled_tokens = int(_count_tokens(distilled))
+            if count_tokens_fn is None:
+                raise RuntimeError("no token counter available")
+            distilled_tokens = int(count_tokens_fn(distilled))
         except Exception:  # noqa: BLE001 — any failure falls back to the heuristic
             # Same rationale as the parent-path call above: ``Exception``
             # already subsumes ``TypeError`` and ``ValueError``, and the
