@@ -2395,6 +2395,11 @@ def archive_session(
         supersedes=supersedes,
         extractor_thinking_level=extractor_thinking_level,
     )
+    if carried_forward:
+        # Carried-forward metadata keeps its own label, including none:
+        # create_session_metadata's default would otherwise attribute a
+        # block written before labels existed to today's model.
+        metadata["extractor_model_id"] = prior_metadata.get("extractor_model_id")
 
     # Atomic write (2026-10-08): superseding overwrites an existing record,
     # and a crash mid-write must not leave it empty or partial.

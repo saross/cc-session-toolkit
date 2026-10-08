@@ -425,6 +425,27 @@ class TestArchiveSessionSupersede:
         assert archived_transcript_bytes(dest) == live.stat().st_size
         assert after["extractor_source_bytes"] < archived_transcript_bytes(dest)
 
+    def test_carry_forward_keeps_an_absent_label_absent(
+        self, tmp_path: Path, fake_generator: dict[str, Any],
+    ) -> None:
+        """Carried-forward metadata keeps its own label, even none.
+
+        Records written before labels existed carry no extractor_model_id.
+        Carrying such a block forward must not attribute it to today's
+        model: on 2026-10-08 a model-off refresh did exactly that.
+        """
+        live = tmp_path / f"{SID}.jsonl"
+        _write(live, 0, 10)
+        root, cat, dest = _initial_archive(tmp_path, live)
+        meta = _meta(dest)
+        meta.pop("extractor_model_id")
+        (dest / "session.meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        _write(live, 10, 10, append=True)
+
+        self._supersede(live, cat, root, regen_on_growth=False)
+
+        assert _meta(dest)["extractor_model_id"] is None
+
     def test_stale_metadata_is_regenerated_later(
         self, tmp_path: Path, fake_generator: dict[str, Any],
     ) -> None:
