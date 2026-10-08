@@ -529,3 +529,52 @@ class TestUpdateMetadataProvenance:
 
         assert data["extractor_model_id"] == EXTRACTOR_MODEL_ID
         assert data["extractor_source_bytes"] == 12345
+
+    def test_records_the_model_that_answered(self, tmp_path: Path) -> None:
+        """A result written by the fallback provider is labelled with it."""
+        backfill = _load_backfill_module()
+        meta_path = tmp_path / "session.meta.json"
+        meta_path.write_text(json.dumps({
+            "auto_generated": {"purpose": "Auto-metadata unavailable"},
+        }))
+        backfill.update_metadata(
+            meta_path,
+            {"title": "T", "purpose": "P", "tags": [], "three_ps": {},
+             "_extractor": {"model_id": "gemini-3.8-flash", "thinking_level": "medium"}},
+            [],
+            source_bytes=10,
+        )
+        data = json.loads(meta_path.read_text())
+        assert data["extractor_model_id"] == "gemini-3.8-flash"
+        assert data["extractor_thinking_level"] == "medium"
+        assert "_extractor" not in data["auto_generated"]
+
+
+@pytest.mark.openai_provider
+class TestOpenAIEstimates:
+    """2026-10-08: dry-run estimates follow the primary provider's prices."""
+
+    def test_parent_estimate_uses_luna_prices(self) -> None:
+        from cc_session_toolkit.archive import openai_cost_usd
+
+        backfill = _load_backfill_module()
+        assert backfill._per_session_cost(100_000) == pytest.approx(
+            openai_cost_usd(100_000, 1500)
+        )
+        assert backfill._per_session_cost(400_000) == pytest.approx(
+            openai_cost_usd(400_000, 1500)
+        )
+
+    def test_subagent_estimate_uses_the_luna_constant(self) -> None:
+        backfill = _load_backfill_module()
+        assert backfill._per_subagent_cost() == backfill.PER_SUBAGENT_COST_USD_OPENAI
+
+    def test_openai_calls_reach_the_cost_log(self) -> None:
+        backfill = _load_backfill_module()
+        backfill._CALL_RECORDS.clear()
+        backfill._CURRENT_CONTEXT.update(target="proj/entry", phase="parent")
+        backfill._record_openai_call({"provider": "openai", "cost_usd": 0.01})
+        assert backfill._CALL_RECORDS == [{
+            "target": "proj/entry", "phase": "parent",
+            "provider": "openai", "cost_usd": 0.01,
+        }]

@@ -4,6 +4,7 @@ Constants, file type mappings, and defaults loading for CC session archiving.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -61,7 +62,11 @@ SCHEMA_VERSION = "1.3"
 # the introductory 3.8 Flex price, ~103% once that price doubles on
 # 2027-01-01. Google's 2026-10-07 notice also deprecates
 # ``thinking_budget`` (upcoming models reject it with 400).
-EXTRACTOR_MODEL_ID = "gemini-3.8-flash"
+#
+# 2026-10-08 (later): the Gemini model is now one of two extractor
+# providers, see ``EXTRACTOR_PROVIDER`` below. Its constant is renamed
+# ``GEMINI_EXTRACTOR_MODEL_ID``; every Gemini call and token count uses it.
+GEMINI_EXTRACTOR_MODEL_ID = "gemini-3.8-flash"
 
 # Thinking level for the extractor (2026-10-08). ``medium`` is the
 # documented default for 3.8 Flash; it is set explicitly so the record
@@ -70,6 +75,78 @@ EXTRACTOR_MODEL_ID = "gemini-3.8-flash"
 # ``minimal`` is rejected by 3.8. Sending ``thinking_budget`` together
 # with ``thinking_level`` returns 400, so only the level is sent.
 AUTO_METADATA_THINKING_LEVEL = "medium"
+
+# ---------------------------------------------------------------------------
+# Extractor provider (added 2026-10-08)
+# ---------------------------------------------------------------------------
+# Which provider writes the auto-metadata: ``"openai"`` (GPT-6 Luna) or
+# ``"gemini"`` (the Gemini path above, kept intact). Shawn chose Luna on
+# 2026-10-08 after the 10-session comparison (PA
+# ``data/experiments/extractor-comparison-2026-10-08/report.md``): topic
+# coverage matched 3.8-medium (62 vs 61 of 64; side topics in long sessions
+# 20 vs 19 of 22), every one of its 44 quotes was verbatim (3.8: 33 of 35,
+# two with added punctuation), and at standard tier it cost about a third
+# of 3.8 Flex (US$0.29 vs US$0.81 for the 10 sessions) at a median 14 s
+# against 33 s. Standard tier is never preempted, which removes the Flex
+# 503s that left 25 sessions with placeholder metadata.
+#
+# The environment variable ``CC_EXTRACTOR_PROVIDER`` overrides the choice
+# without a code change. When the primary provider fails (after its own
+# retries), the call falls back to ``EXTRACTOR_FALLBACK_PROVIDER``; set it
+# to ``None`` to disable. Each record names the model that actually wrote
+# it, so a fallback is visible in ``extractor_model_id``.
+EXTRACTOR_PROVIDER: str = os.environ.get("CC_EXTRACTOR_PROVIDER") or "openai"
+EXTRACTOR_FALLBACK_PROVIDER: str | None = "gemini"
+
+# OpenAI model and reasoning effort. ``none`` is the effort the comparison
+# measured as strongest (``luna6-none``); ``low`` scored the same within
+# noise at ~1.3x the latency. Recorded as ``extractor_thinking_level``.
+OPENAI_EXTRACTOR_MODEL_ID = "gpt-6-luna"
+OPENAI_REASONING_EFFORT = "none"
+
+# The OpenAI key is role-scoped, never a generic ``OPENAI_API_KEY``, so the
+# spend lands in the right OpenAI project: role ``PA`` keys belong to the
+# ``personal-assistant`` project (Shawn, 2026-10-08). Resolution order:
+# ``OPENAI_API_KEY_<ROLE>`` (an override), then
+# ``OPENAI_API_KEY_<ROLE>_<SUFFIX>``, with the suffix from
+# ``OPENAI_KEY_SUFFIX`` or the hostname below; environment first, then the
+# PA ``.env`` file (hooks do not inherit it). Mirrors PA
+# ``scripts/_openai_key.py``.
+OPENAI_KEY_ROLE = "PA"
+OPENAI_KEY_HOST_SUFFIXES: tuple[tuple[str, str], ...] = (
+    ("zbook", "ZBOOK"),
+    ("amd-tower", "AMDT"),
+)
+
+# Request handling. Standard tier (no ``service_tier`` sent). Retries cover
+# rate limits and transient server errors; a 429 for exhausted quota and
+# any 4xx other than 429 are not retried. The timeout is per attempt.
+OPENAI_RETRY_WAITS_SECONDS = (10, 30, 60)
+OPENAI_REQUEST_TIMEOUT_SECONDS = 300
+OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+
+# GPT-6 Luna list prices, standard tier (USD per million tokens), verified
+# 2026-10-08 (PA ``extractor-comparison-2026-10-08/pricing/
+# openai-model-gpt-6-luna-2026-10-08.txt``, line 9). A request whose prompt
+# exceeds 272,000 tokens pays 2x input and 1.5x output for the whole
+# request. Output prices include reasoning tokens.
+OPENAI_INPUT_PRICE_PER_MTOK = 0.10
+OPENAI_CACHED_INPUT_PRICE_PER_MTOK = 0.01
+OPENAI_OUTPUT_PRICE_PER_MTOK = 0.50
+OPENAI_LONG_PROMPT_THRESHOLD_TOKENS = 272_000
+OPENAI_LONG_PROMPT_INPUT_MULTIPLIER = 2.0
+OPENAI_LONG_PROMPT_OUTPUT_MULTIPLIER = 1.5
+
+# The primary model and its thinking setting: the defaults recorded when a
+# caller names no model. A fallback records its own.
+EXTRACTOR_MODEL_ID = (
+    OPENAI_EXTRACTOR_MODEL_ID if EXTRACTOR_PROVIDER == "openai"
+    else GEMINI_EXTRACTOR_MODEL_ID
+)
+EXTRACTOR_THINKING_LEVEL = (
+    OPENAI_REASONING_EFFORT if EXTRACTOR_PROVIDER == "openai"
+    else AUTO_METADATA_THINKING_LEVEL
+)
 
 # ---------------------------------------------------------------------------
 # Auto-metadata extraction tuning

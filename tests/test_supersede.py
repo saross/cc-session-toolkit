@@ -186,8 +186,9 @@ class TestHelpers:
         _write(live, 0, 10)
         _, _, dest = _initial_archive(tmp_path, live)
         assert _meta(dest)["extractor_source_bytes"] == live.stat().st_size
-        from cc_session_toolkit.config import AUTO_METADATA_THINKING_LEVEL
-        assert _meta(dest)["extractor_thinking_level"] == AUTO_METADATA_THINKING_LEVEL
+        # The fake generator names no model, so the primary's defaults apply.
+        from cc_session_toolkit.config import EXTRACTOR_THINKING_LEVEL
+        assert _meta(dest)["extractor_thinking_level"] == EXTRACTOR_THINKING_LEVEL
 
     def test_placeholder_records_no_source_bytes(
         self, tmp_path: Path, fake_generator: dict[str, Any],

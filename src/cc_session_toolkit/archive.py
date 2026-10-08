@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -34,8 +35,25 @@ from cc_session_toolkit.config import (
     DEFAULT_THINKING_NATURE_NOTE,
     DEFAULT_THINKING_SHARING,
     DEFAULT_THINKING_USE_CONSTRAINTS,
+    EXTRACTOR_FALLBACK_PROVIDER,
     EXTRACTOR_MODEL_ID,
+    EXTRACTOR_PROVIDER,
+    EXTRACTOR_THINKING_LEVEL,
+    GEMINI_EXTRACTOR_MODEL_ID,
     MAX_SUBAGENT_SUMMARIES,
+    OPENAI_CACHED_INPUT_PRICE_PER_MTOK,
+    OPENAI_EXTRACTOR_MODEL_ID,
+    OPENAI_INPUT_PRICE_PER_MTOK,
+    OPENAI_KEY_HOST_SUFFIXES,
+    OPENAI_KEY_ROLE,
+    OPENAI_LONG_PROMPT_INPUT_MULTIPLIER,
+    OPENAI_LONG_PROMPT_OUTPUT_MULTIPLIER,
+    OPENAI_LONG_PROMPT_THRESHOLD_TOKENS,
+    OPENAI_OUTPUT_PRICE_PER_MTOK,
+    OPENAI_REASONING_EFFORT,
+    OPENAI_REQUEST_TIMEOUT_SECONDS,
+    OPENAI_RESPONSES_URL,
+    OPENAI_RETRY_WAITS_SECONDS,
     SCHEMA_VERSION,
     load_defaults,
 )
@@ -697,7 +715,7 @@ def _call_gemini_once(
         system_prompt, response_schema, service_tier=service_tier
     )
     response = client.models.generate_content(
-        model=EXTRACTOR_MODEL_ID,
+        model=GEMINI_EXTRACTOR_MODEL_ID,
         contents=user_message,
         config=config,
     )
@@ -790,12 +808,385 @@ def _call_gemini_with_retry(
         ) from exc
 
 
+# -------------------------------------------------------------------------
+# OpenAI extractor (GPT-6 Luna, added 2026-10-08)
+# -------------------------------------------------------------------------
+# The Gemini functions above are unchanged apart from naming their model
+# (GEMINI_EXTRACTOR_MODEL_ID); config.EXTRACTOR_PROVIDER chooses between
+# the two, and _call_extractor falls back from one to the other.
+
+#: Optional observer for OpenAI calls. The backfill sets it to record
+#: per-call usage and cost for its audit log; production leaves it None.
+_EXTRACTOR_CALL_OBSERVER: Callable[[dict[str, Any]], None] | None = None
+
+
+class OpenAIRequestError(RuntimeError):
+    """An HTTP error from the OpenAI API, keeping the status for retries."""
+
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(f"OpenAI HTTP {status}: {detail}")
+        self.status = status
+        self.detail = detail
+
+
+def _openai_key_names(hostname: str | None = None) -> list[str]:
+    """Return the ``.env`` names the role-scoped OpenAI key may use, in order.
+
+    ``OPENAI_API_KEY_<ROLE>`` first (an explicit override), then the
+    host-suffixed ``OPENAI_API_KEY_<ROLE>_<SUFFIX>``. The suffix comes from
+    ``OPENAI_KEY_SUFFIX`` when set, otherwise from the hostname. A generic
+    ``OPENAI_API_KEY`` is never used: it may bill another project.
+    """
+    import os
+    import socket
+
+    names = [f"OPENAI_API_KEY_{OPENAI_KEY_ROLE}"]
+    suffix = os.environ.get("OPENAI_KEY_SUFFIX")
+    if not suffix:
+        host = (hostname if hostname is not None else socket.gethostname()).lower()
+        for fragment, candidate in OPENAI_KEY_HOST_SUFFIXES:
+            if fragment in host:
+                suffix = candidate
+                break
+    if suffix:
+        names.append(f"OPENAI_API_KEY_{OPENAI_KEY_ROLE}_{suffix}")
+    return names
+
+
+def _ensure_openai_api_key() -> str | None:
+    """
+    Resolve the extractor's OpenAI key from the environment or PA ``.env``.
+
+    Same fallback as :func:`_ensure_gemini_api_key`, because hooks do not
+    inherit ``.env``. Returns *None* when no key is found; never logs or
+    prints a key value.
+    """
+    import os
+
+    names = _openai_key_names()
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+
+    env_path = Path.home() / "personal-assistant" / ".env"
+    if not env_path.is_file():
+        return None
+    found: dict[str, str] = {}
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        key = key.strip().removeprefix("export ").strip()
+        value = value.strip().strip("\"'")
+        if key in names and value:
+            found[key] = value
+    for name in names:
+        if name in found:
+            os.environ[name] = found[name]
+            return found[name]
+    return None
+
+
+def openai_cost_usd(
+    input_tokens: int,
+    output_tokens: int,
+    cached_input_tokens: int = 0,
+) -> float:
+    """
+    List-price cost in USD of one standard-tier GPT-6 Luna request.
+
+    A prompt above ``OPENAI_LONG_PROMPT_THRESHOLD_TOKENS`` moves the whole
+    request to the long-prompt rates (2x input, 1.5x output). Output
+    tokens include reasoning tokens, as OpenAI bills them.
+    """
+    long_prompt = input_tokens > OPENAI_LONG_PROMPT_THRESHOLD_TOKENS
+    in_mult = OPENAI_LONG_PROMPT_INPUT_MULTIPLIER if long_prompt else 1.0
+    out_mult = OPENAI_LONG_PROMPT_OUTPUT_MULTIPLIER if long_prompt else 1.0
+    cached = min(max(cached_input_tokens, 0), input_tokens)
+    return (
+        (input_tokens - cached) * OPENAI_INPUT_PRICE_PER_MTOK * in_mult
+        + cached * OPENAI_CACHED_INPUT_PRICE_PER_MTOK * in_mult
+        + output_tokens * OPENAI_OUTPUT_PRICE_PER_MTOK * out_mult
+    ) / 1_000_000
+
+
+def _openai_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """
+    Copy a response schema into the form OpenAI's strict mode requires.
+
+    Strict structured outputs need ``additionalProperties: false`` on every
+    object and every property listed as required. The toolkit's schemas
+    already require all their properties, so the result accepts exactly
+    the JSON Gemini's ``response_schema`` accepts.
+    """
+    import copy
+
+    out = copy.deepcopy(schema)
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if node.get("type") == "object":
+                node["additionalProperties"] = False
+                node["required"] = list((node.get("properties") or {}).keys())
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(out)
+    return out
+
+
+def _openai_post(body: dict[str, Any], api_key: str, timeout: float) -> dict[str, Any]:
+    """POST one Responses API request and return the decoded JSON body.
+
+    Kept as a separate function so tests replace it and never reach the
+    network. HTTP errors become :class:`OpenAIRequestError`.
+    """
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        OPENAI_RESPONSES_URL,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:500]
+        raise OpenAIRequestError(exc.code, detail) from exc
+
+
+def _call_openai_once(
+    user_message: str,
+    system_prompt: str,
+    response_schema: dict[str, Any] | None,
+    *,
+    api_key: str,
+) -> str:
+    """
+    One GPT-6 Luna call through the Responses API; returns the raw text.
+
+    ``store: false`` keeps the transcript out of OpenAI's retained
+    response storage. Standard tier (no ``service_tier``). The reasoning
+    effort and output cap come from config. Raises on an HTTP error, an
+    incomplete response (for example the output cap), a refusal, or empty
+    output, so the caller's handling stays the same as for Gemini.
+    """
+    import time
+
+    body: dict[str, Any] = {
+        "model": OPENAI_EXTRACTOR_MODEL_ID,
+        "store": False,
+        "instructions": system_prompt,
+        "input": user_message,
+        "max_output_tokens": AUTO_METADATA_MAX_OUTPUT_TOKENS,
+        "reasoning": {"effort": OPENAI_REASONING_EFFORT},
+    }
+    if response_schema is not None:
+        body["text"] = {
+            "format": {
+                "type": "json_schema",
+                "name": "extractor_output",
+                "schema": _openai_strict_schema(response_schema),
+                "strict": True,
+            }
+        }
+
+    started = time.time()
+    payload = _openai_post(body, api_key, OPENAI_REQUEST_TIMEOUT_SECONDS)
+    wall_seconds = round(time.time() - started, 2)
+
+    usage = payload.get("usage") or {}
+    in_tok = usage.get("input_tokens")
+    out_tok = usage.get("output_tokens")
+    cached = (usage.get("input_tokens_details") or {}).get("cached_tokens") or 0
+    reasoning = (usage.get("output_tokens_details") or {}).get("reasoning_tokens") or 0
+    if _EXTRACTOR_CALL_OBSERVER is not None:
+        known = isinstance(in_tok, int) and isinstance(out_tok, int)
+        _EXTRACTOR_CALL_OBSERVER({
+            "provider": "openai",
+            "model": payload.get("model") or OPENAI_EXTRACTOR_MODEL_ID,
+            "input_tokens_charged": in_tok,
+            "cached_input_tokens": cached,
+            "output_tokens": out_tok,
+            "reasoning_tokens": reasoning,
+            "cost_usd": (
+                round(openai_cost_usd(in_tok, out_tok, cached), 6) if known else None
+            ),
+            "cost_unknown_reason": None if known else "usage missing on response",
+            "wall_seconds": wall_seconds,
+            "had_response_schema": response_schema is not None,
+            "service_tier": payload.get("service_tier") or "standard",
+        })
+
+    status = payload.get("status")
+    parts = [
+        part
+        for item in payload.get("output") or []
+        for part in (item.get("content") or [])
+    ]
+    refusals = [p.get("refusal") for p in parts if p.get("type") == "refusal"]
+    text = payload.get("output_text") or "".join(
+        p.get("text", "") for p in parts if p.get("type") in ("output_text", "text")
+    )
+    if refusals:
+        raise RuntimeError(f"OpenAI refused: {refusals[0]!r}")
+    if status not in (None, "completed") or not text:
+        raise RuntimeError(
+            f"OpenAI returned no usable text (status={status!r}, "
+            f"incomplete_details={payload.get('incomplete_details')!r})"
+        )
+    return text
+
+
+def _call_openai_with_retry(
+    user_message: str,
+    system_prompt: str,
+    response_schema: dict[str, Any] | None,
+    *,
+    api_key: str,
+) -> str:
+    """
+    Call GPT-6 Luna, retrying rate limits, server errors and network errors.
+
+    Waits follow ``OPENAI_RETRY_WAITS_SECONDS``. Not retried: a 4xx other
+    than 408/409/429, a 429 for exhausted quota (a billing state that a
+    wait cannot fix), and incomplete or refused responses.
+    """
+    import time
+    import urllib.error
+
+    retryable_status = {408, 409, 429, 500, 502, 503, 504}
+    waits: tuple[int, ...] = (0,) + tuple(OPENAI_RETRY_WAITS_SECONDS)
+    last_exc: Exception | None = None
+    for attempt, wait_seconds in enumerate(waits):
+        if wait_seconds:
+            _log_metadata_event(
+                f"OpenAI call failed ({last_exc}); waiting {wait_seconds}s "
+                f"before retry (attempt {attempt + 1}/{len(waits)})",
+                level="WARNING",
+            )
+            time.sleep(wait_seconds)
+        try:
+            return _call_openai_once(
+                user_message, system_prompt, response_schema, api_key=api_key
+            )
+        except OpenAIRequestError as exc:
+            last_exc = exc
+            if exc.status not in retryable_status or "insufficient_quota" in exc.detail:
+                raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+            last_exc = exc
+    raise RuntimeError(f"OpenAI failed after {len(waits)} attempts: {last_exc}")
+
+
+def _extractor_providers() -> list[str]:
+    """Return the providers to try, primary first, then the fallback."""
+    providers = [EXTRACTOR_PROVIDER]
+    if EXTRACTOR_FALLBACK_PROVIDER and EXTRACTOR_FALLBACK_PROVIDER not in providers:
+        providers.append(EXTRACTOR_FALLBACK_PROVIDER)
+    return providers
+
+
+def _call_extractor(
+    user_message: str,
+    system_prompt: str,
+    response_schema: dict[str, Any] | None,
+    *,
+    gemini_client: Any | None,
+) -> tuple[str, str, str]:
+    """
+    Run one extraction on the first provider that answers.
+
+    Returns ``(raw_text, model_id, thinking_level)``, where the last two
+    describe the model that actually produced the text, so a record
+    written by the fallback is labelled as such. Raises with every
+    provider's error when all fail.
+    """
+    providers = _extractor_providers()
+    errors: list[str] = []
+    for index, provider in enumerate(providers):
+        try:
+            if provider == "openai":
+                api_key = _ensure_openai_api_key()
+                if not api_key:
+                    raise RuntimeError(
+                        f"no OpenAI key for role {OPENAI_KEY_ROLE} on this host "
+                        f"(looked for {', '.join(_openai_key_names())})"
+                    )
+                raw = _call_openai_with_retry(
+                    user_message, system_prompt, response_schema, api_key=api_key
+                )
+                return raw, OPENAI_EXTRACTOR_MODEL_ID, OPENAI_REASONING_EFFORT
+            if provider == "gemini":
+                if gemini_client is None:
+                    raise RuntimeError(
+                        "Gemini unavailable (google-genai missing, no key, or "
+                        "client construction failed)"
+                    )
+                raw = _call_gemini_with_retry(
+                    gemini_client, user_message, system_prompt, response_schema
+                )
+                return raw, GEMINI_EXTRACTOR_MODEL_ID, AUTO_METADATA_THINKING_LEVEL
+            raise RuntimeError(f"unknown extractor provider {provider!r}")
+        except Exception as exc:  # noqa: BLE001 — collected and reported below
+            errors.append(f"{provider}: {type(exc).__name__}: {exc}")
+            if index + 1 < len(providers):
+                _log_metadata_event(
+                    f"Extractor {provider} failed; falling back to "
+                    f"{providers[index + 1]}: {type(exc).__name__}: {exc}",
+                    level="WARNING",
+                )
+    raise RuntimeError("; ".join(errors))
+
+
+def _gemini_client_for_extraction(context: str) -> tuple[Any | None, str | None]:
+    """
+    Build a Gemini client, or explain why not.
+
+    Returns ``(client, None)`` or ``(None, reason)``. The client serves the
+    free token counter that sizes every transcript, and the Gemini
+    provider itself.
+    """
+    try:
+        from google import genai  # noqa: WPS433 — optional dependency
+    except ImportError:
+        return None, "google-genai package not installed"
+    if not _ensure_gemini_api_key():
+        return None, "no GEMINI_API_KEY / GOOGLE_API_KEY"
+    try:
+        return genai.Client(), None
+    except Exception as exc:  # noqa: BLE001 — graceful degradation
+        return None, (
+            f"Gemini client construction failed for {context}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
 def generate_auto_metadata(
     session_path: Path,
     stats: dict[str, Any],
 ) -> dict[str, Any] | None:
     """
-    Generate title / purpose / tags / Three Ps via Gemini Flex.
+    Generate title / purpose / tags / Three Ps via the configured extractor.
+
+    Provider (2026-10-08): ``config.EXTRACTOR_PROVIDER`` (GPT-6 Luna by
+    default) with ``EXTRACTOR_FALLBACK_PROVIDER`` (Gemini) behind it; see
+    :func:`_call_extractor`. The returned dict carries a private
+    ``_extractor`` entry naming the model that answered, which callers pop
+    into the record's provenance fields. Gemini's free token counter sizes
+    the transcript for every provider; without it the chars-per-token
+    heuristic is used.
 
     Architecture (2026-05-18 bake-off winner; refined 2026-05-22 + 2026-05-23):
     - Full distilled transcript via
@@ -832,46 +1223,72 @@ def generate_auto_metadata(
         Dictionary with ``title``, ``purpose``, ``tags``, and
         ``three_ps`` keys, or *None* on failure.
     """
+    # Gemini serves the free token counter for every provider and is itself
+    # a provider (2026-10-08). When it is the PRIMARY provider, a missing
+    # client ends the attempt exactly as before; otherwise extraction goes
+    # on with the heuristic token counter and without a Gemini fallback.
+    gemini_required = EXTRACTOR_PROVIDER == "gemini"
+    client: Any | None = None
     try:
         from google import genai  # noqa: WPS433 — optional dependency
     except ImportError:
+        genai = None
+        if gemini_required:
+            _log_metadata_event(
+                "google-genai package not installed — skipping auto-metadata",
+                level="WARNING",
+            )
+            print(
+                "  Warning: google-genai package not installed, "
+                "skipping auto-metadata"
+            )
+            return None
         _log_metadata_event(
-            "google-genai package not installed — skipping auto-metadata",
+            "google-genai not installed; token counts use the heuristic and "
+            "Gemini cannot serve as the fallback",
             level="WARNING",
         )
-        print(
-            "  Warning: google-genai package not installed, "
-            "skipping auto-metadata"
-        )
-        return None
 
-    api_key = _ensure_gemini_api_key()
-    if not api_key:
-        _log_metadata_event(
-            f"No GEMINI_API_KEY / GOOGLE_API_KEY for {session_path.name}",
-            level="ERROR",
-        )
-        print(
-            "  Warning: no GEMINI_API_KEY / GOOGLE_API_KEY — "
-            "skipping auto-metadata"
-        )
-        return None
-
-    # Build the Gemini client up-front so we can use the real tokeniser
-    # for the session-budget truncation (count_tokens is a free, no-cost
-    # API call per Google's docs — input/output token billing does not
-    # apply). Falling back to the chars-per-token heuristic when client
-    # construction fails preserves the prior behaviour.
-    try:
-        client = genai.Client()
-    except Exception as exc:  # noqa: BLE001 — graceful degradation
-        _log_metadata_event(
-            f"Gemini client construction failed for {session_path.name}: "
-            f"{type(exc).__name__}: {exc}",
-            level="ERROR",
-        )
-        print(f"  Warning: Gemini client construction failed: {exc}")
-        return None
+    if genai is not None:
+        api_key = _ensure_gemini_api_key()
+        if not api_key:
+            if gemini_required:
+                _log_metadata_event(
+                    f"No GEMINI_API_KEY / GOOGLE_API_KEY for {session_path.name}",
+                    level="ERROR",
+                )
+                print(
+                    "  Warning: no GEMINI_API_KEY / GOOGLE_API_KEY — "
+                    "skipping auto-metadata"
+                )
+                return None
+            _log_metadata_event(
+                f"No GEMINI_API_KEY for {session_path.name}; token counts use "
+                f"the heuristic and Gemini cannot serve as the fallback",
+                level="WARNING",
+            )
+        else:
+            # Build the Gemini client up-front so we can use the real
+            # tokeniser for the session-budget truncation (count_tokens is a
+            # free, no-cost API call per Google's docs — input/output token
+            # billing does not apply).
+            try:
+                client = genai.Client()
+            except Exception as exc:  # noqa: BLE001 — graceful degradation
+                if gemini_required:
+                    _log_metadata_event(
+                        f"Gemini client construction failed for "
+                        f"{session_path.name}: {type(exc).__name__}: {exc}",
+                        level="ERROR",
+                    )
+                    print(f"  Warning: Gemini client construction failed: {exc}")
+                    return None
+                _log_metadata_event(
+                    f"Gemini client construction failed for {session_path.name}"
+                    f" ({type(exc).__name__}: {exc}); token counts use the "
+                    f"heuristic and Gemini cannot serve as the fallback",
+                    level="WARNING",
+                )
 
     def _count_tokens(text: str) -> int:
         """Call the Gemini API's count_tokens with the configured model.
@@ -884,7 +1301,7 @@ def generate_auto_metadata(
         calibration finding).
         """
         return client.models.count_tokens(
-            model=EXTRACTOR_MODEL_ID, contents=text
+            model=GEMINI_EXTRACTOR_MODEL_ID, contents=text
         ).total_tokens
 
     # Distil the full transcript with tokeniser-calibrated truncation.
@@ -898,7 +1315,8 @@ def generate_auto_metadata(
             extract_transcript_text_for_gemini,
         )
         transcript_text = extract_transcript_text_for_gemini(
-            session_path, count_tokens_fn=_count_tokens
+            session_path,
+            count_tokens_fn=_count_tokens if client is not None else None,
         )
     except (
         FileNotFoundError, OSError, EOFError, UnicodeDecodeError,
@@ -926,6 +1344,8 @@ def generate_auto_metadata(
     # acceptable because the truncation step already brought the text
     # under budget.
     try:
+        if client is None:
+            raise RuntimeError("no Gemini client for the token counter")
         content_tokens = int(_count_tokens(transcript_text))
     except Exception as exc:  # noqa: BLE001 — any failure falls back to the heuristic
         # ``Exception`` already subsumes ``TypeError`` and ``ValueError``;
@@ -953,18 +1373,18 @@ def generate_auto_metadata(
 
     try:
         _log_metadata_event(
-            f"Calling Gemini Flex for {session_path.name} "
-            f"({content_tokens:,} content tokens)"
+            f"Calling extractor ({' then '.join(_extractor_providers())}) for "
+            f"{session_path.name} ({content_tokens:,} content tokens)"
         )
-        raw_text = _call_gemini_with_retry(
-            client,
+        raw_text, model_id, thinking_level = _call_extractor(
             user_message,
             system_prompt,
-            response_schema=PARENT_METADATA_SCHEMA,
+            PARENT_METADATA_SCHEMA,
+            gemini_client=client,
         )
     except Exception as exc:  # noqa: BLE001 — graceful degradation
         _log_metadata_event(
-            f"Gemini call failed for {session_path.name}: "
+            f"Extractor call failed for {session_path.name}: "
             f"{type(exc).__name__}: {exc}",
             level="ERROR",
         )
@@ -980,7 +1400,7 @@ def generate_auto_metadata(
         # (the 2026-05-24 b089991e/ab92875b subagent failure broke at
         # char 1144, invisible under raw[:200]/[:300]).
         _log_metadata_event(
-            f"Gemini response not parseable as JSON for "
+            f"{model_id} response not parseable as JSON for "
             f"{session_path.name}: {exc}; "
             f"raw_len={len(raw_text)}; raw[:8192]={raw_text[:8192]!r}",
             level="ERROR",
@@ -995,7 +1415,7 @@ def generate_auto_metadata(
     # that iterate ``tags``. ``.get(key) or default`` covers both cases.
     title = result.get("title") or "Untitled Session"
     _log_metadata_event(
-        f"Success for {session_path.name}: {title!r}"
+        f"Success for {session_path.name} via {model_id}: {title!r}"
     )
     auto_meta: dict[str, Any] = {
         "title": title,
@@ -1017,6 +1437,8 @@ def generate_auto_metadata(
     for v3_field in ("phases", "decisions", "key_exchanges"):
         raw = result.get(v3_field)
         auto_meta[v3_field] = raw if isinstance(raw, list) else []
+    # Provenance for the caller to pop (never stored under auto_generated).
+    auto_meta["_extractor"] = {"model_id": model_id, "thinking_level": thinking_level}
     return auto_meta
 
 
@@ -1169,7 +1591,8 @@ def generate_subagent_summaries(
     produced by :func:`archive_subagent_transcripts`), this function
     reads the archived transcript at ``dest_dir / archive_path``,
     distils it through the toolkit's tokeniser-calibrated extractor, and
-    calls Gemini Flex with the v3 subagent prompt to produce a single
+    calls the configured extractor (:func:`_call_extractor`; GPT-6 Luna by
+    default since 2026-10-08) with the v3 subagent prompt to produce a single
     ~60–200-word narrative paragraph capturing what the subagent did and
     what it returned to the parent.
 
@@ -1201,36 +1624,26 @@ def generate_subagent_summaries(
         )
         subagents = subagents[:MAX_SUBAGENT_SUMMARIES]
 
-    try:
-        from google import genai  # noqa: WPS433 — optional dependency
-    except ImportError:
+    # As in generate_auto_metadata (2026-10-08): Gemini is required only
+    # when it is the primary provider; otherwise it serves the token counter
+    # when available and the heuristic stands in when not.
+    client, gemini_problem = _gemini_client_for_extraction("subagent summaries")
+    if client is None:
+        if EXTRACTOR_PROVIDER == "gemini":
+            _log_metadata_event(
+                f"{gemini_problem}; skipping subagent summaries",
+                level="WARNING",
+            )
+            return []
         _log_metadata_event(
-            "google-genai not installed; skipping subagent summaries",
+            f"{gemini_problem}; subagent token counts use the heuristic and "
+            f"Gemini cannot serve as the fallback",
             level="WARNING",
         )
-        return []
-
-    api_key = _ensure_gemini_api_key()
-    if not api_key:
-        _log_metadata_event(
-            "No GEMINI_API_KEY for subagent summaries; skipping",
-            level="WARNING",
-        )
-        return []
-
-    try:
-        client = genai.Client()
-    except Exception as exc:  # noqa: BLE001 — graceful degradation
-        _log_metadata_event(
-            f"Gemini client construction failed for subagent summaries: "
-            f"{type(exc).__name__}: {exc}",
-            level="ERROR",
-        )
-        return []
 
     def _count_tokens(text: str) -> int:
         return client.models.count_tokens(
-            model=EXTRACTOR_MODEL_ID, contents=text
+            model=GEMINI_EXTRACTOR_MODEL_ID, contents=text
         ).total_tokens
 
     system_prompt = _load_auto_metadata_subagent_prompt()
@@ -1254,7 +1667,8 @@ def generate_subagent_summaries(
                 extract_transcript_text_for_gemini,
             )
             distilled = extract_transcript_text_for_gemini(
-                sa_path, count_tokens_fn=_count_tokens
+                sa_path,
+                count_tokens_fn=_count_tokens if client is not None else None,
             )
         except Exception as exc:  # noqa: BLE001 — graceful degradation
             _log_metadata_event(
@@ -1268,6 +1682,8 @@ def generate_subagent_summaries(
             continue
 
         try:
+            if client is None:
+                raise RuntimeError("no Gemini client for the token counter")
             distilled_tokens = int(_count_tokens(distilled))
         except Exception:  # noqa: BLE001 — any failure falls back to the heuristic
             # Same rationale as the parent-path call above: ``Exception``
@@ -1306,15 +1722,15 @@ def generate_subagent_summaries(
         )
 
         try:
-            raw_text = _call_gemini_with_retry(
-                client,
+            raw_text, model_id, _thinking = _call_extractor(
                 user_msg,
                 system_prompt,
-                response_schema=SUBAGENT_NARRATIVE_SCHEMA,
+                SUBAGENT_NARRATIVE_SCHEMA,
+                gemini_client=client,
             )
         except Exception as exc:  # noqa: BLE001 — graceful degradation
             _log_metadata_event(
-                f"Subagent Gemini call failed for {agent_id}: "
+                f"Subagent extractor call failed for {agent_id}: "
                 f"{type(exc).__name__}: {exc}",
                 level="ERROR",
             )
@@ -1345,6 +1761,9 @@ def generate_subagent_summaries(
         summaries.append({
             "agent_id": agent_id,
             "narrative": narrative.strip(),
+            # Which model wrote this narrative (2026-10-08): with a fallback
+            # provider, subagents in one record can differ from the parent.
+            "extractor_model_id": model_id,
         })
         _log_metadata_event(
             f"Subagent summary success for {agent_id} "
@@ -1999,6 +2418,7 @@ def archive_session(
     # inform the directory name (human-readable slug instead of short
     # session ID).
     auto_generated = None
+    extractor_used: dict[str, Any] | None = None
     effective_title = title
     # Provenance of the metadata block (2026-10-08): which model wrote it
     # and how many transcript bytes it describes. Fresh output records the
@@ -2024,6 +2444,9 @@ def archive_session(
     elif auto_metadata:
         print(f"  Generating auto-metadata via {EXTRACTOR_MODEL_ID}...")
         auto_generated = generate_auto_metadata(session_path, stats)
+        extractor_used = (
+            auto_generated.pop("_extractor", None) if auto_generated else None
+        )
         if auto_generated:
             if title:
                 # Explicit title overrides the auto-generated title.
@@ -2279,8 +2702,13 @@ def archive_session(
         is_placeholder_metadata({"auto_generated": auto_generated})
     ):
         extractor_source_bytes = uncompressed_size
-        extractor_model_for_record = EXTRACTOR_MODEL_ID
-        extractor_thinking_level = AUTO_METADATA_THINKING_LEVEL
+        # The model that answered, which differs from the primary when the
+        # fallback provider wrote the metadata (2026-10-08).
+        used = extractor_used or {}
+        extractor_model_for_record = used.get("model_id") or EXTRACTOR_MODEL_ID
+        extractor_thinking_level = (
+            used.get("thinking_level") or EXTRACTOR_THINKING_LEVEL
+        )
 
     # Archive any sub-agent transcripts alongside the parent (v1.2).
     # Keeps parent + sub-agents co-located as one atomic archive unit.
