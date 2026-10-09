@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -306,6 +307,20 @@ class TestCatalogueOwner:
     def _own(root: Path, text: str) -> None:
         (root / CATALOGUE_OWNER_FILE).write_text(text, encoding="utf-8")
 
+    @staticmethod
+    def _all_writers(store: Path) -> list[Callable[[], object]]:
+        """Every public catalogue writer, each set to change *store*'s catalogue."""
+        cat = store / "CATALOG.json"
+        new = json.loads((_entry(store, "proj/2026-03-04_n", "N", recorded=5)
+                          / "session.meta.json").read_text())
+        new["_archive_directory"] = str(store / "proj/2026-03-04_n")
+        return [
+            lambda: rebuild_and_write_catalogue(store),
+            lambda: update_catalogue([new], cat, store, "proj"),
+            lambda: update_catalogue_entry("A", {"auto_generated": {"title": "t"}}, cat),
+            lambda: write_catalogue(cat, {"sessions": []}),
+        ]
+
     def test_another_hosts_store_is_refused_everywhere(
         self, store: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -313,20 +328,51 @@ class TestCatalogueOwner:
         self._own(store, "# the R2 push owner\nAMD-tower-ubuntu\n")
         cat = store / "CATALOG.json"
         before = cat.read_bytes()
-        new = json.loads((_entry(store, "proj/2026-03-04_n", "N", recorded=5)
-                          / "session.meta.json").read_text())
-        new["_archive_directory"] = str(store / "proj/2026-03-04_n")
-        writers = [
-            lambda: rebuild_and_write_catalogue(store),
-            lambda: update_catalogue([new], cat, store, "proj"),
-            lambda: update_catalogue_entry("A", {"auto_generated": {"title": "t"}}, cat),
-            lambda: write_catalogue(cat, {"sessions": []}),
-        ]
-        for write in writers:
+        for write in self._all_writers(store):
             with pytest.raises(CatalogueNotOwner, match="owned by AMD-tower-ubuntu"):
                 write()
         assert cat.read_bytes() == before
         assert not list(store.glob("CATALOG.json.*.tmp"))
+
+    def test_a_dangling_owner_symlink_refuses_everywhere(
+        self, store: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Astra's C1: a broken guard must not read as "no guard".
+
+        Following a dangling link raises the same FileNotFoundError as an
+        absent file, so the guard used to fail OPEN and admit every host.
+        """
+        monkeypatch.setattr(catalogue_mod.socket, "gethostname", lambda: "zbook-ubuntu")
+        cat = store / "CATALOG.json"
+        lock = catalogue_mod._lock_path(cat)
+        lock.unlink()  # left by the fixture's rebuild; none may be created now
+        (store / CATALOGUE_OWNER_FILE).symlink_to(store / "owner-moved-away")
+        before = cat.read_bytes()
+        for write in self._all_writers(store):
+            with pytest.raises(CatalogueNotOwner, match="not a symlink"):
+                write()
+        assert cat.read_bytes() == before
+        assert not list(store.glob("CATALOG.json.*.tmp"))
+        assert not lock.exists()
+
+    def test_a_live_owner_symlink_refuses_too(
+        self, store: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Even a symlink to a file naming this host: the rule is simply no links."""
+        monkeypatch.setattr(catalogue_mod.socket, "gethostname", lambda: "AMD-tower-ubuntu")
+        target = store / "owner-elsewhere"
+        target.write_text("AMD-tower-ubuntu\n", encoding="utf-8")
+        (store / CATALOGUE_OWNER_FILE).symlink_to(target)
+        with pytest.raises(CatalogueNotOwner, match="not a symlink"):
+            rebuild_and_write_catalogue(store)
+
+    def test_an_owner_directory_refuses(
+        self, store: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(catalogue_mod.socket, "gethostname", lambda: "AMD-tower-ubuntu")
+        (store / CATALOGUE_OWNER_FILE).mkdir()
+        with pytest.raises(CatalogueNotOwner, match="not a regular file"):
+            rebuild_and_write_catalogue(store)
 
     def test_refused_before_the_lock(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

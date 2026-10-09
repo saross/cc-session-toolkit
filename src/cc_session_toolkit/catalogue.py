@@ -12,6 +12,7 @@ import contextlib
 import json
 import os
 import socket
+import stat
 import tempfile
 import time
 from collections.abc import Collection, Iterator
@@ -96,23 +97,49 @@ REBUILD_API_VERSION = 3
 
 #: Beside ``CATALOG.json``: one line naming the host (as
 #: ``socket.gethostname()`` reports it) that owns the catalogue. Lines
-#: starting with ``#`` are comments. Move ownership by editing it.
+#: starting with ``#`` are comments. It must be a regular file, not a
+#: symlink. Move ownership by editing it.
 CATALOGUE_OWNER_FILE = "CATALOG.owner"
 
 
 def check_catalogue_owner(catalogue_file: Path) -> None:
     """Raise :class:`CatalogueNotOwner` unless this host may write *catalogue_file*.
 
-    Returns quietly when the store has no owner file. An owner file that
-    cannot be read, or that does not name exactly one host, refuses too: a
-    guard that failed open on a damaged file would guard nothing. Host
-    names compare case-insensitively, as DNS names do.
+    Returns quietly only when the store has no owner file (no directory
+    entry by that name). An owner file that is a symlink (live or
+    dangling) or not a regular file, that cannot be read, or that does not
+    name exactly one host, refuses too: a guard that failed open on a
+    damaged file would guard nothing. Host names compare
+    case-insensitively, as DNS names do.
     """
     owner_file = catalogue_file.with_name(CATALOGUE_OWNER_FILE)
+    # The directory entry itself, not what it points to (Astra's review of
+    # cc-session-toolkit #11, C1). Reading through the name treated a
+    # DANGLING symlink as "no owner file", because following the link
+    # raises the same FileNotFoundError as absence: a damaged guard then
+    # admitted every host. Only a missing entry means "no guard"; a symlink,
+    # even a live one, and anything else that is not a regular file refuse.
     try:
-        text = owner_file.read_text(encoding="utf-8")
+        mode = owner_file.lstat().st_mode
     except FileNotFoundError:
         return
+    except OSError as exc:
+        raise CatalogueNotOwner(
+            f"cannot inspect the catalogue owner file {owner_file} ({exc}); nothing written"
+        ) from exc
+    if stat.S_ISLNK(mode):
+        raise CatalogueNotOwner(
+            f"the catalogue owner file {owner_file} must be a regular file, not a "
+            f"symlink; nothing written"
+        )
+    if not stat.S_ISREG(mode):
+        raise CatalogueNotOwner(
+            f"the catalogue owner file {owner_file} is not a regular file; nothing written"
+        )
+    try:
+        text = owner_file.read_text(encoding="utf-8")
+    # Includes a FileNotFoundError: the entry vanished after the lstat, so
+    # whether a guard applies is unknown, and unknown refuses.
     except (OSError, UnicodeDecodeError) as exc:
         raise CatalogueNotOwner(
             f"cannot read the catalogue owner file {owner_file} ({exc}); nothing written"
