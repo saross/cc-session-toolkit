@@ -75,8 +75,12 @@ cc-session summarise SESSION_ID
 cc-session update SESSION_ID [-m FILE]
     Update metadata for an existing archive.
 
-cc-session catalogue [--rebuild] [--markdown]
-    Regenerate catalogue from archived session metadata.
+cc-session catalogue [--rebuild] [--markdown] [--archive-root DIR]
+                     [--allow-removed FILE]
+    Regenerate catalogue from archived session metadata. A store that
+    several machines reach (over a network mount) should have ONE
+    catalogue writer: name its host in CATALOG.owner, beside
+    CATALOG.json, and every catalogue write on any other host is refused.
 ```
 
 ## Project Structure After `init`
