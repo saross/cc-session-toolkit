@@ -17,6 +17,38 @@ from pathlib import Path
 # Markers that indicate a project root directory (checked in order)
 PROJECT_ROOT_MARKERS = (".git", "CLAUDE.md", "pyproject.toml")
 
+#: What a gitfile (the ``.git`` FILE of a worktree or submodule) starts with.
+_GITFILE_PREFIX = b"gitdir:"
+
+
+def _is_root_marker(path: Path) -> bool:
+    """
+    Return True if *path* is a real project-root marker, not just a name.
+
+    ``CLAUDE.md`` and ``pyproject.toml`` count if they exist. ``.git``
+    counts only if it is a repository: a directory holding ``HEAD`` (every
+    git directory has one), or a gitfile (``gitdir: <path>``, as in a
+    worktree or submodule).
+
+    Why (2026-10-09): an EMPTY ``.git`` directory is no repository, but it
+    used to make its parent a project root. GPT's Codex sandbox (bubblewrap
+    ``--tmpfs /tmp/.git``) leaves exactly that at ``/tmp/.git`` while it
+    runs, so every directory under ``/tmp`` looked like part of a project
+    rooted at ``/tmp``, and 9 of this package's own tests failed during one
+    such run (their ``tmp_path`` fixtures live under ``/tmp``).
+    """
+    if path.name != ".git":
+        return path.exists()
+    if path.is_dir():
+        return (path / "HEAD").is_file()
+    if path.is_file():
+        try:
+            with path.open("rb") as handle:
+                return handle.read(len(_GITFILE_PREFIX)) == _GITFILE_PREFIX
+        except OSError:
+            return False
+    return False
+
 # Standard Claude Code projects directory
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
@@ -27,7 +59,9 @@ def find_project_root(start: Path | None = None) -> Path:
 
     A directory is considered a project root if it contains any of the
     marker files/directories: ``.git/``, ``CLAUDE.md``, or
-    ``pyproject.toml``.
+    ``pyproject.toml``. A ``.git`` must be a real repository (a directory
+    with ``HEAD``, or a gitfile); an empty one is ignored
+    (see :func:`_is_root_marker`).
 
     Args:
         start: Directory to begin searching from.  Defaults to the
@@ -44,7 +78,7 @@ def find_project_root(start: Path | None = None) -> Path:
 
     while True:
         for marker in PROJECT_ROOT_MARKERS:
-            if (current / marker).exists():
+            if _is_root_marker(current / marker):
                 return current
 
         parent = current.parent

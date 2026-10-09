@@ -2032,6 +2032,7 @@ class TestCliArchiveGlobal:
         proj = tmp_path / "myproject"
         proj.mkdir()
         (proj / ".git").mkdir()
+        (proj / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
         # CC live store sits under tmp_path/.claude/projects/<encoded>/
         live_dir = tmp_path / ".claude" / "projects" / "-tmp-myproject"
         self._make_session(live_dir, "sid-001", str(proj))

@@ -51,6 +51,59 @@ class TestFindProjectRoot:
         assert find_project_root() == tmp_project
 
 
+class TestEmptyGitIsNotARoot:
+    """An empty ``.git`` is no repository (Codex's sandbox leaves ``/tmp/.git``)."""
+
+    def test_empty_git_dir_is_skipped(self, tmp_path: Path) -> None:
+        """Search continues past an empty .git to the real root above it."""
+        real = tmp_path / "real"
+        (real / ".git").mkdir(parents=True)
+        (real / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+        inner = real / "scratch"
+        (inner / ".git").mkdir(parents=True)  # empty, like bwrap's mount point
+        start = inner / "work"
+        start.mkdir()
+        assert find_project_root(start=start) == real
+
+    def test_only_an_empty_git_dir_finds_no_root(self, tmp_path: Path) -> None:
+        """With nothing else above, an empty .git yields no project root."""
+        sandbox = tmp_path / "sandbox"
+        (sandbox / ".git").mkdir(parents=True)
+        start = sandbox / "job"
+        start.mkdir()
+        try:
+            root = find_project_root(start=start)
+        except FileNotFoundError:
+            return
+        # Something above tmp_path (a real checkout) may still be a root,
+        # but never the directory holding only the empty .git.
+        assert root != sandbox
+
+    def test_git_dir_with_head_counts(self, tmp_path: Path) -> None:
+        """A .git directory holding HEAD is a repository."""
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+        assert find_project_root(start=repo) == repo
+
+    def test_gitfile_counts(self, tmp_path: Path) -> None:
+        """A worktree's or submodule's .git FILE marks a root."""
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        (worktree / ".git").write_text("gitdir: /elsewhere/.git/worktrees/w\n")
+        assert find_project_root(start=worktree) == worktree
+
+    def test_other_git_file_is_skipped(self, tmp_path: Path) -> None:
+        """A .git file that is not a gitfile marks nothing."""
+        real = tmp_path / "real"
+        real.mkdir()
+        (real / "pyproject.toml").write_text("[project]\nname='x'\n")
+        odd = real / "odd"
+        odd.mkdir()
+        (odd / ".git").write_text("not a gitfile\n")
+        assert find_project_root(start=odd) == real
+
+
 class TestGetProjectName:
     """Tests for :func:`get_project_name`."""
 
