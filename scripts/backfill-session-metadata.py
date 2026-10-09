@@ -367,15 +367,19 @@ def _per_session_cost(input_tokens: int) -> float:
 
 
 # Typical per-subagent Gemini Flex call cost in USD, for the fallback
-# provider. A flat value keeps the estimate within the ~10% target without
-# a second sampling pass over the subagent transcripts (audit follow-up
-# 2026-05-24). Recalibrated 2026-10-09 for Gemini 3.8 Flash Flex: the 591
-# subagent calls in PA ``data/logs/backfill-cost-log-20260528T020248Z.json``
-# (mean 39,738 input and 256 output tokens) cost a mean of $0.0154 at the
-# Flex prices above (95th percentile $0.044, max $0.147). The old $0.05 was
-# set for an earlier model and overstated the 3.8 cost about threefold.
-# The May calls were not made with 3.8, so its own output (thinking)
-# tokens may differ. ⚠ Double this with the prices on 2027-01-01.
+# provider: a flat value, which saves a second sampling pass over the
+# subagent transcripts (audit follow-up 2026-05-24). Recalibrated
+# 2026-10-09 for Gemini 3.8 Flash Flex: the 591 subagent calls in PA
+# ``data/logs/backfill-cost-log-20260528T020248Z.json`` (mean 39,738 input
+# and 256 output tokens), REPRICED at the Flex prices above, have a mean of
+# $0.0154 (95th percentile $0.044, max $0.147). $0.02 is a conservative
+# historical estimate, about 30% above that mean ($11.82 against about
+# $9.10 for those 591 calls), not one within the original ~10% target
+# (Astra's review of #11). The old $0.05 was set for an earlier model and
+# overstated the repriced cost about threefold. The May calls were not
+# made with 3.8, so this is a repricing, not a measurement: 3.8's own
+# output (thinking) tokens may differ. ⚠ Double this with the prices on
+# 2027-01-01.
 PER_SUBAGENT_COST_USD = 0.02
 
 # GPT-6 Luna equivalent (2026-10-08), from the 591 subagent calls in PA
