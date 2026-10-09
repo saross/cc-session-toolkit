@@ -13,12 +13,15 @@ Tests for the catalogue fixes from Astra's review of PA #172 (2026-10-08).
   long; a minority of directories vanishing (a stale mount) is refused.
 * P2: the newest-first sort keeps each session's copies in preference
   order, so lookups find the most complete copy even when dates differ.
+* Single owner (2026-10-09): a store's ``CATALOG.owner`` names the one host
+  that may write its catalogue; every writer refuses on any other host.
 """
 
 from __future__ import annotations
 
 import json
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -26,7 +29,9 @@ import pytest
 from cc_session_toolkit import catalogue as catalogue_mod
 from cc_session_toolkit.archive import find_archive_directory
 from cc_session_toolkit.catalogue import (
+    CATALOGUE_OWNER_FILE,
     CatalogueLockError,
+    CatalogueNotOwner,
     CatalogueRebuildRefused,
     CatalogueScanError,
     catalogue_lock,
@@ -35,6 +40,7 @@ from cc_session_toolkit.catalogue import (
     rebuild_catalogue,
     update_catalogue,
     update_catalogue_entry,
+    write_catalogue,
 )
 
 
@@ -286,6 +292,133 @@ class TestIncrementalUpdateKeepsAnUnreadableCatalogue:
                            / "session.meta.json").read_text())
         update_catalogue([meta], cat, tmp_path, "proj")
         assert [s["id"] for s in json.loads(cat.read_text())["sessions"]] == ["N"]
+
+
+class TestCatalogueOwner:
+    """``CATALOG.owner``: only the named host writes the store's catalogue."""
+
+    @pytest.fixture()
+    def store(self, tmp_path: Path) -> Path:
+        _entry(tmp_path, "proj/2026-03-02_a", "A", recorded=10)
+        rebuild_and_write_catalogue(tmp_path)
+        return tmp_path
+
+    @staticmethod
+    def _own(root: Path, text: str) -> None:
+        (root / CATALOGUE_OWNER_FILE).write_text(text, encoding="utf-8")
+
+    @staticmethod
+    def _all_writers(store: Path) -> list[Callable[[], object]]:
+        """Every public catalogue writer, each set to change *store*'s catalogue."""
+        cat = store / "CATALOG.json"
+        new = json.loads((_entry(store, "proj/2026-03-04_n", "N", recorded=5)
+                          / "session.meta.json").read_text())
+        new["_archive_directory"] = str(store / "proj/2026-03-04_n")
+        return [
+            lambda: rebuild_and_write_catalogue(store),
+            lambda: update_catalogue([new], cat, store, "proj"),
+            lambda: update_catalogue_entry("A", {"auto_generated": {"title": "t"}}, cat),
+            lambda: write_catalogue(cat, {"sessions": []}),
+        ]
+
+    def test_another_hosts_store_is_refused_everywhere(
+        self, store: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(catalogue_mod.socket, "gethostname", lambda: "zbook-ubuntu")
+        self._own(store, "# the R2 push owner\nAMD-tower-ubuntu\n")
+        cat = store / "CATALOG.json"
+        before = cat.read_bytes()
+        for write in self._all_writers(store):
+            with pytest.raises(CatalogueNotOwner, match="owned by AMD-tower-ubuntu"):
+                write()
+        assert cat.read_bytes() == before
+        assert not list(store.glob("CATALOG.json.*.tmp"))
+
+    def test_a_dangling_owner_symlink_refuses_everywhere(
+        self, store: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Astra's C1: a broken guard must not read as "no guard".
+
+        Following a dangling link raises the same FileNotFoundError as an
+        absent file, so the guard used to fail OPEN and admit every host.
+        """
+        monkeypatch.setattr(catalogue_mod.socket, "gethostname", lambda: "zbook-ubuntu")
+        cat = store / "CATALOG.json"
+        lock = catalogue_mod._lock_path(cat)
+        lock.unlink()  # left by the fixture's rebuild; none may be created now
+        (store / CATALOGUE_OWNER_FILE).symlink_to(store / "owner-moved-away")
+        before = cat.read_bytes()
+        for write in self._all_writers(store):
+            with pytest.raises(CatalogueNotOwner, match="not a symlink"):
+                write()
+        assert cat.read_bytes() == before
+        assert not list(store.glob("CATALOG.json.*.tmp"))
+        assert not lock.exists()
+
+    def test_a_live_owner_symlink_refuses_too(
+        self, store: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Even a symlink to a file naming this host: the rule is simply no links."""
+        monkeypatch.setattr(catalogue_mod.socket, "gethostname", lambda: "AMD-tower-ubuntu")
+        target = store / "owner-elsewhere"
+        target.write_text("AMD-tower-ubuntu\n", encoding="utf-8")
+        (store / CATALOGUE_OWNER_FILE).symlink_to(target)
+        with pytest.raises(CatalogueNotOwner, match="not a symlink"):
+            rebuild_and_write_catalogue(store)
+
+    def test_an_owner_directory_refuses(
+        self, store: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(catalogue_mod.socket, "gethostname", lambda: "AMD-tower-ubuntu")
+        (store / CATALOGUE_OWNER_FILE).mkdir()
+        with pytest.raises(CatalogueNotOwner, match="not a regular file"):
+            rebuild_and_write_catalogue(store)
+
+    def test_refused_before_the_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Another host's store is not touched at all, not even its lock file."""
+        monkeypatch.setattr(catalogue_mod.socket, "gethostname", lambda: "zbook-ubuntu")
+        _entry(tmp_path, "proj/a", "A")
+        self._own(tmp_path, "AMD-tower-ubuntu\n")
+        with pytest.raises(CatalogueNotOwner):
+            rebuild_and_write_catalogue(tmp_path)
+        assert not (tmp_path / "CATALOG.json").exists()
+        assert not (tmp_path / "CATALOG.json.lock").exists()
+
+    def test_the_owner_writes_and_case_does_not_matter(
+        self, store: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(catalogue_mod.socket, "gethostname", lambda: "amd-tower-ubuntu")
+        self._own(store, "AMD-tower-ubuntu\n")
+        _entry(store, "proj/2026-03-05_b", "B", recorded=7)
+        rebuilt = rebuild_and_write_catalogue(store)
+        assert {s["id"] for s in rebuilt["sessions"]} == {"A", "B"}
+
+    def test_a_refusal_is_a_rebuild_refusal(self) -> None:
+        """Existing callers that catch the refusal handle this one too."""
+        assert issubclass(CatalogueNotOwner, CatalogueRebuildRefused)
+
+    @pytest.mark.parametrize("text", ["", "# only a comment\n", "host-a\nhost-b\n"])
+    def test_an_owner_file_must_name_one_host(
+        self, store: Path, monkeypatch: pytest.MonkeyPatch, text: str,
+    ) -> None:
+        monkeypatch.setattr(catalogue_mod.socket, "gethostname", lambda: "host-a")
+        self._own(store, text)
+        with pytest.raises(CatalogueNotOwner, match="exactly one host"):
+            rebuild_and_write_catalogue(store)
+
+    def test_an_unreadable_owner_file_refuses(
+        self, store: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(catalogue_mod.socket, "gethostname", lambda: "host-a")
+        (store / CATALOGUE_OWNER_FILE).write_bytes(b"\xff\xfe not utf-8")
+        with pytest.raises(CatalogueNotOwner, match="cannot read"):
+            rebuild_and_write_catalogue(store)
+
+    def test_a_store_without_an_owner_file_is_unchanged(self, store: Path) -> None:
+        _entry(store, "proj/2026-03-05_b", "B", recorded=7)
+        assert len(rebuild_and_write_catalogue(store)["sessions"]) == 2
 
 
 class TestRecordedLength:

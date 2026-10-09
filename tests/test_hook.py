@@ -1454,6 +1454,68 @@ class TestCliFromHook:
         ]
         assert "fresh-id" in written
 
+    def test_another_hosts_store_is_archived_but_not_catalogued(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """2026-10-09: a store whose CATALOG.owner names another host.
+
+        The hook still archives the session (its metadata is written), but
+        it does not touch that store's catalogue: it warns on stderr and
+        exits non-zero, as for any other refused catalogue update.
+        """
+        from datetime import UTC, timedelta
+
+        from cc_session_toolkit import catalogue as catalogue_mod
+
+        archive_root = tmp_path / "cc-archives"
+        archive_root.mkdir()
+        catalogue = archive_root / "CATALOG.json"
+        catalogue.write_text('{"schema_version": "1.3", "sessions": []}')
+        (archive_root / "CATALOG.owner").write_text("AMD-tower-ubuntu\n")
+        monkeypatch.setattr(catalogue_mod.socket, "gethostname", lambda: "zbook-ubuntu")
+
+        now = datetime(2026, 3, 15, 10, 0, 0, tzinfo=UTC)
+        entries: list[dict[str, Any]] = []
+        for i in range(6):
+            entries.append({
+                "timestamp": (now + timedelta(minutes=i * 2)).isoformat(),
+                "message": {"role": "user", "content": f"Message {i + 1}"},
+            })
+            entries.append({
+                "timestamp": (now + timedelta(minutes=i * 2 + 1)).isoformat(),
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-5-20250929",
+                    "content": [{"type": "text", "text": f"Reply {i + 1}"}],
+                    "usage": {"input_tokens": 100, "output_tokens": 50},
+                },
+            })
+        session = tmp_path / "session.jsonl"
+        session.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        hook_input = json.dumps({
+            "session_id": "fresh-id",
+            "transcript_path": str(session),
+            "cwd": str(tmp_path),
+        })
+
+        code = self._run_cli(
+            ["archive", "--from-hook", "--archive-root", str(archive_root)],
+            hook_input,
+            monkeypatch,
+        )
+
+        assert code == 1
+        assert catalogue.read_text() == '{"schema_version": "1.3", "sessions": []}'
+        err = capsys.readouterr().err
+        assert "NOT catalogued" in err
+        assert "owned by AMD-tower-ubuntu" in err
+        written = [json.loads(m.read_text())["session"]["id"]
+                   for m in archive_root.rglob("session.meta.json")]
+        assert written == ["fresh-id"]
+
 
 class TestCliArchiveGlobal:
     """
@@ -2032,6 +2094,7 @@ class TestCliArchiveGlobal:
         proj = tmp_path / "myproject"
         proj.mkdir()
         (proj / ".git").mkdir()
+        (proj / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
         # CC live store sits under tmp_path/.claude/projects/<encoded>/
         live_dir = tmp_path / ".claude" / "projects" / "-tmp-myproject"
         self._make_session(live_dir, "sid-001", str(proj))

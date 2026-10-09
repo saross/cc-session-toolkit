@@ -22,6 +22,7 @@ def tmp_project(tmp_path: Path) -> Path:
     project = tmp_path / "test-project"
     project.mkdir()
     (project / ".git").mkdir()
+    (project / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
     (project / "CLAUDE.md").write_text("# Project: test-project\n")
     return project
 
@@ -34,6 +35,7 @@ def tmp_project_no_claude(tmp_path: Path) -> Path:
     project = tmp_path / "bare-project"
     project.mkdir()
     (project / ".git").mkdir()
+    (project / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
     return project
 
 

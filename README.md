@@ -75,8 +75,19 @@ cc-session summarise SESSION_ID
 cc-session update SESSION_ID [-m FILE]
     Update metadata for an existing archive.
 
-cc-session catalogue [--rebuild] [--markdown]
-    Regenerate catalogue from archived session metadata.
+cc-session catalogue [--rebuild] [--markdown] [--archive-root DIR]
+                     [--allow-removed FILE]
+    Regenerate catalogue from archived session metadata. A store that
+    several machines reach (over a network mount) should have ONE
+    catalogue writer: name its host in CATALOG.owner, beside
+    CATALOG.json, and every catalogue write on any other host is refused.
+    It must be a regular file, not a symlink. Moving ownership is a
+    drained handover: stop and drain the old owner's catalogue writers
+    (no rebuild, sync or push running there, or able to start), change
+    CATALOG.owner and any setting naming the same host together, then
+    resume on the new owner. The check runs before the lock, with no
+    lease over the write, so editing the file mid-rebuild does not stop
+    the old owner publishing that rebuild.
 ```
 
 ## Project Structure After `init`

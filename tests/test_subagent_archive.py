@@ -814,6 +814,7 @@ class TestGetSessionFilesFiltering:
         project_root = fake_home / "test-project"
         project_root.mkdir()
         (project_root / ".git").mkdir()
+        (project_root / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
         (project_root / "CLAUDE.md").write_text("# Project: test-project\n")
         # Populate the CC-side project directory with mixed files
         encoded = str(project_root.resolve()).replace("/", "-")
