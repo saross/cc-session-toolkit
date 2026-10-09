@@ -366,15 +366,17 @@ def _per_session_cost(input_tokens: int) -> float:
     )
 
 
-# Typical per-subagent Gemini Flex call cost in USD. Subagent transcripts
-# are typically small (a few thousand distilled tokens) and the v3
-# subagent prompt emits short narratives (~60–200 words, ~80–250 output
-# tokens). $0.05 is the per-subagent figure already documented in the
-# audit follow-ups doc and in ``_per_session_cost`` history; using a
-# flat value here keeps the estimate within the ~10% target without
-# requiring a second sampling pass over the subagent transcripts.
-# Audit follow-up 2026-05-24.
-PER_SUBAGENT_COST_USD = 0.05
+# Typical per-subagent Gemini Flex call cost in USD, for the fallback
+# provider. A flat value keeps the estimate within the ~10% target without
+# a second sampling pass over the subagent transcripts (audit follow-up
+# 2026-05-24). Recalibrated 2026-10-09 for Gemini 3.8 Flash Flex: the 591
+# subagent calls in PA ``data/logs/backfill-cost-log-20260528T020248Z.json``
+# (mean 39,738 input and 256 output tokens) cost a mean of $0.0154 at the
+# Flex prices above (95th percentile $0.044, max $0.147). The old $0.05 was
+# set for an earlier model and overstated the 3.8 cost about threefold.
+# The May calls were not made with 3.8, so its own output (thinking)
+# tokens may differ. ⚠ Double this with the prices on 2027-01-01.
+PER_SUBAGENT_COST_USD = 0.02
 
 # GPT-6 Luna equivalent (2026-10-08), from the 591 subagent calls in PA
 # ``data/logs/backfill-cost-log-20260528T020248Z.json``: mean 39,738 input
