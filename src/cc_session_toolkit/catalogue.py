@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import socket
 import tempfile
 import time
 from collections.abc import Collection, Iterator
@@ -62,11 +63,74 @@ class CatalogueRebuildRefused(RuntimeError):
     """A rebuild would drop entries it cannot account for; nothing written."""
 
 
+class CatalogueNotOwner(CatalogueRebuildRefused):
+    """This store's owner file names another host; nothing written.
+
+    A subclass of :class:`CatalogueRebuildRefused`, so every caller that
+    already keeps the file and reports a refusal handles it too.
+    """
+
+
 #: Version of the transactional rebuild API, for callers outside this
 #: package (personal-assistant's scripts) to check before relying on it.
 #: 2 (2026-10-08, review round two): ``allow_removed`` replaces
 #: ``max_removed_fraction``, and entries carry ``transcript_bytes``.
-REBUILD_API_VERSION = 2
+#: 3 (2026-10-09): every catalogue writer honours ``CATALOG.owner``.
+REBUILD_API_VERSION = 3
+
+
+# -------------------------------------------------------------------------
+# Single-owner stores (2026-10-09)
+# -------------------------------------------------------------------------
+#
+# The catalogue lock is an flock, and over a network mount (SSHFS) it
+# excludes writers on ONE machine only. A store that several hosts can
+# reach therefore needs exactly one catalogue writer, or two hosts' full
+# rebuilds can interleave: A reads its baseline and scans, B publishes an
+# entry A missed, then A publishes its older scan and B's entry is gone
+# (Astra's review of personal-assistant #172, round three). That contract
+# used to live only in documentation. A store now states it: an owner file
+# beside the catalogue names the one host allowed to write it, and every
+# writer here refuses on any other host. A store without the file is
+# unchanged (a machine's own mirror needs none).
+
+#: Beside ``CATALOG.json``: one line naming the host (as
+#: ``socket.gethostname()`` reports it) that owns the catalogue. Lines
+#: starting with ``#`` are comments. Move ownership by editing it.
+CATALOGUE_OWNER_FILE = "CATALOG.owner"
+
+
+def check_catalogue_owner(catalogue_file: Path) -> None:
+    """Raise :class:`CatalogueNotOwner` unless this host may write *catalogue_file*.
+
+    Returns quietly when the store has no owner file. An owner file that
+    cannot be read, or that does not name exactly one host, refuses too: a
+    guard that failed open on a damaged file would guard nothing. Host
+    names compare case-insensitively, as DNS names do.
+    """
+    owner_file = catalogue_file.with_name(CATALOGUE_OWNER_FILE)
+    try:
+        text = owner_file.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CatalogueNotOwner(
+            f"cannot read the catalogue owner file {owner_file} ({exc}); nothing written"
+        ) from exc
+    owners = [line.strip() for line in text.splitlines()
+              if line.strip() and not line.strip().startswith("#")]
+    if len(owners) != 1:
+        raise CatalogueNotOwner(
+            f"the catalogue owner file {owner_file} must name exactly one host "
+            f"(found {len(owners)}); nothing written"
+        )
+    host = socket.gethostname()
+    if host.casefold() != owners[0].casefold():
+        raise CatalogueNotOwner(
+            f"this store's catalogue is owned by {owners[0]} ({owner_file}) and this "
+            f"host is {host}; nothing written. Rebuild it on {owners[0]}, or, if "
+            f"ownership has moved, edit that file first"
+        )
 
 
 def _acquire_lock(handle: Any, timeout: float | None) -> None:
@@ -157,6 +221,7 @@ def write_catalogue(catalogue_file: Path, catalogue: dict[str, Any]) -> None:
     :func:`rebuild_and_write_catalogue`, which holds one lock across the
     whole transaction.
     """
+    check_catalogue_owner(catalogue_file)
     with catalogue_lock(catalogue_file):
         _write_json_atomic(catalogue_file, catalogue)
 
@@ -290,8 +355,9 @@ def rebuild_and_write_catalogue(
     update. Here the baseline read, the strict scan, the identity check and
     the atomic write all happen under one lock. Raises
     (:class:`CatalogueLockError`, :class:`CatalogueScanError`,
-    :class:`CatalogueRebuildRefused`) and leaves the existing file untouched
-    on any doubt; an ``OSError`` from the write itself propagates (the
+    :class:`CatalogueRebuildRefused`, including :class:`CatalogueNotOwner`
+    on a host the store's owner file does not name) and leaves the existing
+    file untouched on any doubt; an ``OSError`` from the write itself propagates (the
     temporary file is removed, and the rename is the last step, so the old
     file survives any failure before it).
 
@@ -302,6 +368,8 @@ def rebuild_and_write_catalogue(
     caller's log.
     """
     catalogue_file = catalogue_file or archive_dir / "CATALOG.json"
+    # Before the lock: another host's store is refused without touching it.
+    check_catalogue_owner(catalogue_file)
     with catalogue_lock(catalogue_file, timeout=lock_timeout):
         baseline = _read_baseline(catalogue_file)
         rebuilt = rebuild_catalogue(archive_dir, strict=True)
@@ -354,6 +422,7 @@ def update_catalogue(
         archive_dir: Base archive directory.
         project_name: Project name.
     """
+    check_catalogue_owner(catalogue_file)
     with catalogue_lock(catalogue_file):
         _update_catalogue_locked(
             new_sessions, catalogue_file, archive_dir, project_name
@@ -458,6 +527,7 @@ def update_catalogue_entry(
         meta: Updated metadata dictionary.
         catalogue_file: Path to ``CATALOG.json``.
     """
+    check_catalogue_owner(catalogue_file)
     with catalogue_lock(catalogue_file):
         # Raises, leaving the file as it is, when it cannot be read.
         catalogue = _read_baseline(catalogue_file)
