@@ -98,7 +98,8 @@ REBUILD_API_VERSION = 3
 #: Beside ``CATALOG.json``: one line naming the host (as
 #: ``socket.gethostname()`` reports it) that owns the catalogue. Lines
 #: starting with ``#`` are comments. It must be a regular file, not a
-#: symlink. Move ownership by editing it.
+#: symlink. Moving ownership is a drained handover, not a live edit: see
+#: :func:`check_catalogue_owner`.
 CATALOGUE_OWNER_FILE = "CATALOG.owner"
 
 
@@ -111,6 +112,24 @@ def check_catalogue_owner(catalogue_file: Path) -> None:
     name exactly one host, refuses too: a guard that failed open on a
     damaged file would guard nothing. Host names compare
     case-insensitively, as DNS names do.
+
+    Moving ownership is a quiescent handover, not a live edit (Astra's
+    review of cc-session-toolkit #11, C2). This check runs once, before the
+    lock and the scan, and no lease spans the publication that follows, so
+    a writer that has passed it carries on whatever the file says next: A
+    passes and starts a rebuild, the file is changed to name B, B
+    publishes, and A then publishes its older scan over B's entries. The
+    flock does not serialise the two, being on different hosts. Rechecking
+    just before the rename would narrow that window, not close it; only
+    draining closes it. So:
+
+    1. Stop admission on the old owner and drain its catalogue writers:
+       nothing that rebuilds or updates this store's catalogue (a daily
+       sync, a manual rebuild, an R2 push) may be running there, or start.
+    2. Change the owner file and every setting that names the same host
+       together (for personal-assistant's canonical store, ``R2_PUSH_HOST``
+       in ``scripts/daily-sync.sh``).
+    3. Resume on the new owner.
     """
     owner_file = catalogue_file.with_name(CATALOGUE_OWNER_FILE)
     # The directory entry itself, not what it points to (Astra's review of
@@ -155,8 +174,9 @@ def check_catalogue_owner(catalogue_file: Path) -> None:
     if host.casefold() != owners[0].casefold():
         raise CatalogueNotOwner(
             f"this store's catalogue is owned by {owners[0]} ({owner_file}) and this "
-            f"host is {host}; nothing written. Rebuild it on {owners[0]}, or, if "
-            f"ownership has moved, edit that file first"
+            f"host is {host}; nothing written. Rebuild it on {owners[0]}. Moving "
+            f"ownership needs the old owner drained first, not just an edit (README, "
+            f"CATALOG.owner)"
         )
 
 
