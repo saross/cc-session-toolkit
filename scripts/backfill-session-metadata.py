@@ -27,8 +27,10 @@ Usage:
                                                 [--cost-sample-size N]
                                                 [--upgrade-to-v13]
 
-Cost: ~$0.08 per session via Gemini 3.5 Flash Flex tier (3× the prior
-Gemini 3 Flash Preview ~$0.027 figure; was ~$0.001 under Haiku). The
+Cost: priced for the primary extractor, GPT-6 Luna at standard tier since
+2026-10-08 (the 2026-10-08 repair averaged about $0.02 per summary call);
+historically ~$0.08 per session under Gemini 3.5 Flash Flex and ~$0.001
+under Haiku. Every call is paid; the
 ``--dry-run`` mode samples ``--cost-sample-size`` sessions (default 20),
 distils them locally with no API spend, and reports mean / p90 /
 worst-case-envelope cost estimates grounded in the actual size
@@ -784,8 +786,9 @@ def main() -> None:
         help=(
             "Number of sessions to distil locally for a refined dry-run "
             "cost estimate (no API spend). Set to 0 to use a flat "
-            "$0.10/session estimate (Gemini 3.5 Flash + v3 schema; "
-            "subagent calls not modelled). Default: 20."
+            "$0.10/session estimate (calibrated on Gemini 3.5 Flash + v3 "
+            "schema, so high for Luna; subagent calls not modelled). "
+            "Default: 20."
         ),
     )
     parser.add_argument(

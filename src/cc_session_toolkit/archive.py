@@ -2520,8 +2520,9 @@ def archive_session(
             archive directory).
         project_name_override: Explicit project name (overrides
             auto-detection from *project_root*).
-        auto_metadata: Call Gemini Flex (Flex tier) for automatic
-            title/purpose/tags/three_ps. See
+        auto_metadata: Call the configured extractor (GPT-6 Luna,
+            ``gpt-6-luna``, since 2026-10-08; Gemini as fallback) for
+            automatic title/purpose/tags/three_ps. See
             :func:`generate_auto_metadata` for the model + cost details.
         capture_type: How the session was captured — ``"session_end"``,
             ``"pre_compact"``, or *None* for manual archiving.

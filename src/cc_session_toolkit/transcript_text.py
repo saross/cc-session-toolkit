@@ -7,7 +7,8 @@ Ported from ``personal-assistant/scripts/extract-transcript-text.py`` (the
 script-form sibling kept in the PA repo for ad-hoc smoke-testing). The
 module-form lives here so the cc-session-toolkit archiver can produce a
 faithful, framing-free representation of the whole transcript and feed it
-to the auto-metadata extractor (Gemini 3.5 Flash, Flex tier) without the
+to the auto-metadata extractor (GPT-6 Luna since 2026-10-08, with Gemini
+as fallback; Gemini 3.5 Flash Flex when this was written) without the
 sampled-message machinery that preceded it.
 
 What is kept

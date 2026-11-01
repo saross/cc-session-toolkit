@@ -211,7 +211,8 @@ def _cmd_archive_from_hook(args: argparse.Namespace) -> None:
 
     # Archive the session
     # Always stats_only=True in hook mode — suppress interactive prompt.
-    # The auto_metadata flag handles Gemini Flex independently.
+    # The auto_metadata flag handles the extractor call (GPT-6 Luna, Gemini
+    # fallback) independently.
     result = archive_session(
         transcript_path,
         project_root,
@@ -368,7 +369,7 @@ def _cmd_archive_global(args: argparse.Namespace) -> None:
         return
 
     # Apply trivial-session filter (mirrors ``_cmd_archive_from_hook``).
-    # Without this, ``--all --auto-metadata`` would fire a Gemini Flex
+    # Without this, ``--all --auto-metadata`` would fire an extractor
     # call on every empty / aborted / few-turn session in the live
     # store — material cost on a multi-hundred-session sweep. The
     # ``--min-turns`` flag (previously documented as hook-only) is
@@ -1086,8 +1087,10 @@ def main() -> None:
         "--auto-metadata",
         action="store_true",
         help=(
-            "Generate title/purpose/tags/three_ps via Gemini Flex "
-            "(~$0.027/session, ~½ Haiku Batch list price)."
+            "Generate title/purpose/tags/three_ps via the configured "
+            "extractor: GPT-6 Luna (gpt-6-luna, standard tier) since "
+            "2026-10-08, with Gemini 3.8 Flash as fallback. Paid; see "
+            "scripts/backfill-session-metadata.py --dry-run for estimates."
         ),
     )
     p_archive.add_argument(
