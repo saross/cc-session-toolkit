@@ -21,11 +21,22 @@ partition the archive into disjoint populations: missing-metadata
 sessions go through the default path, pre-v1.3 populated sessions go
 through the upgrade path, and v1.3 sessions are skipped entirely.
 
+--session-id / --non-luna mode (added 2026-11-02): RE-EXTRACTS sessions
+that already hold model metadata, to replace a legacy extractor's record
+(GPT-5.6 Terra, Gemini, Haiku) with GPT-6 Luna's. ``--session-id`` selects
+by session id or unique prefix (repeatable); ``--non-luna`` selects every
+record whose ``extractor_model_id`` is not GPT-6 Luna, placeholders
+included. Before each overwrite the existing record is copied
+to ``session.meta.pre-reextract-backup.json`` (never overwritten once
+written), so a re-extraction can be rolled back.
+
 Usage:
     python scripts/backfill-session-metadata.py [--dry-run]
                                                 [--archive-root DIR]
                                                 [--cost-sample-size N]
-                                                [--upgrade-to-v13]
+                                                [--upgrade-to-v13 |
+                                                 --session-id ID ... |
+                                                 --non-luna]
 
 Cost: priced for the primary extractor, GPT-6 Luna at standard tier since
 2026-10-08 (the 2026-10-08 repair averaged about $0.02 per summary call);
@@ -155,6 +166,64 @@ def find_sessions_needing_v13_upgrade(
             continue
         results.append(meta_path)
     return results
+
+
+def find_sessions_for_reextraction(
+    archive_root: Path,
+    session_ids: list[str] | None = None,
+    non_luna: bool = False,
+) -> list[Path]:
+    """Return meta paths selected for re-extraction (added 2026-11-02).
+
+    *session_ids* match ``session.id`` exactly or by prefix; a prefix that
+    matches more than one session raises ``ValueError`` rather than
+    spending on the wrong one, and one that matches none raises too.
+    *non_luna* selects every record whose ``extractor_model_id`` is not
+    GPT-6 Luna (``OPENAI_EXTRACTOR_MODEL_ID``, read at call time),
+    placeholders included. Permanently skipped records are never selected.
+    """
+    from cc_session_toolkit.config import OPENAI_EXTRACTOR_MODEL_ID
+
+    wanted = [sid.strip() for sid in (session_ids or []) if sid.strip()]
+    matches: dict[str, list[Path]] = {sid: [] for sid in wanted}
+    results: list[Path] = []
+    for meta_path in sorted(archive_root.rglob("session.meta.json")):
+        with open(meta_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if data.get("auto_metadata_skip_permanent"):
+            continue
+        sid = str((data.get("session") or {}).get("id") or "")
+        hit = False
+        for want in wanted:
+            if sid and sid.startswith(want):
+                matches[want].append(meta_path)
+                hit = True
+        if non_luna and data.get("extractor_model_id") != OPENAI_EXTRACTOR_MODEL_ID:
+            hit = True
+        if hit:
+            results.append(meta_path)
+    for want, paths in matches.items():
+        ids = {p.parent.name for p in paths}
+        if not paths:
+            raise ValueError(f"no archived session matches id {want!r}")
+        if len(ids) > 1:
+            raise ValueError(
+                f"id prefix {want!r} matches {len(ids)} archive entries; "
+                "give more characters"
+            )
+    return results
+
+
+def backup_pre_reextract_meta(meta_path: Path) -> Path:
+    """Copy session.meta.json aside before a re-extraction overwrites it.
+
+    Like :func:`backup_pre_v13_meta`, an existing backup is kept, so the
+    file always holds the record as it was before the first re-extraction.
+    """
+    backup_path = meta_path.with_name("session.meta.pre-reextract-backup.json")
+    if not backup_path.exists():
+        shutil.copy2(meta_path, backup_path)
+    return backup_path
 
 
 def mark_session_permanently_skipped(
@@ -804,6 +873,26 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--session-id",
+        action="append",
+        default=None,
+        metavar="ID",
+        help=(
+            "Re-extract this session (full id or unique prefix), replacing "
+            "existing metadata; repeatable. The prior record is backed up to "
+            "session.meta.pre-reextract-backup.json first."
+        ),
+    )
+    parser.add_argument(
+        "--non-luna",
+        action="store_true",
+        help=(
+            "Re-extract every session whose extractor_model_id is not the "
+            "GPT-6 Luna (gpt-6-luna), placeholders included, "
+            "with the same backup as --session-id."
+        ),
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -828,6 +917,9 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    reextract = bool(args.session_id) or args.non_luna
+    if reextract and args.upgrade_to_v13:
+        parser.error("--upgrade-to-v13 cannot be combined with re-extraction")
 
     # Ensure the PRIMARY provider's key is available before starting
     # (2026-10-08). A missing OpenAI key would otherwise send the whole paid
@@ -854,7 +946,16 @@ def main() -> None:
         if "gemini" in providers:
             print("Warning: no Gemini key; the Gemini fallback is unavailable.")
 
-    if args.upgrade_to_v13:
+    if reextract:
+        try:
+            sessions = find_sessions_for_reextraction(
+                args.archive_root, args.session_id, args.non_luna
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            sys.exit(2)
+        mode_label = "re-extraction"
+    elif args.upgrade_to_v13:
         sessions = find_sessions_needing_v13_upgrade(args.archive_root)
         mode_label = "v1.3 upgrade"
     else:
@@ -1003,6 +1104,8 @@ def main() -> None:
                 # preserving).
                 if args.upgrade_to_v13:
                     backup_pre_v13_meta(meta_path)
+                elif reextract:
+                    backup_pre_reextract_meta(meta_path)
                 update_metadata(
                     meta_path, result, subagent_summaries,
                     source_bytes=tmp_path.stat().st_size,

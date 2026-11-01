@@ -617,3 +617,57 @@ def test_finds_both_placeholder_texts(tmp_path: Path) -> None:
         )
     found = backfill.find_sessions_needing_backfill(tmp_path)
     assert sorted(p.parent.name for p in found) == ["a", "b"]
+
+
+class TestReextractionSelectors:
+    """--session-id / --non-luna select populated records (2026-11-02)."""
+
+    @staticmethod
+    def _entry(root: Path, name: str, sid: str, model: str | None,
+               **extra: object) -> Path:
+        """Write one archive entry's session.meta.json and return its path."""
+        entry = root / "proj" / name
+        entry.mkdir(parents=True)
+        meta = entry / "session.meta.json"
+        meta.write_text(json.dumps({
+            "session": {"id": sid},
+            "extractor_model_id": model,
+            "auto_generated": {"purpose": "A real purpose"},
+            **extra,
+        }), encoding="utf-8")
+        return meta
+
+    def test_non_luna_selects_every_other_extractor(self, tmp_path: Path) -> None:
+        backfill = _load_backfill_module()
+        self._entry(tmp_path, "a", "aaaa-1", "gpt-6-luna")
+        self._entry(tmp_path, "b", "bbbb-1", "gpt-5.6-terra")
+        self._entry(tmp_path, "c", "cccc-1", "gemini-3.5-flash")
+        self._entry(tmp_path, "d", "dddd-1", None)
+        self._entry(tmp_path, "e", "eeee-1", None,
+                    auto_metadata_skip_permanent=True)
+        found = backfill.find_sessions_for_reextraction(tmp_path, non_luna=True)
+        assert sorted(p.parent.name for p in found) == ["b", "c", "d"]
+
+    def test_session_id_prefix_selects_one(self, tmp_path: Path) -> None:
+        backfill = _load_backfill_module()
+        self._entry(tmp_path, "a", "aaaa-1", "gpt-6-luna")
+        self._entry(tmp_path, "b", "bbbb-1", "gpt-5.6-terra")
+        found = backfill.find_sessions_for_reextraction(tmp_path, ["bbbb"])
+        assert [p.parent.name for p in found] == ["b"]
+
+    def test_ambiguous_or_unknown_prefix_refuses(self, tmp_path: Path) -> None:
+        backfill = _load_backfill_module()
+        self._entry(tmp_path, "a", "abcd-1", "gpt-5.6-terra")
+        self._entry(tmp_path, "b", "abcd-2", "gpt-5.6-terra")
+        with pytest.raises(ValueError, match="matches 2"):
+            backfill.find_sessions_for_reextraction(tmp_path, ["abcd"])
+        with pytest.raises(ValueError, match="no archived session"):
+            backfill.find_sessions_for_reextraction(tmp_path, ["zzzz"])
+
+    def test_backup_keeps_the_first_original(self, tmp_path: Path) -> None:
+        backfill = _load_backfill_module()
+        meta = self._entry(tmp_path, "a", "aaaa-1", "gpt-5.6-terra")
+        backup = backfill.backup_pre_reextract_meta(meta)
+        meta.write_text("{}", encoding="utf-8")
+        backfill.backup_pre_reextract_meta(meta)
+        assert json.loads(backup.read_text())["extractor_model_id"] == "gpt-5.6-terra"
